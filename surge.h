@@ -27,6 +27,13 @@ bool sg_gguf_get_f32(const sg_gguf *g, const char *key, float *out);
 bool sg_gguf_get_str(const sg_gguf *g, const char *key, const char **out);
 bool sg_gguf_get_arr(const sg_gguf *g, const char *key, sg_gguf_kv_type *elem_type,
                      const void **data, uint64_t *count);
+/* Element accessor for SG_GGUF_STR arrays. sg_gguf_get_arr's data pointer for a
+ * string array is the raw packed region (u64 length + bytes per element, no NUL
+ * terminators); this walks it and returns an arena-backed NUL-terminated copy of
+ * element i. The first call for a given key builds a cached index (one O(count)
+ * pass); subsequent calls are O(1). Returns false if key is absent, not a string
+ * array, or i is out of bounds. */
+bool sg_gguf_get_arr_str(const sg_gguf *g, const char *key, uint64_t i, const char **out);
 /* Get scalar value by index; returns false if out of bounds or not a scalar.
  * Pass NULL for outputs you don't need. int_out gets sign-extended int64. */
 bool sg_gguf_kv_scalar_at(const sg_gguf *g, uint64_t i, sg_gguf_kv_type *type_out,
@@ -37,5 +44,17 @@ bool sg_gguf_kv_at(const sg_gguf *g, uint64_t i, const char **key_out, sg_gguf_k
 const sg_tensor *sg_gguf_tensor(const sg_gguf *g, const char *name);
 uint64_t sg_gguf_tensor_count(const sg_gguf *g);
 const sg_tensor *sg_gguf_tensor_at(const sg_gguf *g, uint64_t i);
+
+/* Byte-level BPE tokenizer (Task 4), built from tokenizer.ggml.* GGUF metadata. */
+
+typedef struct sg_tok sg_tok;
+sg_err sg_tok_from_gguf(const sg_gguf *g, sg_tok **out);
+void sg_tok_free(sg_tok *t);
+sg_err sg_tok_encode(const sg_tok *t, const char *utf8, int32_t **ids, uint64_t *n);
+/* Decode appends the bytes for ids[0..n) to buf (capacity buf_cap). Returns the
+ * number of bytes written, or -1 if buf_cap is too small or an id is out of range. */
+int64_t sg_tok_decode(const sg_tok *t, const int32_t *ids, uint64_t n,
+                      char *buf, uint64_t buf_cap);
+int32_t sg_tok_eos(const sg_tok *t);
 
 #endif

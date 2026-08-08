@@ -35,7 +35,13 @@ typedef union {
     float f32; double f64;
     bool b;
     const char *str; /* arena copy, NUL-terminated */
-    struct { sg_gguf_kv_type elem_type; uint64_t count; const void *data; } arr;
+    struct {
+        sg_gguf_kv_type elem_type; uint64_t count; const void *data;
+        /* Lazily built index for SG_GGUF_STR arrays: str_cache[i] is an
+         * arena-backed NUL-terminated copy of element i, or NULL until built.
+         * Populated on first sg_gguf_get_arr_str() call for this key. */
+        char **str_cache;
+    } arr;
 } sg_kv_value;
 
 typedef struct {
@@ -335,6 +341,20 @@ static const sg_kv *find_kv(const sg_gguf *g, const char *key) {
     return NULL;
 }
 
+/* Same lookup, but through a mutable path: g->kvs is `sg_kv *` (non-const
+ * pointee), so indexing it is legal even when reached via a `const sg_gguf *`
+ * (C's const only applies one level deep). Used by sg_gguf_get_arr_str to
+ * lazily populate the per-key string-array cache behind the const-correct
+ * public API; the underlying sg_gguf is always heap-allocated by
+ * sg_gguf_open, never truly const, so this is well-defined. */
+static sg_kv *find_kv_mut(const sg_gguf *g, const char *key) {
+    if (!g || !key) return NULL;
+    for (uint64_t i = 0; i < g->kv_count; i++) {
+        if (strcmp(g->kvs[i].key, key) == 0) return &g->kvs[i];
+    }
+    return NULL;
+}
+
 sg_err sg_gguf_open(const char *path, sg_gguf **out) {
     if (out) *out = NULL;
     if (!path || !out) return (sg_err){"gguf: invalid arguments"};
@@ -458,6 +478,13 @@ fail:
 void sg_gguf_close(sg_gguf *g) {
     if (!g) return;
     if (g->map) munmap(g->map, g->map_size);
+    /* str_cache arrays hold pointers into g->arena (freed below); only the
+     * index arrays themselves need a separate free. */
+    for (uint64_t i = 0; i < g->kv_count; i++) {
+        if (g->kvs[i].type == SG_GGUF_ARR && g->kvs[i].v.arr.elem_type == SG_GGUF_STR) {
+            free(g->kvs[i].v.arr.str_cache);
+        }
+    }
     for (size_t i = 0; i < g->arena_len; i++) free(g->arena[i]);
     free(g->arena);
     free(g->kvs);
@@ -493,6 +520,51 @@ bool sg_gguf_get_arr(const sg_gguf *g, const char *key, sg_gguf_kv_type *elem_ty
     if (elem_type) *elem_type = kv->v.arr.elem_type;
     if (data) *data = kv->v.arr.data;
     if (count) *count = kv->v.arr.count;
+    return true;
+}
+
+/* Not thread-safe: the lazy str_cache build below (and the arena it writes
+ * through via arena_add) has no synchronization. Fine today since nothing
+ * in this codebase calls into a single sg_gguf from more than one thread;
+ * revisit if/when model loading or tokenization is ever parallelized. */
+bool sg_gguf_get_arr_str(const sg_gguf *g, const char *key, uint64_t i, const char **out) {
+    if (!out) return false;
+    sg_kv *kv = find_kv_mut(g, key);
+    if (!kv || kv->type != SG_GGUF_ARR || kv->v.arr.elem_type != SG_GGUF_STR) return false;
+    if (i >= kv->v.arr.count) return false;
+
+    if (!kv->v.arr.str_cache) {
+        uint64_t count = kv->v.arr.count; /* >= 1: the i >= count check above passed */
+        char **cache = calloc(count, sizeof(*cache));
+        if (!cache) return false;
+
+        /* Bound the walk against the mapping's end, not just the packed
+         * region's nominal size; parse_kv_array already validated this data
+         * once at open time, this re-walk stays defensive regardless. */
+        const uint8_t *data = (const uint8_t *)kv->v.arr.data;
+        const uint8_t *map_end = (const uint8_t *)g->map + g->map_size;
+        rd_t r = { .base = data, .size = (uint64_t)(map_end - data), .pos = 0 };
+
+        /* g is heap-allocated by sg_gguf_open and never truly const; this
+         * cast confines the lazy-cache mutation to one spot. */
+        sg_gguf *mg = (sg_gguf *)g;
+
+        bool ok = true;
+        for (uint64_t j = 0; j < count; j++) {
+            const char *p; uint64_t len;
+            sg_err e = rd_str_raw(&r, &p, &len, "gguf: truncated walking cached string array",
+                                  "gguf: truncated walking cached string array");
+            if (sg_failed(e)) { ok = false; break; }
+            char *copy;
+            e = arena_add(mg, p, len, &copy);
+            if (sg_failed(e)) { ok = false; break; }
+            cache[j] = copy;
+        }
+        if (!ok) { free(cache); return false; }
+        kv->v.arr.str_cache = cache;
+    }
+
+    *out = kv->v.arr.str_cache[i];
     return true;
 }
 

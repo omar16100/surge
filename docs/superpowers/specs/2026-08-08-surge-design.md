@@ -1,7 +1,7 @@
 # surge: a production C inference engine for the M3 Ultra (design)
 
-Date: 2026-08-08. Status: approved design, pre-implementation. Name `surge` is a
-placeholder the owner may change.
+Date: 2026-08-08. Status: approved design, pre-implementation. Name `surge` confirmed
+by the owner; public MIT repo at github.com/omar16100/surge.
 
 ## Context
 

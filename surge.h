@@ -27,6 +27,10 @@ bool sg_gguf_get_f32(const sg_gguf *g, const char *key, float *out);
 bool sg_gguf_get_str(const sg_gguf *g, const char *key, const char **out);
 bool sg_gguf_get_arr(const sg_gguf *g, const char *key, sg_gguf_kv_type *elem_type,
                      const void **data, uint64_t *count);
+/* Get scalar value by index; returns false if out of bounds or not a scalar.
+ * Pass NULL for outputs you don't need. int_out gets sign-extended int64. */
+bool sg_gguf_kv_scalar_at(const sg_gguf *g, uint64_t i, sg_gguf_kv_type *type_out,
+                          int64_t *int_out, double *float_out, bool *bool_out);
 uint32_t sg_gguf_version(const sg_gguf *g);
 uint64_t sg_gguf_kv_count(const sg_gguf *g);
 bool sg_gguf_kv_at(const sg_gguf *g, uint64_t i, const char **key_out, sg_gguf_kv_type *type_out);

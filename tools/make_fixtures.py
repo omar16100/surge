@@ -12,6 +12,9 @@ GGUF_VERSION = 3
 ALIGNMENT = 32
 
 # sg_gguf_kv_type values, must match the enum in surge.h.
+T_I32 = 5
+T_F32 = 6
+T_BOOL = 7
 T_U32 = 4
 T_STR = 8
 T_ARR = 9
@@ -32,6 +35,14 @@ def _kv_str(key: str, value: str) -> bytes:
 
 def _kv_u32(key: str, value: int) -> bytes:
     return _str(key) + struct.pack("<I", T_U32) + struct.pack("<I", value)
+
+
+def _kv_i32(key: str, value: int) -> bytes:
+    return _str(key) + struct.pack("<I", T_I32) + struct.pack("<i", value)
+
+
+def _kv_bool(key: str, value: bool) -> bytes:
+    return _str(key) + struct.pack("<I", T_BOOL) + struct.pack("<B", 1 if value else 0)
 
 
 def _kv_arr_u32(key: str, values: list) -> bytes:
@@ -56,7 +67,8 @@ def write_mini_gguf(path: str) -> None:
     """Write the small GGUF v3 fixture used by tests/test_gguf.c.
 
     Metadata: general.architecture="qwen3_5" (str),
-    qwen3_5.block_count=2 (u32), test.arr=[1,2,3] (u32 array).
+    qwen3_5.block_count=2 (u32), test.arr=[1,2,3] (u32 array),
+    test.i32=-42 (i32), test.bool=true (bool).
     Tensors: t.f32 f32[4] = [1.0, 2.0, 3.0, 4.0];
     t.q8 Q8_0[32], one block: f16 scale 0.5 + int8 0..31.
     """
@@ -64,6 +76,8 @@ def write_mini_gguf(path: str) -> None:
         _kv_str("general.architecture", "qwen3_5"),
         _kv_u32("qwen3_5.block_count", 2),
         _kv_arr_u32("test.arr", [1, 2, 3]),
+        _kv_i32("test.i32", -42),
+        _kv_bool("test.bool", True),
     ]
 
     f32_nbytes = 4 * 4  # t.f32: f32[4]

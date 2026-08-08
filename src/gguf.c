@@ -519,6 +519,62 @@ bool sg_gguf_kv_at(const sg_gguf *g, uint64_t i, const char **key_out, sg_gguf_k
     return true;
 }
 
+bool sg_gguf_kv_scalar_at(const sg_gguf *g, uint64_t i, sg_gguf_kv_type *type_out,
+                          int64_t *int_out, double *float_out, bool *bool_out) {
+    if (!g || i >= g->kv_count) return false;
+    const sg_kv *kv = &g->kvs[i];
+    if (type_out) *type_out = kv->type;
+
+    switch (kv->type) {
+        case SG_GGUF_U8:
+            if (int_out) *int_out = (int64_t)kv->v.u8;
+            if (float_out) *float_out = (double)kv->v.u8;
+            return true;
+        case SG_GGUF_I8:
+            if (int_out) *int_out = (int64_t)kv->v.i8;
+            if (float_out) *float_out = (double)kv->v.i8;
+            return true;
+        case SG_GGUF_U16:
+            if (int_out) *int_out = (int64_t)kv->v.u16;
+            if (float_out) *float_out = (double)kv->v.u16;
+            return true;
+        case SG_GGUF_I16:
+            if (int_out) *int_out = (int64_t)kv->v.i16;
+            if (float_out) *float_out = (double)kv->v.i16;
+            return true;
+        case SG_GGUF_U32:
+            if (int_out) *int_out = (int64_t)kv->v.u32;
+            if (float_out) *float_out = (double)kv->v.u32;
+            return true;
+        case SG_GGUF_I32:
+            if (int_out) *int_out = (int64_t)kv->v.i32;
+            if (float_out) *float_out = (double)kv->v.i32;
+            return true;
+        case SG_GGUF_F32:
+            if (int_out) *int_out = (int64_t)kv->v.f32;
+            if (float_out) *float_out = (double)kv->v.f32;
+            return true;
+        case SG_GGUF_F64:
+            if (int_out) *int_out = (int64_t)kv->v.f64;
+            if (float_out) *float_out = kv->v.f64;
+            return true;
+        case SG_GGUF_U64:
+            if (int_out) *int_out = (int64_t)kv->v.u64;
+            if (float_out) *float_out = (double)kv->v.u64;
+            return true;
+        case SG_GGUF_I64:
+            if (int_out) *int_out = kv->v.i64;
+            if (float_out) *float_out = (double)kv->v.i64;
+            return true;
+        case SG_GGUF_BOOL:
+            if (bool_out) *bool_out = kv->v.b;
+            if (int_out) *int_out = kv->v.b ? 1 : 0;
+            return true;
+        default:
+            return false;
+    }
+}
+
 uint64_t sg_gguf_tensor_count(const sg_gguf *g) {
     return g ? g->tensor_count : 0;
 }

@@ -66,6 +66,57 @@ static void gguf_open_close(void) {
     sg_gguf_close(g);
 }
 
+static void gguf_metadata_enumeration(void) {
+    sg_gguf *g = NULL;
+    sg_err e = sg_gguf_open("tests/fixtures/mini.gguf", &g);
+    tt_assert(!sg_failed(e), "open mini.gguf should succeed: %s", e.msg ? e.msg : "");
+    tt_assert(g != NULL, "handle should be non-NULL on success");
+    if (!g) return;
+
+    uint32_t version = sg_gguf_version(g);
+    tt_assert(version == 3, "version should be 3");
+
+    uint64_t kv_count = sg_gguf_kv_count(g);
+    tt_assert(kv_count == 5, "kv_count should be 5 (arch, block_count, arr, i32, bool)");
+
+    const char *arch_key;
+    sg_gguf_kv_type arch_type;
+    tt_assert(sg_gguf_kv_at(g, 0, &arch_key, &arch_type),
+              "first kv should be accessible");
+    tt_assert(arch_type == SG_GGUF_STR, "first key should be STR type");
+    tt_assert(strcmp(arch_key, "general.architecture") == 0,
+              "first key should be general.architecture");
+
+    const char *i32_key;
+    sg_gguf_kv_type i32_type;
+    tt_assert(sg_gguf_kv_at(g, 3, &i32_key, &i32_type),
+              "fourth kv should be accessible");
+    tt_assert(i32_type == SG_GGUF_I32, "fourth key should be I32 type");
+    tt_assert(strcmp(i32_key, "test.i32") == 0,
+              "fourth key should be test.i32");
+
+    int64_t i32_val = 0;
+    sg_gguf_kv_scalar_at(g, 3, NULL, &i32_val, NULL, NULL);
+    tt_assert(i32_val == -42, "i32 value should be -42");
+
+    const char *bool_key;
+    sg_gguf_kv_type bool_type;
+    tt_assert(sg_gguf_kv_at(g, 4, &bool_key, &bool_type),
+              "fifth kv should be accessible");
+    tt_assert(bool_type == SG_GGUF_BOOL, "fifth key should be BOOL type");
+    tt_assert(strcmp(bool_key, "test.bool") == 0,
+              "fifth key should be test.bool");
+
+    bool bool_val = false;
+    sg_gguf_kv_scalar_at(g, 4, NULL, NULL, NULL, &bool_val);
+    tt_assert(bool_val == true, "bool value should be true");
+
+    tt_assert(!sg_gguf_kv_at(g, 999, NULL, NULL),
+              "out of bounds access should return false");
+
+    sg_gguf_close(g);
+}
+
 static void gguf_open_nonexistent(void) {
     sg_gguf *g = NULL;
     sg_err e = sg_gguf_open("/nonexistent/path/mini.gguf", &g);
@@ -102,6 +153,7 @@ static void gguf_open_truncated(void) {
 
 int main(void) {
     tt_run("gguf_open_close", gguf_open_close);
+    tt_run("gguf_metadata_enumeration", gguf_metadata_enumeration);
     tt_run("gguf_open_nonexistent", gguf_open_nonexistent);
     tt_run("gguf_open_truncated", gguf_open_truncated);
     return tt_report();

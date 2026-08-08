@@ -41,48 +41,36 @@ static const char *tensor_type_name(sg_tensor_type t) {
     }
 }
 
-static void print_kv_value(const sg_gguf *g, const char *key, sg_gguf_kv_type type) {
+static void print_kv_at(const sg_gguf *g, uint64_t idx) {
+    const char *key;
+    sg_gguf_kv_type type;
+    if (!sg_gguf_kv_at(g, idx, &key, &type)) return;
+
     switch (type) {
-        case SG_GGUF_U8: {
-            printf("    %s (U8)\n", key);
+        case SG_GGUF_U8:
+        case SG_GGUF_I8:
+        case SG_GGUF_U16:
+        case SG_GGUF_I16:
+        case SG_GGUF_U32:
+        case SG_GGUF_I32:
+        case SG_GGUF_U64:
+        case SG_GGUF_I64: {
+            int64_t v = 0;
+            sg_gguf_kv_scalar_at(g, idx, NULL, &v, NULL, NULL);
+            printf("    %s = %lld\n", key, (long long)v);
             break;
         }
-        case SG_GGUF_I8: {
-            printf("    %s (I8)\n", key);
-            break;
-        }
-        case SG_GGUF_U16: {
-            printf("    %s (U16)\n", key);
-            break;
-        }
-        case SG_GGUF_I16: {
-            printf("    %s (I16)\n", key);
-            break;
-        }
-        case SG_GGUF_U32: {
-            uint32_t v;
-            if (sg_gguf_get_u32(g, key, &v)) {
-                printf("    %s = %u\n", key, v);
-            } else {
-                printf("    %s (unavailable)\n", key);
-            }
-            break;
-        }
-        case SG_GGUF_I32: {
-            printf("    %s (I32)\n", key);
-            break;
-        }
-        case SG_GGUF_F32: {
-            float v;
-            if (sg_gguf_get_f32(g, key, &v)) {
-                printf("    %s = %g\n", key, (double)v);
-            } else {
-                printf("    %s (unavailable)\n", key);
-            }
+        case SG_GGUF_F32:
+        case SG_GGUF_F64: {
+            double v = 0.0;
+            sg_gguf_kv_scalar_at(g, idx, NULL, NULL, &v, NULL);
+            printf("    %s = %g\n", key, v);
             break;
         }
         case SG_GGUF_BOOL: {
-            printf("    %s (BOOL)\n", key);
+            bool v = false;
+            sg_gguf_kv_scalar_at(g, idx, NULL, NULL, NULL, &v);
+            printf("    %s = %s\n", key, v ? "true" : "false");
             break;
         }
         case SG_GGUF_STR: {
@@ -102,18 +90,6 @@ static void print_kv_value(const sg_gguf *g, const char *key, sg_gguf_kv_type ty
             } else {
                 printf("    %s (unavailable)\n", key);
             }
-            break;
-        }
-        case SG_GGUF_U64: {
-            printf("    %s (U64)\n", key);
-            break;
-        }
-        case SG_GGUF_I64: {
-            printf("    %s (I64)\n", key);
-            break;
-        }
-        case SG_GGUF_F64: {
-            printf("    %s (F64)\n", key);
             break;
         }
         default: {
@@ -156,11 +132,7 @@ int main(int argc, char *argv[]) {
 
     printf("\nMetadata (%llu keys):\n", (unsigned long long)sg_gguf_kv_count(g));
     for (uint64_t i = 0; i < sg_gguf_kv_count(g); i++) {
-        const char *key;
-        sg_gguf_kv_type type;
-        if (sg_gguf_kv_at(g, i, &key, &type)) {
-            print_kv_value(g, key, type);
-        }
+        print_kv_at(g, i);
     }
 
     uint64_t n_tensors = sg_gguf_tensor_count(g);

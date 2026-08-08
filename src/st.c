@@ -1,11 +1,15 @@
-/* st.c - read-only safetensors bf16 loader + config.json.
+/* st.c - read-only safetensors bf16/f32 loader + config.json.
  *
  * Maps every *.safetensors shard for a model directory read-only and parses
  * each shard's JSON header (u64 header_len, then header_len bytes of JSON
  * mapping tensor name -> {dtype, shape, data_offsets:[begin,end]}, offsets
  * relative to the byte right after the header) into a flat tensor
- * directory. Only BF16-dtype tensors are retrievable via sg_st_tensor();
- * other dtypes are bounds-checked but not indexed (this is a bf16 loader).
+ * directory. BF16 tensors are retrievable via sg_st_tensor() and F32 ones
+ * via sg_st_tensor_f32(); other dtypes are bounds-checked but not indexed.
+ * F32 indexing was added in Task 7: the real Qwen3.5 checkpoint stores
+ * linear_attn.A_log and linear_attn.norm.weight as F32 amid otherwise-BF16
+ * layer weights (mlx's cast_predicate deliberately exempts A_log), so a
+ * bf16-only index cannot reach a complete gated-DeltaNet layer.
  * Shard filenames come from model.safetensors.index.json's weight_map when
  * present (never a hardcoded "model-NNNNN-of-NNNNN.safetensors" pattern,
  * since real checkpoints don't always follow it), otherwise model_dir must
@@ -501,8 +505,9 @@ typedef struct {
     char *name;          /* owned, NUL-terminated; the checkpoint's own name */
     uint32_t n_dims;
     uint64_t dims[4];
-    const uint16_t *data; /* pointer into the owning shard's mmap */
+    const void *data;    /* pointer into the owning shard's mmap */
     uint64_t nbytes;
+    bool is_f32;         /* false => BF16 (sg_st_tensor), true => F32 */
 } st_tensor;
 
 struct sg_st {
@@ -664,23 +669,60 @@ static sg_err st_add_tensor(sg_st *s, const char *name, uint32_t name_len, const
     if (end > map_size - data_start) return (sg_err){"st: tensor data out of bounds"};
 
     bool is_bf16 = (dtype_v->as.str.len == 4 && memcmp(dtype_v->as.str.ptr, "BF16", 4) == 0);
-    if (!is_bf16 || n_dims > 4) return SG_OK; /* validated, not indexed */
+    /* F32 is indexed too (retrievable via sg_st_tensor_f32, never via
+     * sg_st_tensor): real Qwen3.5 checkpoints keep two per-linear-attention
+     * -layer tensors in F32 while the rest of the layer is BF16
+     * (linear_attn.A_log and linear_attn.norm.weight), so a bf16-only index
+     * cannot reach the DeltaNet weights at all. Every other dtype stays
+     * validated-but-not-indexed as before. */
+    bool is_f32 = (dtype_v->as.str.len == 3 && memcmp(dtype_v->as.str.ptr, "F32", 3) == 0);
+    if ((!is_bf16 && !is_f32) || n_dims > 4) return SG_OK; /* validated, not indexed */
 
+    uint64_t elem_size = is_f32 ? 4 : 2;
     uint64_t elem_count = 1;
     for (uint32_t i = 0; i < n_dims; i++) {
         uint64_t d = dims[i];
         if (d != 0 && elem_count > UINT64_MAX / d) return (sg_err){"st: tensor dims overflow"};
         elem_count *= d;
     }
-    if (elem_count > UINT64_MAX / 2) return (sg_err){"st: tensor size overflow"};
-    uint64_t expected_bytes = elem_count * 2;
+    if (elem_count > UINT64_MAX / elem_size) return (sg_err){"st: tensor size overflow"};
+    uint64_t expected_bytes = elem_count * elem_size;
     uint64_t nbytes = end - begin;
-    if (nbytes != expected_bytes) {
-        return (sg_err){"st: bf16 tensor byte length does not match its shape"};
-    }
-
     uint64_t abs_off = data_start + begin; /* begin <= map_size - data_start, so no overflow */
-    if (abs_off % 2 != 0) return (sg_err){"st: bf16 tensor offset is not 2-byte aligned"};
+
+    /* Natural alignment is required so the mmap pointer can be handed out as
+     * a uint16_t or float pointer directly.
+     *
+     * The two failure modes are treated differently by dtype, on purpose:
+     *
+     *  - BF16 keeps its original hard-error behaviour. This loader has always
+     *    been "the bf16 loader", so a bf16 tensor it cannot represent is a
+     *    file it cannot honestly load.
+     *  - F32 only started being indexed in Task 7, and before that ANY
+     *    non-BF16 tensor was validated-but-not-indexed and could never fail
+     *    an open. Hard-erroring on it now would newly reject checkpoints that
+     *    loaded fine before, including for a caller that only ever wanted the
+     *    bf16 tensors: the safetensors spec does not require 8 + header_len
+     *    to be a multiple of 4, so a legal shard can put every F32 tensor at
+     *    a 2-aligned offset. So an F32 tensor that is misaligned or whose
+     *    byte length disagrees with its shape is skipped, not fatal --
+     *    exactly the pre-Task-7 contract for a dtype this loader cannot
+     *    represent. It then reads as absent through sg_st_tensor_f32.
+     *
+     * Both real checkpoints are clean on both counts (the 2B's data section
+     * starts at 76656, and all 36 of its F32 tensors are 4-aligned). */
+    if (is_f32) {
+        if (nbytes != expected_bytes || abs_off % elem_size != 0) {
+            return SG_OK; /* validated, not indexed */
+        }
+    } else {
+        if (nbytes != expected_bytes) {
+            return (sg_err){"st: bf16 tensor byte length does not match its shape"};
+        }
+        if (abs_off % elem_size != 0) {
+            return (sg_err){"st: bf16 tensor offset is not 2-byte aligned"};
+        }
+    }
 
     if (s->n_tensors == s->tensors_cap) {
         uint64_t ncap = s->tensors_cap ? s->tensors_cap * 2 : 16;
@@ -696,8 +738,9 @@ static sg_err st_add_tensor(sg_st *s, const char *name, uint32_t name_len, const
     t->name = name_copy;
     t->n_dims = n_dims;
     memcpy(t->dims, dims, sizeof(dims));
-    t->data = (const uint16_t *)((const uint8_t *)map + abs_off);
+    t->data = (const void *)((const uint8_t *)map + abs_off);
     t->nbytes = nbytes;
+    t->is_f32 = is_f32;
     return SG_OK;
 }
 
@@ -822,18 +865,36 @@ void sg_st_close(sg_st *s) {
     free(s);
 }
 
+/* Shared lookup for both typed accessors; want_f32 selects which dtype the
+ * caller is asking for, so a name that exists at the other dtype reports
+ * "absent" exactly as the header promises. */
+static const st_tensor *st_find(const sg_st *s, const char *name, bool want_f32) {
+    if (!s || !name) return NULL;
+    for (uint64_t i = 0; i < s->n_tensors; i++) {
+        if (s->tensors[i].is_f32 != want_f32) continue;
+        if (strcmp(s->tensors[i].name, name) == 0) return &s->tensors[i];
+    }
+    return NULL;
+}
+
 bool sg_st_tensor(const sg_st *s, const char *name, const uint16_t **data,
                   uint64_t dims[4], uint32_t *n_dims) {
-    if (!s || !name) return false;
-    for (uint64_t i = 0; i < s->n_tensors; i++) {
-        if (strcmp(s->tensors[i].name, name) == 0) {
-            if (data) *data = s->tensors[i].data;
-            if (dims) memcpy(dims, s->tensors[i].dims, sizeof(s->tensors[i].dims));
-            if (n_dims) *n_dims = s->tensors[i].n_dims;
-            return true;
-        }
-    }
-    return false;
+    const st_tensor *t = st_find(s, name, false);
+    if (!t) return false;
+    if (data) *data = (const uint16_t *)t->data;
+    if (dims) memcpy(dims, t->dims, sizeof(t->dims));
+    if (n_dims) *n_dims = t->n_dims;
+    return true;
+}
+
+bool sg_st_tensor_f32(const sg_st *s, const char *name, const float **data,
+                      uint64_t dims[4], uint32_t *n_dims) {
+    const st_tensor *t = st_find(s, name, true);
+    if (!t) return false;
+    if (data) *data = (const float *)t->data;
+    if (dims) memcpy(dims, t->dims, sizeof(t->dims));
+    if (n_dims) *n_dims = t->n_dims;
+    return true;
 }
 
 /* key looked up at the top level first, then inside "text_config" if absent

@@ -78,6 +78,33 @@
  *    symmetric and directly tied to what this loader can actually act on.
  *    Independently verified consistent with the real checkpoint's
  *    tie_word_embeddings=true / lm_head.weight-absent.
+ *
+ * 8. (Task 7) The linear-attention layers' own nine tensors are now mapped
+ *    too, into sg_layer_w's ssm_* fields, by the same tensor-presence rule
+ *    as note 2's attention group: whichever group is absent on a layer
+ *    comes back NULL, and no config layer-type list is consulted. Names
+ *    were taken verbatim from the real files' tensor directories, which
+ *    corrected two guesses: the GGUF's a/b projections are
+ *    blk.N.ssm_alpha.weight and blk.N.ssm_beta.weight (not bare ssm_alpha /
+ *    ssm_beta), while blk.N.ssm_a really is bare with no .weight suffix.
+ *    The two "attn_"-prefixed names on a linear layer are not a mistake in
+ *    the converter: blk.N.attn_qkv.weight is the DeltaNet's in_proj_qkv and
+ *    blk.N.attn_gate.weight is its in_proj_z, confirmed by their shapes
+ *    ([5120, 10240] == hidden -> 2*key_dim+value_dim, and [5120, 6144] ==
+ *    hidden -> value_dim, with key_dim/value_dim read off qwen35.ssm.*).
+ *    The alpha<->in_proj_a / beta<->in_proj_b pairing is by name only:
+ *    both tensors are [5120, 48], so shape cannot disambiguate them. It
+ *    matches Qwen3-Next's in_proj_ba = concat(b, a) convention, but it is
+ *    not numerically verified here and is flagged for the M1 gate.
+ *
+ * 9. (Task 7) The safetensors checkpoint is dtype-mixed WITHIN a linear-
+ *    attention layer: linear_attn.A_log and linear_attn.norm.weight are
+ *    F32 while the other seven tensors of the same layer are BF16 (36 F32
+ *    tensors in the 2B file = 18 linear layers x 2). mlx's own
+ *    cast_predicate explicitly exempts A_log from casting, so this is
+ *    intentional upstream, not a packaging artifact. st.c's index was
+ *    extended in Task 7 to carry F32 tensors as well, reachable through
+ *    sg_st_tensor_f32; those two fields are looked up with it here.
  */
 #include "surge.h"
 
@@ -190,6 +217,21 @@ sg_err sg_model_from_gguf(const sg_gguf *g, sg_model *m) {
         OPT("blk.%u.attn_output.weight", o_proj);
         OPT("blk.%u.attn_q_norm.weight", q_norm);
         OPT("blk.%u.attn_k_norm.weight", k_norm);
+
+        /* The mirror-image group: present only on a linear-attention layer,
+         * NULL on a full-attention one (see file header note 8). Names are
+         * verbatim from the real file's tensor directory, including the two
+         * that do not follow the ".weight" convention (ssm_a is the bare
+         * A_log vector and the dt bias is spelled ssm_dt.bias). */
+        OPT("blk.%u.attn_qkv.weight", ssm_in_qkv);
+        OPT("blk.%u.attn_gate.weight", ssm_in_z);
+        OPT("blk.%u.ssm_beta.weight", ssm_in_b);
+        OPT("blk.%u.ssm_alpha.weight", ssm_in_a);
+        OPT("blk.%u.ssm_a", ssm_a_log);
+        OPT("blk.%u.ssm_dt.bias", ssm_dt_bias);
+        OPT("blk.%u.ssm_conv1d.weight", ssm_conv1d);
+        OPT("blk.%u.ssm_norm.weight", ssm_norm);
+        OPT("blk.%u.ssm_out.weight", ssm_out);
     }
 #undef REQ
 #undef OPT
@@ -216,6 +258,24 @@ static const void *st_dense_tensor(const sg_st *s, const char *suffix) {
     const uint16_t *data = NULL;
     if (sg_st_tensor(s, plain, &data, NULL, NULL)) return data;
     if (sg_st_tensor(s, nested, &data, NULL, NULL)) return data;
+    return NULL;
+}
+
+/* Same two-name probe, for the two DeltaNet tensors the real checkpoint
+ * stores as F32 rather than BF16 (see file header note 9). Kept separate
+ * from st_dense_tensor rather than folded into one "any dtype" helper so
+ * that a tensor turning up in the wrong dtype is a loud NULL here instead
+ * of a silently misinterpreted pointer. */
+static const void *st_dense_tensor_f32(const sg_st *s, const char *suffix) {
+    char plain[192], nested[192];
+    int r1 = snprintf(plain, sizeof plain, "model.%s", suffix);
+    int r2 = snprintf(nested, sizeof nested, "model.language_model.%s", suffix);
+    if (r1 <= 0 || (size_t)r1 >= sizeof plain) return NULL;
+    if (r2 <= 0 || (size_t)r2 >= sizeof nested) return NULL;
+
+    const float *data = NULL;
+    if (sg_st_tensor_f32(s, plain, &data, NULL, NULL)) return data;
+    if (sg_st_tensor_f32(s, nested, &data, NULL, NULL)) return data;
     return NULL;
 }
 
@@ -289,6 +349,11 @@ sg_err sg_model_from_st(const sg_st *s, sg_model *m) {
         if (_r <= 0 || (size_t)_r >= sizeof suffix) { free(layers); return (sg_err){"model: safetensors tensor name too long"}; } \
         lw->field = st_dense_tensor(s, suffix); \
     } while (0)
+#define OPT_F32(fmt, field) do { \
+        int _r = snprintf(suffix, sizeof suffix, fmt, i); \
+        if (_r <= 0 || (size_t)_r >= sizeof suffix) { free(layers); return (sg_err){"model: safetensors tensor name too long"}; } \
+        lw->field = st_dense_tensor_f32(s, suffix); \
+    } while (0)
 
     for (uint32_t i = 0; i < cfg.n_layers; i++) {
         sg_layer_w *lw = &layers[i];
@@ -311,16 +376,34 @@ sg_err sg_model_from_st(const sg_st *s, sg_model *m) {
         OPT("layers.%u.self_attn.o_proj.weight", o_proj);
         OPT("layers.%u.self_attn.q_norm.weight", q_norm);
         OPT("layers.%u.self_attn.k_norm.weight", k_norm);
+
+        /* Present only on a linear-attention layer (see file header note 8).
+         * A_log and norm.weight are F32 in this checkpoint while every other
+         * weight in the same layer is BF16 (note 9). */
+        OPT("layers.%u.linear_attn.in_proj_qkv.weight", ssm_in_qkv);
+        OPT("layers.%u.linear_attn.in_proj_z.weight", ssm_in_z);
+        OPT("layers.%u.linear_attn.in_proj_b.weight", ssm_in_b);
+        OPT("layers.%u.linear_attn.in_proj_a.weight", ssm_in_a);
+        OPT_F32("layers.%u.linear_attn.A_log", ssm_a_log);
+        OPT("layers.%u.linear_attn.dt_bias", ssm_dt_bias);
+        OPT("layers.%u.linear_attn.conv1d.weight", ssm_conv1d);
+        OPT_F32("layers.%u.linear_attn.norm.weight", ssm_norm);
+        OPT("layers.%u.linear_attn.out_proj.weight", ssm_out);
     }
 #undef REQ
 #undef OPT
+#undef OPT_F32
 
     m->cfg = cfg;
     m->tok_emb = tok_emb;
     m->out_norm = out_norm;
     m->lm_head = has_lm_head ? (const void *)lm_head_data : tok_emb;
     m->layers = layers;
-    m->wtype = SG_T_BF16; /* sg_st_tensor only ever retrieves BF16 tensors */
+    /* The embedding table (and every matmul weight) is BF16 here. This is NOT
+     * a claim about every pointer in sg_layer_w: ssm_a_log and ssm_norm come
+     * from sg_st_tensor_f32 and are F32 even in this checkpoint. See the
+     * per-field dtype table in surge.h's sg_layer_w comment. */
+    m->wtype = SG_T_BF16;
     return SG_OK;
 }
 

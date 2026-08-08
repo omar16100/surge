@@ -2,7 +2,8 @@
  *
  * Fixture asserts run unconditionally against tests/fixtures/mini_st/
  * (produced by tools/make_fixtures.py write_mini_safetensors()): a
- * single-shard model dir with one bf16 tensor "w" [2,3] and
+ * single-shard model dir with a bf16 tensor "w" [2,3], an f32 tensor "wf"
+ * [4], an i8 tensor "wi8" [4] that must stay unindexed, and
  * config.json {"hidden_size": 3}.
  *
  * Real-model asserts are gated on env SURGE_ST (path to a directory with
@@ -54,6 +55,47 @@ static void st_fixture_open_close(void) {
 
     tt_assert(!sg_st_tensor(s, "does.not.exist", NULL, NULL, NULL),
               "missing tensor lookup should return false");
+
+    /* F32 tensors are indexed too (Task 7), reachable only through
+     * sg_st_tensor_f32. The real Qwen3.5 checkpoint stores
+     * linear_attn.A_log and linear_attn.norm.weight as F32 amid otherwise
+     * BF16 layer weights, so without this the DeltaNet weights would be
+     * unreachable; "wf" exists in the fixture so that path runs in a plain
+     * `make check`, not only under SURGE_ST. */
+    static const float MINI_WF[4] = {-1.5f, 0.25f, 3.0f, -7.5f};
+    const float *fdata = NULL;
+    uint64_t fdims[4] = {99, 99, 99, 99};
+    uint32_t f_ndims = 99;
+    bool ffound = sg_st_tensor_f32(s, "wf", &fdata, fdims, &f_ndims);
+    tt_assert(ffound, "f32 tensor wf should be found by sg_st_tensor_f32");
+    if (ffound) {
+        tt_assert(f_ndims == 1, "wf n_dims should be 1, got %u", f_ndims);
+        tt_assert(fdims[0] == 4, "wf dims should be [4], got [%llu]",
+                  (unsigned long long)fdims[0]);
+        tt_assert(fdata != NULL, "wf data pointer should be non-NULL");
+        if (fdata) {
+            for (int i = 0; i < 4; i++) {
+                tt_assert(fdata[i] == MINI_WF[i], "wf[%d] should be %g, got %g",
+                          i, (double)MINI_WF[i], (double)fdata[i]);
+            }
+        }
+    }
+
+    /* The two accessors are strictly typed: neither one sees the other's
+     * dtype, so a caller can never silently reinterpret bf16 as f32. */
+    tt_assert(!sg_st_tensor(s, "wf", NULL, NULL, NULL),
+              "wf is F32, so the bf16 accessor must not return it");
+    tt_assert(!sg_st_tensor_f32(s, "w", NULL, NULL, NULL),
+              "w is BF16, so the f32 accessor must not return it");
+    tt_assert(!sg_st_tensor_f32(s, "does.not.exist", NULL, NULL, NULL),
+              "missing f32 tensor lookup should return false");
+
+    /* A third dtype is still validated-but-not-indexed: the open succeeded
+     * with wi8 (I8) present, and neither accessor can reach it. */
+    tt_assert(!sg_st_tensor(s, "wi8", NULL, NULL, NULL),
+              "I8 tensor should not be reachable through sg_st_tensor");
+    tt_assert(!sg_st_tensor_f32(s, "wi8", NULL, NULL, NULL),
+              "I8 tensor should not be reachable through sg_st_tensor_f32");
 
     uint32_t hidden_size = 0;
     tt_assert(sg_st_config_u32(s, "hidden_size", &hidden_size),

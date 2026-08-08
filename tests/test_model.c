@@ -57,6 +57,15 @@ static void assert_cfg_sane(const sg_cfg *c, const char *label) {
               label, c->n_kv_heads, c->n_heads);
 }
 
+/* The nine DeltaNet pointers, as one group. Task 7 added these; the two
+ * assert_layer_* helpers below check that the ssm group and the attention
+ * group are exact complements on every layer, which is what makes
+ * "layer kind == which tensors are present" a safe rule for the forward
+ * pass to dispatch on. */
+#define SSM_FIELDS(X) \
+    X(ssm_in_qkv) X(ssm_in_z) X(ssm_in_b) X(ssm_in_a) X(ssm_a_log) \
+    X(ssm_dt_bias) X(ssm_conv1d) X(ssm_norm) X(ssm_out)
+
 static void assert_layer_full_attn(const sg_layer_w *lw, uint32_t idx, const char *label) {
     tt_assert(lw->q_proj != NULL, "%s: layer %u q_proj should be non-NULL", label, idx);
     tt_assert(lw->k_proj != NULL, "%s: layer %u k_proj should be non-NULL", label, idx);
@@ -69,6 +78,10 @@ static void assert_layer_full_attn(const sg_layer_w *lw, uint32_t idx, const cha
     tt_assert(lw->down_proj != NULL, "%s: layer %u down_proj should be non-NULL", label, idx);
     tt_assert(lw->ln1 != NULL, "%s: layer %u ln1 should be non-NULL", label, idx);
     tt_assert(lw->ln2 != NULL, "%s: layer %u ln2 should be non-NULL", label, idx);
+#define X(f) tt_assert(lw->f == NULL, \
+        "%s: layer %u (full-attn) " #f " should be NULL", label, idx);
+    SSM_FIELDS(X)
+#undef X
 }
 
 static void assert_layer_linear_attn(const sg_layer_w *lw, uint32_t idx, const char *label) {
@@ -83,6 +96,39 @@ static void assert_layer_linear_attn(const sg_layer_w *lw, uint32_t idx, const c
     tt_assert(lw->down_proj != NULL, "%s: layer %u down_proj should still be non-NULL", label, idx);
     tt_assert(lw->ln1 != NULL, "%s: layer %u ln1 should still be non-NULL", label, idx);
     tt_assert(lw->ln2 != NULL, "%s: layer %u ln2 should still be non-NULL", label, idx);
+#define X(f) tt_assert(lw->f != NULL, \
+        "%s: layer %u (linear-attn) " #f " should be non-NULL", label, idx);
+    SSM_FIELDS(X)
+#undef X
+}
+
+/* Mean of an F32 norm-weight vector, used to pin the +1.0 scale difference
+ * between the two sources (see the long note in surge.h's sg_layer_w
+ * comment): mlx's TextModel.sanitize adds 1.0 to the input_layernorm /
+ * post_attention_layernorm / model.norm / q_norm / k_norm weights when the
+ * checkpoint carries mtp.* tensors or an unsanitized conv1d weight. The real
+ * 2B safetensors checkpoint carries both and is therefore stored
+ * "residual" (centred near 0); the GGUF converter baked the shift in, so the
+ * GGUF's are absolute (centred near 1). A forward pass that feeds either one
+ * straight into sg_ref_rmsnorm without knowing which it has is wrong by a
+ * factor of ~10 on the safetensors path, so this is asserted, not assumed. */
+static double f32_mean(const void *p, uint64_t n) {
+    const float *v = (const float *)p;
+    double s = 0.0;
+    for (uint64_t i = 0; i < n; i++) s += (double)v[i];
+    return n ? s / (double)n : 0.0;
+}
+
+static double bf16_mean(const void *p, uint64_t n) {
+    const uint16_t *v = (const uint16_t *)p;
+    double s = 0.0;
+    for (uint64_t i = 0; i < n; i++) {
+        uint32_t bits = (uint32_t)v[i] << 16;
+        float f;
+        memcpy(&f, &bits, sizeof f);
+        s += (double)f;
+    }
+    return n ? s / (double)n : 0.0;
 }
 
 static float g_gguf_rope_theta = 0.0f, g_gguf_rms_eps = 0.0f;
@@ -165,6 +211,105 @@ static void model_from_gguf_real(void) {
                   (unsigned long long)((uint64_t)m.cfg.n_kv_heads * m.cfg.head_dim));
     }
 
+    /* Linear-attention layer wiring, checked against the file directly and
+     * against the DeltaNet shape relations from qwen3_5.py (Task 7). The
+     * qwen35.ssm.* metadata keys name the DeltaNet dims: group_count is the
+     * key-head count, state_size the key head dim, time_step_rank the
+     * value-head count, inner_size the total value width, conv_kernel the
+     * short conv's kernel. Layer 0 is a linear-attention layer. */
+    uint32_t k_heads = 0, k_head_dim = 0, v_heads = 0, v_dim = 0, conv_k = 0;
+    bool ssm_meta = sg_gguf_get_u32(g, "qwen35.ssm.group_count", &k_heads)
+                 && sg_gguf_get_u32(g, "qwen35.ssm.state_size", &k_head_dim)
+                 && sg_gguf_get_u32(g, "qwen35.ssm.time_step_rank", &v_heads)
+                 && sg_gguf_get_u32(g, "qwen35.ssm.inner_size", &v_dim)
+                 && sg_gguf_get_u32(g, "qwen35.ssm.conv_kernel", &conv_k);
+    tt_assert(ssm_meta, "gguf should carry the qwen35.ssm.* DeltaNet metadata keys");
+    if (ssm_meta) {
+        uint32_t key_dim = k_heads * k_head_dim;
+        uint32_t conv_dim = 2 * key_dim + v_dim;
+        const sg_tensor *qkv = sg_gguf_tensor(g, "blk.0.attn_qkv.weight");
+        const sg_tensor *z = sg_gguf_tensor(g, "blk.0.attn_gate.weight");
+        const sg_tensor *cv = sg_gguf_tensor(g, "blk.0.ssm_conv1d.weight");
+        const sg_tensor *al = sg_gguf_tensor(g, "blk.0.ssm_a");
+        const sg_tensor *dt = sg_gguf_tensor(g, "blk.0.ssm_dt.bias");
+        const sg_tensor *nw = sg_gguf_tensor(g, "blk.0.ssm_norm.weight");
+        const sg_tensor *ow = sg_gguf_tensor(g, "blk.0.ssm_out.weight");
+        const sg_tensor *ba = sg_gguf_tensor(g, "blk.0.ssm_beta.weight");
+        const sg_tensor *aa = sg_gguf_tensor(g, "blk.0.ssm_alpha.weight");
+        tt_assert(qkv && z && cv && al && dt && nw && ow && ba && aa,
+                  "all nine blk.0 DeltaNet tensors should be found directly");
+        if (qkv && z && cv && al && dt && nw && ow && ba && aa) {
+            tt_assert(m.layers[0].ssm_in_qkv == qkv->data,
+                      "gguf layer 0 ssm_in_qkv should point at blk.0.attn_qkv.weight");
+            tt_assert(m.layers[0].ssm_in_z == z->data,
+                      "gguf layer 0 ssm_in_z should point at blk.0.attn_gate.weight");
+            tt_assert(m.layers[0].ssm_in_b == ba->data,
+                      "gguf layer 0 ssm_in_b should point at blk.0.ssm_beta.weight");
+            tt_assert(m.layers[0].ssm_in_a == aa->data,
+                      "gguf layer 0 ssm_in_a should point at blk.0.ssm_alpha.weight");
+            tt_assert(m.layers[0].ssm_a_log == al->data,
+                      "gguf layer 0 ssm_a_log should point at blk.0.ssm_a");
+            tt_assert(m.layers[0].ssm_conv1d == cv->data,
+                      "gguf layer 0 ssm_conv1d should point at blk.0.ssm_conv1d.weight");
+
+            /* GGUF stores dims fastest-axis-first, so a [in, out] linear is
+             * dims[0]=in, dims[1]=out. */
+            tt_assert(qkv->dims[1] == conv_dim,
+                      "blk.0.attn_qkv out width (%llu) should be 2*key_dim+value_dim (%u)",
+                      (unsigned long long)qkv->dims[1], conv_dim);
+            tt_assert(qkv->dims[0] == m.cfg.hidden,
+                      "blk.0.attn_qkv in width (%llu) should be hidden (%u)",
+                      (unsigned long long)qkv->dims[0], m.cfg.hidden);
+            tt_assert(z->dims[1] == v_dim,
+                      "blk.0.attn_gate out width (%llu) should be value_dim (%u) -- it is "
+                      "the DeltaNet's in_proj_z, despite the attn_ name prefix",
+                      (unsigned long long)z->dims[1], v_dim);
+            tt_assert(cv->dims[0] == conv_k && cv->dims[1] == conv_dim,
+                      "blk.0.ssm_conv1d.weight should be [conv_kernel %u, conv_dim %u], "
+                      "got [%llu, %llu]", conv_k, conv_dim,
+                      (unsigned long long)cv->dims[0], (unsigned long long)cv->dims[1]);
+            tt_assert(al->dims[0] == v_heads && dt->dims[0] == v_heads,
+                      "blk.0.ssm_a and ssm_dt.bias should both be [num_v_heads %u], "
+                      "got [%llu] and [%llu]", v_heads,
+                      (unsigned long long)al->dims[0], (unsigned long long)dt->dims[0]);
+            tt_assert(v_heads != 0 && nw->dims[0] == v_dim / v_heads,
+                      "blk.0.ssm_norm.weight should be [head_v_dim %u], got [%llu]",
+                      v_heads ? v_dim / v_heads : 0, (unsigned long long)nw->dims[0]);
+            tt_assert(ow->dims[0] == v_dim && ow->dims[1] == m.cfg.hidden,
+                      "blk.0.ssm_out.weight should be [value_dim %u, hidden %u], got [%llu, %llu]",
+                      v_dim, m.cfg.hidden,
+                      (unsigned long long)ow->dims[0], (unsigned long long)ow->dims[1]);
+            tt_assert(ba->dims[1] == v_heads && aa->dims[1] == v_heads,
+                      "blk.0.ssm_beta/alpha out widths should both be num_v_heads (%u), "
+                      "got %llu and %llu", v_heads,
+                      (unsigned long long)ba->dims[1], (unsigned long long)aa->dims[1]);
+        }
+        /* A full-attention layer must carry none of them. */
+        tt_assert(sg_gguf_tensor(g, "blk.3.ssm_conv1d.weight") == NULL,
+                  "blk.3 (full-attention) should have no ssm_conv1d.weight");
+        tt_assert(sg_gguf_tensor(g, "blk.3.attn_qkv.weight") == NULL,
+                  "blk.3 (full-attention) should have no attn_qkv.weight");
+    }
+
+    /* Norm-weight scale: the GGUF's are absolute (mlx's +1.0 sanitize shift
+     * is already baked in by the converter), so their means sit near 1. All
+     * of these are F32 in the GGUF even though the matmul weights are Q8_0. */
+    tt_assert(m.layers[0].ln1 != NULL && m.layers[3].q_norm != NULL,
+              "gguf norm pointers needed for the scale check");
+    if (m.layers[0].ln1 && m.layers[3].q_norm) {
+        double ln1_mean = f32_mean(m.layers[0].ln1, m.cfg.hidden);
+        double qn_mean = f32_mean(m.layers[3].q_norm, m.cfg.head_dim);
+        tt_assert(ln1_mean > 0.5,
+                  "gguf blk.0.attn_norm.weight mean is %.4f; the GGUF's norm weights "
+                  "should be ABSOLUTE (near 1), i.e. mlx's +1.0 sanitize shift already "
+                  "applied by the converter", ln1_mean);
+        tt_assert(qn_mean > 0.5,
+                  "gguf blk.3.attn_q_norm.weight mean is %.4f; expected absolute (near 1)",
+                  qn_mean);
+        fprintf(stderr, "   gguf norm means: attn_norm %.4f, attn_q_norm %.4f "
+                        "(absolute scale)\n", ln1_mean, qn_mean);
+    }
+
     g_gguf_rope_theta = m.cfg.rope_theta;
     g_gguf_rms_eps = m.cfg.rms_eps;
     g_gguf_vocab = m.cfg.vocab;
@@ -237,6 +382,130 @@ static void model_from_st_real(void) {
                   "st k_proj out rows (%llu) should be n_kv_heads*head_dim (%llu), no gate",
                   (unsigned long long)k_dims[0],
                   (unsigned long long)((uint64_t)m.cfg.n_kv_heads * m.cfg.head_dim));
+    }
+
+    /* Linear-attention layer wiring (Task 7). config.json's text_config
+     * names the DeltaNet dims directly; st.c's config lookup already
+     * descends into text_config. Layer 0 is a linear-attention layer. */
+    uint32_t k_heads = 0, k_head_dim = 0, v_heads = 0, v_head_dim = 0, conv_k = 0;
+    bool ssm_cfg = sg_st_config_u32(s, "linear_num_key_heads", &k_heads)
+                && sg_st_config_u32(s, "linear_key_head_dim", &k_head_dim)
+                && sg_st_config_u32(s, "linear_num_value_heads", &v_heads)
+                && sg_st_config_u32(s, "linear_value_head_dim", &v_head_dim)
+                && sg_st_config_u32(s, "linear_conv_kernel_dim", &conv_k);
+    tt_assert(ssm_cfg, "config.json should carry the linear_* DeltaNet dims");
+    if (ssm_cfg) {
+        uint32_t key_dim = k_heads * k_head_dim;
+        uint32_t v_dim = v_heads * v_head_dim;
+        uint32_t conv_dim = 2 * key_dim + v_dim;
+
+        const uint16_t *qkv = NULL, *z = NULL, *cv = NULL, *dt = NULL,
+                       *ow = NULL, *bw = NULL, *aw = NULL;
+        const float *al = NULL, *nw = NULL;
+        uint64_t d_qkv[4] = {0}, d_z[4] = {0}, d_cv[4] = {0}, d_al[4] = {0},
+                 d_dt[4] = {0}, d_nw[4] = {0}, d_ow[4] = {0}, d_bw[4] = {0}, d_aw[4] = {0};
+        uint32_t nd_cv = 0;
+#define ST_L0(nm, var, dims, nd) \
+        sg_st_tensor(s, "model.language_model.layers.0.linear_attn." nm, &var, dims, nd)
+        bool found = ST_L0("in_proj_qkv.weight", qkv, d_qkv, NULL)
+                  && ST_L0("in_proj_z.weight", z, d_z, NULL)
+                  && ST_L0("conv1d.weight", cv, d_cv, &nd_cv)
+                  && ST_L0("dt_bias", dt, d_dt, NULL)
+                  && ST_L0("out_proj.weight", ow, d_ow, NULL)
+                  && ST_L0("in_proj_b.weight", bw, d_bw, NULL)
+                  && ST_L0("in_proj_a.weight", aw, d_aw, NULL);
+#undef ST_L0
+        /* A_log and norm.weight are F32 in this checkpoint while the other
+         * seven tensors of the same layer are BF16 -- sg_st_tensor cannot
+         * see them at all, which is why sg_st_tensor_f32 exists. */
+        found = found
+             && sg_st_tensor_f32(s, "model.language_model.layers.0.linear_attn.A_log",
+                                 &al, d_al, NULL)
+             && sg_st_tensor_f32(s, "model.language_model.layers.0.linear_attn.norm.weight",
+                                 &nw, d_nw, NULL);
+        tt_assert(found, "all nine layer-0 linear_attn tensors should be found directly");
+
+        tt_assert(!sg_st_tensor(s, "model.language_model.layers.0.linear_attn.A_log",
+                                NULL, NULL, NULL),
+                  "linear_attn.A_log is F32, so the bf16 accessor must NOT return it");
+
+        if (found) {
+            tt_assert(m.layers[0].ssm_in_qkv == qkv, "st layer 0 ssm_in_qkv wiring");
+            tt_assert(m.layers[0].ssm_in_z == z, "st layer 0 ssm_in_z wiring");
+            tt_assert(m.layers[0].ssm_in_b == bw, "st layer 0 ssm_in_b wiring");
+            tt_assert(m.layers[0].ssm_in_a == aw, "st layer 0 ssm_in_a wiring");
+            tt_assert(m.layers[0].ssm_a_log == al, "st layer 0 ssm_a_log wiring");
+            tt_assert(m.layers[0].ssm_dt_bias == dt, "st layer 0 ssm_dt_bias wiring");
+            tt_assert(m.layers[0].ssm_conv1d == cv, "st layer 0 ssm_conv1d wiring");
+            tt_assert(m.layers[0].ssm_norm == nw, "st layer 0 ssm_norm wiring");
+            tt_assert(m.layers[0].ssm_out == ow, "st layer 0 ssm_out wiring");
+
+            /* safetensors shape is [out_features, in_features]. */
+            tt_assert(d_qkv[0] == conv_dim && d_qkv[1] == m.cfg.hidden,
+                      "in_proj_qkv should be [2*key_dim+value_dim %u, hidden %u], got [%llu, %llu]",
+                      conv_dim, m.cfg.hidden,
+                      (unsigned long long)d_qkv[0], (unsigned long long)d_qkv[1]);
+            tt_assert(d_z[0] == v_dim, "in_proj_z out width (%llu) should be value_dim (%u)",
+                      (unsigned long long)d_z[0], v_dim);
+            /* Unsanitized HF layout: [conv_dim, 1, kernel]. mlx's sanitize
+             * moves the axes to [conv_dim, kernel, 1]; surge reads the raw
+             * checkpoint, so the kernel is the LAST axis here. */
+            tt_assert(nd_cv == 3 && d_cv[0] == conv_dim && d_cv[1] == 1 && d_cv[2] == conv_k,
+                      "conv1d.weight should be [conv_dim %u, 1, kernel %u], got rank %u "
+                      "[%llu, %llu, %llu]", conv_dim, conv_k, nd_cv,
+                      (unsigned long long)d_cv[0], (unsigned long long)d_cv[1],
+                      (unsigned long long)d_cv[2]);
+            tt_assert(d_al[0] == v_heads && d_dt[0] == v_heads,
+                      "A_log and dt_bias should both be [num_v_heads %u], got [%llu] and [%llu]",
+                      v_heads, (unsigned long long)d_al[0], (unsigned long long)d_dt[0]);
+            tt_assert(d_nw[0] == v_head_dim,
+                      "linear_attn.norm.weight should be [value_head_dim %u], got [%llu]",
+                      v_head_dim, (unsigned long long)d_nw[0]);
+            tt_assert(d_ow[0] == m.cfg.hidden && d_ow[1] == v_dim,
+                      "out_proj should be [hidden %u, value_dim %u], got [%llu, %llu]",
+                      m.cfg.hidden, v_dim,
+                      (unsigned long long)d_ow[0], (unsigned long long)d_ow[1]);
+            tt_assert(d_bw[0] == v_heads && d_aw[0] == v_heads,
+                      "in_proj_b/in_proj_a out widths should both be num_v_heads (%u), "
+                      "got %llu and %llu", v_heads,
+                      (unsigned long long)d_bw[0], (unsigned long long)d_aw[0]);
+        }
+
+        tt_assert(!sg_st_tensor(s, "model.language_model.layers.3.linear_attn.in_proj_qkv.weight",
+                                NULL, NULL, NULL),
+                  "layer 3 (full-attention) should have no linear_attn.in_proj_qkv.weight");
+    }
+
+    /* The mirror of the GGUF check above, and the one that matters: this
+     * checkpoint carries mtp.* tensors AND an unsanitized conv1d weight
+     * ([6144, 1, 4], last axis != 1), so mlx's TextModel.sanitize adds 1.0
+     * to these five norm families at load time. The file therefore stores
+     * them centred near 0, and a forward pass must add the 1.0 back. The
+     * assertion is deliberately two-sided so that a future checkpoint which
+     * flips the convention fails loudly here instead of producing quietly
+     * wrong logits. ssm_norm is NOT in mlx's shift list and is checked to
+     * confirm it stays on the absolute scale. */
+    tt_assert(m.layers[0].ln1 != NULL && m.layers[3].q_norm != NULL
+              && m.layers[0].ssm_norm != NULL,
+              "st norm pointers needed for the scale check");
+    if (m.layers[0].ln1 && m.layers[3].q_norm && m.layers[0].ssm_norm) {
+        double ln1_mean = bf16_mean(m.layers[0].ln1, m.cfg.hidden);
+        double qn_mean = bf16_mean(m.layers[3].q_norm, m.cfg.head_dim);
+        double ssm_mean = f32_mean(m.layers[0].ssm_norm, 128);
+        tt_assert(ln1_mean < 0.5,
+                  "st layers.0.input_layernorm.weight mean is %.4f; this checkpoint "
+                  "stores norm weights RESIDUAL (near 0) and mlx's sanitize adds 1.0 "
+                  "at load time -- the forward pass must do the same", ln1_mean);
+        tt_assert(qn_mean < 0.5,
+                  "st layers.3.self_attn.q_norm.weight mean is %.4f; expected residual "
+                  "(near 0), same +1.0 shift as input_layernorm", qn_mean);
+        tt_assert(ssm_mean > 0.5,
+                  "st layers.0.linear_attn.norm.weight mean is %.4f; ssm_norm is NOT in "
+                  "mlx's sanitize shift list and should already be absolute (near 1)",
+                  ssm_mean);
+        fprintf(stderr, "   st norm means: input_layernorm %.4f, q_norm %.4f "
+                        "(residual, need +1.0), linear_attn.norm %.4f (absolute)\n",
+                ln1_mean, qn_mean, ssm_mean);
     }
 
     g_st_rope_theta = m.cfg.rope_theta;

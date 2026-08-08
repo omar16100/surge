@@ -8,7 +8,7 @@
 | 4 | tokenizer | done |
 | 5 | safetensors | done |
 | 6 | model config | done |
-| 7 | ref ops | pending |
+| 7 | ref ops (hybrid) | done |
 | 8 | ref forward + M1 gate | pending |
 | 9 | metal ops | pending |
 | 10 | metal decode + M2 gate | pending |
@@ -219,3 +219,149 @@
   source a genuinely dense validation checkpoint, or explicitly narrow M1's
   goal to the full-attention subset. Flagged prominently in the Task 6
   report rather than deferred to Task 8's discovery.
+
+## Task 7 Results (ref.c hybrid ops vs mlx fixtures)
+
+- Scope followed the plan's Hybrid revision, not the original brief: the ops
+  are the ones the real qwen3_5 hybrid needs, and the ground truth is the
+  mlx-lm implementation itself, called on seeded random inputs, never a
+  prose description. Read while porting: qwen3_5.py (GatedDeltaNet),
+  qwen3_next.py (Qwen3NextAttention, Qwen3NextRMSNormGated), gated_delta.py
+  (gated_delta_update / _gated_delta_step_ops), rope_utils.py
+  (initialize_rope -> nn.RoPE for rope type "default").
+- src/ref.c, 15 ops. Base six unchanged in signature: sg_ref_rmsnorm (w may
+  be NULL = mx.fast.rms_norm(x, None, eps)), sg_ref_rope, sg_ref_matvec_bf16,
+  sg_ref_matvec_q8, sg_ref_softmax, sg_ref_swiglu. Hybrid additions:
+  sg_ref_rope_partial, sg_ref_matvec_f32, sg_ref_silu, sg_ref_gate_sigmoid,
+  sg_ref_sigmoid, sg_ref_softplus, sg_ref_delta_decay,
+  sg_ref_conv1d_causal, sg_ref_delta_step. Every reduction accumulates in
+  double; transcendentals are the double libm ones.
+- Conventions confirmed against mlx by direct probe, then pinned by a
+  fixture record: RoPE is half-split (element i pairs with i + rope_dim/2),
+  NOT interleaved, and only the first rope_dim of head_dim rotates (both
+  checkpoints: rope_dim 64 of head_dim 256); the attention output gate is
+  sigmoid, and the per-head split of the 2x-wide q_proj is
+  [queries | gate] within each head, not one gate block after all queries;
+  the conv is a depthwise cross-correlation (no kernel flip) with the
+  newest token on the LAST tap; DeltaNet q/k are RMS-normed with weight
+  None and a hardcoded eps of 1e-6 (not the config eps) and then scaled by
+  1/head_k_dim and 1/sqrt(head_k_dim) respectively -- they are NOT
+  L2-normalized; the delta readout uses the state after the k/v write.
+- Two fixture files, both committed, both generated with
+  /Users/macmini/models/dsv4-venv/bin/python:
+  tests/fixtures/ops.bin (numpy, base ops, `--ops`) and
+  tests/fixtures/hybrid_ops.bin (mlx, `--hybrid`). Shared "SURGEOPS"
+  container: 8-byte magic, u32 version, u32 record count, a 36-byte
+  directory entry per record (name offset, dtype, rank, dims[4], data
+  offset, byte length), a name blob, then a 4-byte-aligned data blob.
+  Layout documented in a comment block in tools/make_fixtures.py; reader is
+  the fx_* helpers in tests/test_ref_ops.c.
+- The hybrid fixture has two tiers. Tier 1 is op-by-op against the exact
+  mlx primitive. Tier 2 is the stronger option the plan allows: a real mlx
+  GatedDeltaNet and a real mlx Qwen3NextAttention were instantiated at
+  small dims (hidden 48; 3 attention heads over 1 kv head; head_dim 32 with
+  rope_dim 8; 2 DeltaNet key heads feeding 4 value heads; key/value head
+  dim 32; conv kernel 4) with seeded random weights, and each was run as a
+  5-token prefill followed by a 1-token decode against a real mlx cache
+  (ArraysCache / KVCache). tests/test_ref_ops.c rebuilds both submodules
+  end to end out of nothing but sg_ref_* calls, streaming one token at a
+  time, and matches all six tokens. Dims were chosen non-square and with
+  both head-repeat factors > 1 so a wrong GQA/value-head repeat cannot pass.
+- Measured max abs error vs mlx: 1.7e-6 (GatedDeltaNet prefill), 7.2e-7
+  (GatedDeltaNet decode), 7.2e-7 (attention prefill), 6.0e-7 (attention
+  decode); worst single op 3.8e-6 (chained delta rule). Tolerance 1e-4.
+- Base ops keep the brief's tolerances (1e-5 f32, 3e-2 bf16 matvec, 2e-2
+  Q8_0 matvec vs the unquantized answer) AND add a 1e-5 check against a
+  matvec over the ROUNDED weights, which is what actually pins the bf16
+  widening and the Q8_0 unpacking rather than merely bounding quantization
+  noise. The generator asserts both quantization bounds hold before writing,
+  so a regenerated fixture cannot silently violate them.
+- Task 6 review follow-up (MEDIUM): sg_layer_w gained nine DeltaNet fields
+  (ssm_in_qkv, ssm_in_z, ssm_in_b, ssm_in_a, ssm_a_log, ssm_dt_bias,
+  ssm_conv1d, ssm_norm, ssm_out) and both loaders map them, still by tensor
+  presence. Names verified with ./surge-info and a direct header dump
+  against both real files; two corrections to the names supplied in the
+  task: the GGUF a/b projections are blk.N.ssm_alpha.weight and
+  blk.N.ssm_beta.weight (not bare ssm_alpha/ssm_beta), while blk.N.ssm_a
+  really is bare. test_model.c now asserts the two groups are exact
+  complements on every checked layer and cross-checks all nine tensors'
+  shapes against the DeltaNet dim relations on both real files.
+- st.c change forced by the real checkpoint: linear_attn.A_log and
+  linear_attn.norm.weight are F32 while the other seven tensors of the same
+  layer are BF16 (36 F32 tensors in the 2B file = 18 linear layers x 2), and
+  mlx's cast_predicate deliberately exempts A_log. The bf16-only index could
+  not reach them at all, so st.c now indexes F32 tensors too, retrievable
+  only via the new sg_st_tensor_f32; sg_st_tensor still returns BF16 and
+  nothing else (pinned by an assertion that the bf16 accessor refuses
+  A_log).
+- .gitignore's blanket `*.bin` was silently excluding the new fixtures;
+  added a `!tests/fixtures/*.bin` exception.
+- 177/177 ref-op checks pass; 224/224 model checks against both real
+  checkpoints. `make check` and `make debug` (ASan) green in all four
+  env-var combinations (with/without SURGE_GGUF x with/without SURGE_ST).
+- Open concerns carried to Task 8:
+  1. The GGUF ssm_alpha <-> in_proj_a / ssm_beta <-> in_proj_b pairing is
+     by NAME only: both tensors are [hidden, num_v_heads], so shape cannot
+     disambiguate them. Swapping them would change the decay and beta gates
+     without any shape error. Unverified until the M1 gate.
+  2. Whether GGUF's blk.N.ssm_a holds A_log or A (mlx wants A_log, and
+     applies exp() to it) is likewise unverified numerically.
+  3. mlx's TextModel.sanitize adds 1.0 to every RMSNorm weight (input/
+     post_attention layernorms, model.norm, q_norm, k_norm) when the
+     checkpoint carries mtp.* weights or an unsanitized conv1d -- the real
+     2B checkpoint carries BOTH. Task 8's loader must reproduce that shift
+     or every norm will be wrong. Not a Task 7 concern (op fixtures use
+     weights generated in-process, post-sanitize) but it is a landmine.
+  4. Safetensors conv1d.weight is stored [conv_dim, 1, kernel]; mlx's
+     sanitize moves it to [conv_dim, kernel, 1]. GGUF stores it as
+     [kernel, conv_dim] with GGUF's reversed dim order, i.e. the same
+     [conv_dim][kernel] memory layout sg_ref_conv1d_causal wants. The
+     safetensors path needs no transpose either (the middle axis is 1), but
+     the two sources' element order should be re-confirmed in Task 8.
+  5. Codex was unavailable again (usage limit until Aug 9); review was done
+     by an adversarial general-purpose agent, same fallback as Tasks 4-6.
+- Review round (codex over its usage limit again -- same adversarial
+  general-purpose agent fallback as Tasks 4-6). 2 HIGH, 7 MEDIUM, 10 LOW;
+  all triaged, every one fixed or explicitly recorded in the task-7 report.
+  The two that changed the work rather than polishing it:
+  1. The attention fixture used num_key_value_heads=1, which makes every
+     candidate GQA head map identical -- the reviewer killed mutants proving
+     the convention was untested. Regenerated at 4 heads over 2 kv heads and
+     tightened the assertion to n_kv >= 2 with repeat >= 2. The C's
+     hk = h / repeat was already right; now it is actually tested.
+  2. `make debug` never rebuilt (make does not track CFLAGS), so a
+     `make check` followed by `make debug` re-ran the uninstrumented
+     binaries and reported a sanitizer pass that never ran a sanitizer.
+     Task 7's own runs had deleted the binaries first so they were real, but
+     the workflow was broken for anyone else. Makefile now removes the test
+     binaries, recurses with the flags on the command line, and adds UBSan
+     alongside ASan -- which immediately found a genuine misaligned uint32_t
+     load in tests/test_gguf.c (pre-existing, Task 2), now a memcpy.
+  Also fixed: the fixture reader could heap-overflow on a truncated file
+  (now validates name termination, payload bounds, nbytes == prod(dims) *
+  elem_size, and payload alignment, and every getter states the element
+  count it is about to read); indexing F32 in st.c had turned a legal
+  2-aligned F32 tensor into a hard sg_st_open failure (now skipped, not
+  fatal, restoring the pre-Task-7 contract -- verified with a crafted
+  shard); the F32 path had no synthetic coverage at all (mini_st now carries
+  an F32 and an I8 tensor, with strict-typing assertions both directions);
+  sg_ref_softmax returned NaN for an all -inf row; and eight LOW items.
+- RoPE precision decision, recorded because it will resurface: mlx rounds
+  the rotation angle to f32, so at the real checkpoint's parameters
+  (head_dim 256, rope_dim 64, theta 1e7) mlx's own output drifts from the
+  exact answer by 1.5e-4 at pos 4096, 9.5e-4 at 32768 and 8.1e-3 at 262143.
+  Verified it is the angle rounding and not a transcendental problem
+  (mx.cos of the f32-rounded angle matches the double cosine of that same
+  value to 6.6e-8), and that no obvious f32 formulation reproduces
+  mx.fast.rope any better than the exact answer does. sg_ref_rope_partial
+  therefore stays in double, and the gap is PINNED rather than hidden: new
+  rope_real.* fixture records store both the mlx output and a float64
+  reference at positions 0/1/4096/32768/262143, the test matches the C to
+  the float64 reference at 1e-5 (exact at every position) and asserts the
+  measured mlx gap. This is a floor on any surge-vs-mlx comparison at long
+  context; Task 8/9 must budget for it.
+- Final state: 204 ref-op checks, 231 model checks (both real checkpoints),
+  58 safetensors checks, 125 tokenizer checks, 44 gguf checks -- all 0
+  failures. `make check` and `make debug` (ASan + UBSan) green with 0
+  sanitizer reports in all four env-var combinations. All three fixture
+  generators regenerate byte-identically.

@@ -32,7 +32,13 @@ static void gguf_open_close(void) {
     tt_assert(elem_type == SG_GGUF_U32, "test.arr elem_type should be U32");
     tt_assert(arr_count == 3, "test.arr count should be 3");
     if (arr_data && arr_count == 3) {
-        const uint32_t *vals = (const uint32_t *)arr_data;
+        /* sg_gguf_get_arr hands back a pointer straight into the mmap'd
+         * file, and GGUF array payloads carry no alignment guarantee at all
+         * (this one lands on a 2-byte boundary in the fixture), so the
+         * elements must be memcpy'd out rather than read through a
+         * uint32_t*. Casting works on arm64 but is UB, and UBSan flags it. */
+        uint32_t vals[3];
+        memcpy(vals, arr_data, sizeof vals);
         tt_assert(vals[0] == 1 && vals[1] == 2 && vals[2] == 3,
                   "test.arr values should be 1,2,3");
     }

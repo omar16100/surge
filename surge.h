@@ -73,4 +73,36 @@ bool sg_st_tensor(const sg_st *s, const char *name, const uint16_t **data,
 bool sg_st_config_u32(const sg_st *s, const char *key, uint32_t *out);
 bool sg_st_config_f32(const sg_st *s, const char *key, float *out);
 
+/* Config extraction + weight-name mapping for the qwen3_5/qwen35 dense-attention
+ * subset (Task 6). Real Qwen3.5/3.6 checkpoints are a hybrid of full (softmax)
+ * attention layers and linear-attention (gated Delta-Net / SSM) layers,
+ * interleaved every full_attention_interval layers (4 in both checkpoints this
+ * project targets); only full-attention layers carry the q/k/v/o + qk-norm
+ * tensors sg_layer_w names below, so those six pointers are NULL on a
+ * linear-attention layer (its state lives in tensors this loader does not map,
+ * e.g. GGUF's blk.N.ssm_*). gate_proj/up_proj/down_proj/ln1/ln2 are populated
+ * for every layer, attention or linear, since both layer kinds share the same
+ * MLP and pre/post norms. */
+typedef struct {
+    uint32_t n_layers, n_heads, n_kv_heads, head_dim, hidden, ffn_hidden, vocab;
+    float rope_theta, rms_eps;
+    bool tied_embeddings;
+} sg_cfg;
+
+typedef struct {
+    const void *q_proj, *k_proj, *v_proj, *o_proj, *q_norm, *k_norm,
+               *gate_proj, *up_proj, *down_proj, *ln1, *ln2;
+} sg_layer_w; /* per layer; attention-only fields NULL on a linear-attention layer */
+
+typedef struct {
+    sg_cfg cfg;
+    const void *tok_emb, *out_norm, *lm_head; /* lm_head == tok_emb when cfg.tied_embeddings */
+    sg_layer_w *layers;  /* cfg.n_layers entries, owned; free with sg_model_free */
+    sg_tensor_type wtype;
+} sg_model;
+
+sg_err sg_model_from_gguf(const sg_gguf *g, sg_model *m);
+sg_err sg_model_from_st(const sg_st *s, sg_model *m);
+void sg_model_free(sg_model *m);
+
 #endif

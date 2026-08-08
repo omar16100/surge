@@ -7,7 +7,7 @@
 | 3 | surge-info + real GGUF | done |
 | 4 | tokenizer | done |
 | 5 | safetensors | done |
-| 6 | model config | pending |
+| 6 | model config | done |
 | 7 | ref ops | pending |
 | 8 | ref forward + M1 gate | pending |
 | 9 | metal ops | pending |
@@ -117,3 +117,105 @@
   via a malloc-interposition harness, confirmed all 11 stated requirements
   and the bf16 hex-constant sanity check. Re-verified full green (make
   check, SURGE_ST make check, both make debug/ASan variants) after the fix.
+
+## Task 6 Results (model_qwen.c config + weight-name mapping)
+
+- **Major finding, checked before writing any code**: read
+  `/Users/macmini/models/dsv4-venv/.../mlx_lm/models/qwen3_5.py` per the
+  brief's instruction, then verified directly against both real checkpoints
+  (`surge-info` on the GGUF, a raw safetensors-header dump + config.json read
+  in Python on the 2B dir). Both the task brief and the project's design spec
+  (`docs/superpowers/specs/2026-08-08-surge-design.md` line 17-23) assume
+  Qwen3.6-27B / Qwen3.5-2B are DENSE transformers. This is factually wrong:
+  both real checkpoints are a HYBRID of full-softmax-attention layers and
+  linear-attention (gated Delta-Net / SSM) layers, interleaved every 4 layers
+  (`qwen35.full_attention_interval=4` in GGUF metadata,
+  `text_config.full_attention_interval=4` in config.json). Only 1 in 4 layers
+  (index 3, 7, 11, ... -- confirmed for all 64 layers of the 27B and all 24
+  of the 2B) carries q/k/v/o + qk-norm tensors under the brief's stated
+  names; the other 3 in 4 have GGUF `blk.N.ssm_{a,alpha,beta,conv1d,dt.bias,
+  norm,out}*` / safetensors `layers.N.linear_attn.*` tensors instead, which
+  this loader does not map (would need new sg_layer_w fields, out of Task
+  6's frozen interface). qwen3_5.py's own `Qwen3NextAttention` module
+  confirms the graph for full-attention layers: per-head QK-RMSNorm
+  (`nn.RMSNorm(head_dim)`, size-head_dim weight broadcast per head, matching
+  GGUF's `attn_q_norm.weight`/`attn_k_norm.weight` being `[head_dim]` not
+  `[n_heads, head_dim]`), standard (non-interleaved, "traditional=False")
+  RoPE applied to only `head_dim * partial_rotary_factor` (256*0.25=64)
+  dims -- matches GGUF's `qwen35.rope.dimension_count=64` -- and SwiGLU MLP.
+  It also revealed `attn_output_gate=true`: full-attention q_proj is folded
+  with a same-width gate, so its output is `2*n_heads*head_dim`, not
+  `n_heads*head_dim` (confirmed against real tensor shapes: GGUF
+  `blk.3.attn_q.weight` [5120,12288]=[hidden,2*24*256]; safetensors layer
+  3's `self_attn.q_proj.weight` [4096,2048]=[2*8*256,hidden]). k_proj/v_proj
+  stay unscaled (n_kv_heads*head_dim exactly).
+- Additional real-file corrections vs the brief (all verified against the
+  actual files, not assumed): (1) GGUF `general.architecture` is `"qwen35"`,
+  not `"qwen3_5"` -- read it first, use as key prefix, accept both spellings.
+  (2) GGUF's pre-MLP norm tensor is `blk.N.post_attention_norm.weight`, not
+  `blk.N.ffn_norm.weight` as the brief stated (that name doesn't exist in
+  the real file at all). (3) head_dim (256) cannot be derived from
+  hidden/heads (5120/24 isn't an integer) -- always read from
+  `qwen35.attention.key_length` (GGUF) / `head_dim` (config.json). (4) The
+  real 2B safetensors checkpoint is multimodal-wrapped: every text tensor is
+  nested under `model.language_model.*`, not the brief's plain
+  `model.*`; `lm_head.weight` is absent (`tie_word_embeddings: true`).
+  (5) `rope_theta` in the real config.json is nested two levels deep
+  (`text_config.rope_parameters.rope_theta`), not a flat
+  `text_config.rope_theta` key -- extended `st_config_lookup` in `src/st.c`
+  with a `rope_parameters` fallback tier (checked only after top-level and
+  `text_config` both miss, so no existing key resolution changes).
+- **Implementation decision**: given the hybrid reality, `sg_model_from_gguf`
+  / `sg_model_from_st` do plain per-layer name lookups exactly as specified;
+  `ln1`/`ln2`/`gate_proj`/`up_proj`/`down_proj` are REQUIRED (error the whole
+  load if any layer lacks them -- real files show these exist on every
+  layer, attention or linear); `q_proj`/`k_proj`/`v_proj`/`o_proj`/`q_norm`/
+  `k_norm` are OPTIONAL (silently NULL, not an error, when absent -- true
+  for 3/4 of layers on both real checkpoints). No architecture-rejection
+  logic was added; the loader always succeeds for a recognized qwen35/
+  qwen3_5 GGUF or well-formed HF config, and callers must treat a NULL
+  `q_proj` as "not a full-attention layer, do not run dense attention here."
+  tied_embeddings is inferred from output-tensor presence (GGUF
+  `output.weight`, safetensors `lm_head.weight`) on both loaders
+  symmetrically, not from a config bool (GGUF has no such key at all).
+- `tests/test_model.c`: fully env-gated on `SURGE_GGUF` and `SURGE_ST`
+  (auto-skip with a notice when unset, matching test_tok.c's precedent --
+  no synthetic fixture, since this is a pure mapping layer over gguf.c/st.c
+  which already have fixture coverage). Adjusted the brief's literal "layer
+  0 and n_layers-1 have every pointer non-NULL" to match reality: asserts
+  layer 3 and layer n_layers-1 (both confirmed full-attention on both real
+  checkpoints) have every pointer non-NULL, and explicitly asserts layer 0
+  (confirmed linear-attention on both) has NULL attention pointers but
+  non-NULL MLP/norm pointers -- pinning the hybrid-architecture discovery as
+  a regression check rather than working around it silently. Also
+  cross-checks the q_proj gate-width relation directly against real tensor
+  dims, and the "two loaders agree where comparable" requirement via vocab
+  (248320, same tokenizer) and rope_theta/rms_eps (same hyperparameter
+  family across the 27B and 2B). 132/132 checks pass against both real
+  checkpoints; `make check` and `make debug` (ASan) green in all four
+  env-var combinations (with/without SURGE_GGUF x with/without SURGE_ST).
+- Review round (codex quota exhausted again -- same fallback as Tasks 4/5:
+  adversarial general-purpose review agent): clean bill of health on memory
+  safety (every early-return after the layers `calloc` frees it, no
+  double-free/UAF), macro hygiene (REQ/OPT do-while-0 blocks, properly
+  scoped/undef'd per loader), snprintf truncation checks, the st.c
+  `rope_parameters` lookup-order extension (only consulted after top-level
+  and text_config both miss), and test assertion strength (cross-checked
+  against direct tensor lookups, not tautological). One suggestion adopted:
+  added an implausible-`n_layers`-count guard (>100000) before the `calloc`
+  in both loaders, mirroring gguf.c's existing implausible-count pattern,
+  since a corrupt/malicious block_count near UINT32_MAX had no bound before
+  failing fast on the first missing tensor.
+- **Blocking concern for Tasks 7-10**: the project's design spec explicitly
+  targets a dense-only forward pass and lists MoE as the only stated
+  non-goal. Since both real target checkpoints are actually hybrid
+  (linear-attention/SSM layers on 3 of every 4 layers, not MoE but also not
+  dense), a forward pass built only on this task's dense/full-attention
+  mapping cannot produce a correct end-to-end decode of either
+  Qwen3.6-27B-Q8_0.gguf or the Qwen3.5-2B checkpoint -- it would only be
+  able to exercise the 1-in-4 full-attention layers. This needs a scope
+  decision before Task 8 (ref forward + M1 gate vs mlx-lm) is attempted:
+  either extend scope to implement the gated Delta-Net/SSM path too, or
+  source a genuinely dense validation checkpoint, or explicitly narrow M1's
+  goal to the full-attention subset. Flagged prominently in the Task 6
+  report rather than deferred to Task 8's discovery.

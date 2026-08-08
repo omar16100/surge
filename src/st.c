@@ -838,15 +838,34 @@ bool sg_st_tensor(const sg_st *s, const char *name, const uint16_t **data,
 
 /* key looked up at the top level first, then inside "text_config" if absent
  * there (some HF configs, e.g. Qwen3.5's, nest the text model's
- * hyperparameters under "text_config"). */
+ * hyperparameters under "text_config"), then inside a "rope_parameters"
+ * object -- itself either at the top level or inside "text_config" -- as a
+ * last resort. That last tier exists because Qwen3.5's real config.json
+ * nests rope_theta two levels deep (text_config.rope_parameters.rope_theta)
+ * rather than as a flat text_config.rope_theta key; checked last so a key
+ * that resolves at a shallower level always wins. */
 static const jv *st_config_lookup(const sg_st *s, const char *key) {
     if (!s || !s->cfg_root || !key) return NULL;
     jv *v = jv_obj_get(s->cfg_root, key);
     if (v) return v;
+
     jv *tc = jv_obj_get(s->cfg_root, "text_config");
     if (tc && tc->kind == JV_OBJ) {
         v = jv_obj_get(tc, key);
         if (v) return v;
+    }
+
+    jv *rp = jv_obj_get(s->cfg_root, "rope_parameters");
+    if (rp && rp->kind == JV_OBJ) {
+        v = jv_obj_get(rp, key);
+        if (v) return v;
+    }
+    if (tc && tc->kind == JV_OBJ) {
+        jv *tc_rp = jv_obj_get(tc, "rope_parameters");
+        if (tc_rp && tc_rp->kind == JV_OBJ) {
+            v = jv_obj_get(tc_rp, key);
+            if (v) return v;
+        }
     }
     return NULL;
 }

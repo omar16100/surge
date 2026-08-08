@@ -7,6 +7,8 @@ check: $(TESTS:.c=.bin)
 LIB_SRC = $(filter-out src/metal.m $(wildcard src/cli_*.c),$(wildcard src/*.c))
 tests/%.bin: tests/%.c $(LIB_SRC)
 	$(CC) $(CFLAGS) -o $@ $< $(LIB_SRC)
+surge-info: src/cli_info.c $(LIB_SRC)
+	$(CC) $(CFLAGS) -o $@ $^
 debug: CFLAGS += -fsanitize=address -g -O0
 debug: check
 .PHONY: check debug

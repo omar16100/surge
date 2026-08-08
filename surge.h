@@ -27,6 +27,9 @@ bool sg_gguf_get_f32(const sg_gguf *g, const char *key, float *out);
 bool sg_gguf_get_str(const sg_gguf *g, const char *key, const char **out);
 bool sg_gguf_get_arr(const sg_gguf *g, const char *key, sg_gguf_kv_type *elem_type,
                      const void **data, uint64_t *count);
+uint32_t sg_gguf_version(const sg_gguf *g);
+uint64_t sg_gguf_kv_count(const sg_gguf *g);
+bool sg_gguf_kv_at(const sg_gguf *g, uint64_t i, const char **key_out, sg_gguf_kv_type *type_out);
 const sg_tensor *sg_gguf_tensor(const sg_gguf *g, const char *name);
 uint64_t sg_gguf_tensor_count(const sg_gguf *g);
 const sg_tensor *sg_gguf_tensor_at(const sg_gguf *g, uint64_t i);

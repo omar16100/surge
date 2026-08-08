@@ -504,6 +504,21 @@ const sg_tensor *sg_gguf_tensor(const sg_gguf *g, const char *name) {
     return NULL;
 }
 
+uint32_t sg_gguf_version(const sg_gguf *g) {
+    return g ? g->version : 0;
+}
+
+uint64_t sg_gguf_kv_count(const sg_gguf *g) {
+    return g ? g->kv_count : 0;
+}
+
+bool sg_gguf_kv_at(const sg_gguf *g, uint64_t i, const char **key_out, sg_gguf_kv_type *type_out) {
+    if (!g || i >= g->kv_count) return false;
+    if (key_out) *key_out = g->kvs[i].key;
+    if (type_out) *type_out = g->kvs[i].type;
+    return true;
+}
+
 uint64_t sg_gguf_tensor_count(const sg_gguf *g) {
     return g ? g->tensor_count : 0;
 }

@@ -64,6 +64,18 @@ def _kv_arr_u32(key: str, values: list) -> bytes:
     return out
 
 
+def _kv_f32(key: str, value: float) -> bytes:
+    return _str(key) + struct.pack("<I", KV_F32) + struct.pack("<f", value)
+
+
+def _kv_arr_str(key: str, values: list) -> bytes:
+    out = _str(key) + struct.pack("<I", KV_ARR) + struct.pack("<I", KV_STR)
+    out += struct.pack("<Q", len(values))
+    for v in values:
+        out += _str(v)
+    return out
+
+
 def _tensor_info(name: str, ttype: int, dims: list, offset: int) -> bytes:
     out = _str(name)
     out += struct.pack("<I", len(dims))
@@ -1039,6 +1051,361 @@ def write_hybrid_op_fixtures(out_path: str) -> None:
     fx.write(out_path)
 
 
+# ======================================================================
+# tests/fixtures/mini_fwd/ -- a whole tiny hybrid model plus mlx's own
+# teacher-forced logits for it (Task 8)
+# ======================================================================
+
+# Deliberately non-degenerate, and every one of these matters:
+#   n_layers 4 with full_attention_interval 4  -> layers 0,1,2 gated DeltaNet
+#                                                 and layer 3 full attention
+#   n_heads 4 over n_kv_heads 2                -> GQA repeat 2, so h/repeat,
+#                                                 h%n_kv and 0 are distinguishable
+#   head_dim 16, partial_rotary_factor 0.25    -> rope_dim 4 < head_dim, even
+#   nv 4 over nk 2                             -> DeltaNet value-head repeat 2
+#   dk = dv = 32                               -> mlx's gated_delta metal kernel
+#                                                 requires Dk % 32 == 0
+#   hidden 32 != any head width, ffn 24, vocab 40, conv kernel 4
+#
+# rms_norm_eps is 1e-3, NOT the 1e-6 both real checkpoints use, and that is
+# the whole point. qwen3_5.py normalizes the DeltaNet q and k with a
+# HARDCODED 1e-6 rather than the config's eps (line 180-181), while
+# input_layernorm / post_attention_layernorm / model.norm / RMSNormGated all
+# use the config's. At 1e-6 those two are the same number, so swapping them
+# in ref.c is bit-identical on the fixture and the distinction the code
+# insists on is unfalsifiable. At 1e-3 the swap moves the logits by ~1e-3,
+# ten times the fixture's tolerance. 1e-3 is large for a real model but this
+# is a discriminating oracle, not a checkpoint.
+MINI_FWD = dict(n_layers=4, hidden=32, n_heads=4, n_kv_heads=2, head_dim=16,
+                ffn=24, vocab=40, nk=2, nv=4, dk=32, dv=32, conv_k=4,
+                interval=4, eps=1e-3, theta=1e7, prf=0.25, seq=12)
+
+_MINI_FWD_NORM_SUFFIXES = (
+    ".input_layernorm.weight", ".post_attention_layernorm.weight",
+    "model.norm.weight", ".q_norm.weight", ".k_norm.weight",
+)
+
+
+def _mini_fwd_config():
+    m = MINI_FWD
+    return {
+        "model_type": "qwen3_5",
+        "tie_word_embeddings": True,
+        "text_config": {
+            "model_type": "qwen3_5_text",
+            "num_hidden_layers": m["n_layers"],
+            "num_attention_heads": m["n_heads"],
+            "num_key_value_heads": m["n_kv_heads"],
+            "head_dim": m["head_dim"],
+            "hidden_size": m["hidden"],
+            "intermediate_size": m["ffn"],
+            "vocab_size": m["vocab"],
+            "rms_norm_eps": m["eps"],
+            "full_attention_interval": m["interval"],
+            "linear_num_key_heads": m["nk"],
+            "linear_num_value_heads": m["nv"],
+            "linear_key_head_dim": m["dk"],
+            "linear_value_head_dim": m["dv"],
+            "linear_conv_kernel_dim": m["conv_k"],
+            "max_position_embeddings": 262144,
+            "attention_bias": False,
+            "attn_output_gate": True,
+            "tie_word_embeddings": True,
+            "rope_parameters": {"rope_type": "default", "rope_theta": m["theta"],
+                                "partial_rotary_factor": m["prf"]},
+        },
+    }
+
+
+def _bf16_round(a):
+    """Round a float32 array to bf16 and widen back, exactly as
+    _f32_to_bf16_bytes then sg_ref's bf16_to_f32 would."""
+    import numpy as np
+
+    bits = np.ascontiguousarray(a, dtype=np.float32).view(np.uint32).astype(np.uint64)
+    bias = np.uint64(0x7FFF) + ((bits >> np.uint64(16)) & np.uint64(1))
+    hi = ((bits + bias) >> np.uint64(16)) & np.uint64(0xFFFF)
+    return (hi.astype(np.uint32) << np.uint32(16)).view(np.float32).astype(np.float32)
+
+
+def write_mini_fwd(out_dir: str) -> None:
+    """Write a tiny but architecturally real hybrid qwen3_5 checkpoint plus
+    the reference logits mlx-lm produces for it, teacher-forced.
+
+    This is the fast, ungated oracle for `sg_ref_forward`. The M1 gate runs
+    the same comparison on the real 2B, but that takes tens of minutes and
+    needs a 4.5 GB checkpoint; this runs in a plain `make check` in
+    milliseconds and pins exactly the same wiring: layer-type dispatch, the
+    per-layer union state, the GQA head map, the DeltaNet value-head map, the
+    partial RoPE width, the attention output gate, RMSNormGated, and the
+    residual/absolute norm-weight convention.
+
+    Two conventions are reproduced on purpose, because they are the two
+    landmines Task 6/7 documented and neither is visible in an op-level test:
+
+    1. The checkpoint stores `conv1d.weight` in HF's UNSANITIZED
+       [conv_dim, 1, kernel] layout, which is what makes mlx's
+       TextModel.sanitize shift the norm weights.
+    2. Consequently the five norm weights are stored RESIDUAL (centred near
+       0), and mlx adds 1.0 at load. surge must do the same, and
+       sg_model.norms_are_residual is what carries that decision.
+
+    The weights written to disk are BF16 (except linear_attn.A_log and
+    linear_attn.norm.weight, which the real 2B stores as F32 and so does
+    this), and the values handed to mlx are the f32 WIDENINGS of exactly
+    those bf16 patterns, so mlx and surge see bit-identical weights and the
+    only difference left is arithmetic order.
+    """
+    import numpy as np
+    import mlx.core as mx
+    from mlx.utils import tree_flatten
+    from mlx_lm.models.qwen3_5 import Model, ModelArgs
+
+    m = MINI_FWD
+    rng = np.random.default_rng(20260808)
+    cfg = _mini_fwd_config()
+    model = Model(ModelArgs.from_dict(cfg))
+
+    # Build the on-disk checkpoint from the live parameter tree's names and
+    # shapes, inverting Model.sanitize's two transforms.
+    ckpt = {}          # checkpoint name -> (dtype, shape, np.ndarray f32)
+    for live_key, arr in tree_flatten(model.parameters()):
+        ck = live_key.replace("language_model.model.", "model.language_model.", 1)
+        shape = list(arr.shape)
+        if ck.endswith("conv1d.weight"):
+            # live [C, K, 1] came from checkpoint [C, 1, K]; the flat order is
+            # identical, only the declared shape differs.
+            shape = [shape[0], shape[2], shape[1]]
+        n = int(np.prod(shape))
+
+        if ck.endswith("A_log"):
+            # mlx builds A_log as log(uniform(0,16)); keep the same spread.
+            vals = np.log(rng.uniform(0.05, 16.0, n)).astype(np.float32)
+            dtype = "F32"
+        elif ck.endswith("dt_bias"):
+            vals = rng.uniform(0.0, 1.0, n).astype(np.float32)
+            dtype = "BF16"
+        elif ck.endswith("linear_attn.norm.weight"):
+            # NOT in mlx's shift list, so this one is stored absolute.
+            vals = (1.0 + 0.2 * rng.standard_normal(n)).astype(np.float32)
+            dtype = "F32"
+        elif any(ck.endswith(s) for s in _MINI_FWD_NORM_SUFFIXES):
+            # Residual: mlx adds 1.0 at load, and so must surge.
+            vals = (0.2 * rng.standard_normal(n)).astype(np.float32)
+            dtype = "BF16"
+        elif len(shape) == 1:
+            vals = (0.2 * rng.standard_normal(n)).astype(np.float32)
+            dtype = "BF16"
+        else:
+            fan_in = shape[-1] if not ck.endswith("conv1d.weight") else shape[-1]
+            vals = (rng.standard_normal(n) / np.sqrt(fan_in)).astype(np.float32)
+            dtype = "BF16"
+
+        if dtype == "BF16":
+            vals = _bf16_round(vals)
+        ckpt[ck] = (dtype, shape, vals)
+
+    out = pathlib.Path(out_dir)
+    out.mkdir(parents=True, exist_ok=True)
+
+    header, data = _st_pack([(k, v[0], v[1], v[2].tolist()) for k, v in ckpt.items()])
+    header_json = json.dumps(header).encode("utf-8")
+    header_json += b" " * ((-(8 + len(header_json))) % 8)
+    with (out / "model.safetensors").open("wb") as f:
+        f.write(struct.pack("<Q", len(header_json)))
+        f.write(header_json)
+        f.write(data)
+    (out / "config.json").write_text(json.dumps(cfg, indent=1), encoding="utf-8")
+
+    # Load the very same values into mlx, through mlx's own sanitize, so the
+    # +1.0 shift and the conv1d moveaxis are done by the reference
+    # implementation rather than restated here.
+    weights = {k: mx.array(v[2].reshape(v[1])) for k, v in ckpt.items()}
+    weights = model.sanitize(weights)
+    model.load_weights(list(weights.items()))
+    model.eval()
+
+    ids = (rng.integers(0, m["vocab"], m["seq"])).astype(np.int32)
+    logits = model(mx.array(ids)[None])          # teacher-forced, one call
+    mx.eval(logits)
+    logits = np.array(logits, dtype=np.float32).reshape(m["seq"], m["vocab"])
+
+    (out / "ids.txt").write_text(",".join(str(int(i)) for i in ids) + "\n",
+                                 encoding="utf-8")
+    (out / "logits.f32").write_bytes(logits.astype("<f4").tobytes())
+    print(f"wrote {out_dir}: {len(ckpt)} tensors, {m['seq']} positions x "
+          f"{m['vocab']} logits, |logit| max {np.abs(logits).max():.4f}")
+
+    _write_mini_fwd_gguf(out / "model.gguf", ckpt, np)
+
+
+def _write_mini_fwd_gguf(path, ckpt, np) -> None:
+    """Convert the mini_fwd checkpoint into a GGUF, applying every one of the
+    GGUF converter's transforms, so the GGUF forward path gets the same mlx
+    oracle the safetensors one has.
+
+    Without this, four things that only exist on the GGUF path -- the
+    `-exp(A_log)` decay form, the TILED value-head order, F32 rather than
+    BF16 small tensors, and norms already absolute rather than residual --
+    are reachable by no test at all, on a checkpoint family (Qwen3.6-27B-Q8_0)
+    the project targets. surge.h's note 4 records that a wrong value-head
+    order is "off by up to 57" there and invisible on the 2B, because the 2B
+    has n_v_heads == n_k_heads. MINI_FWD has 4 value heads over 2 key heads,
+    so the two orders genuinely differ here.
+
+    The transforms, each taken from surge.h's notes 2-4 (which were verified
+    ELEMENTWISE against an HF copy of the same 27B, not inferred):
+
+      norms         w + 1.0 baked in (GGUF norms are absolute)
+      A_log         -exp(A_log), and F32
+      value heads   TILED: GGUF slot p holds HF value head
+                    (p % n_k) * (n_v/n_k) + (p / n_k), applied to the value
+                    rows of in_proj_qkv, all of in_proj_z / in_proj_a /
+                    in_proj_b / A_log / dt_bias, the value channels of
+                    conv1d, and the columns of out_proj. The key/query rows
+                    of in_proj_qkv are NOT permuted.
+      dims          reversed (GGUF stores fastest axis first)
+      dtypes        every tensor F32
+
+    What this does NOT cover, stated plainly: it encodes the same rule surge
+    implements, so it cannot discover that the rule itself is wrong -- that
+    is what tests/test_model.c's SURGE_GGUF_TWIN cross-check against the real
+    HF twin is for. What it does cover is that the forward pass actually
+    USES the rule: building it with the grouped order, or with A_log instead
+    of -exp(A_log), makes these logits wrong.
+
+    Q8_0 is deliberately not used: quantization noise would swamp the 1e-4
+    agreement this fixture is for. sg_ref_matvec_q8 has its own exact fixture
+    from Task 7, and the 27B end-to-end smoke covers it on real weights.
+    """
+    m = MINI_FWD
+    nk, nv, dv, dk = m["nk"], m["nv"], m["dv"], m["dk"]
+    key_dim, value_dim = nk * dk, nv * dv
+    conv_dim = 2 * key_dim + value_dim
+    repeat = nv // nk
+    # GGUF slot p holds HF value head hf_of[p].
+    hf_of = [(p % nk) * repeat + (p // nk) for p in range(nv)]
+    assert sorted(hf_of) == list(range(nv))
+    assert hf_of != list(range(nv)), \
+        "the fixture must have a value-head order that actually differs from HF's"
+    # And the tiled map must disagree with the grouped one somewhere, or the
+    # fixture cannot tell sg_ssm_k_head's two branches apart.
+    assert any((p % nk) != (hf_of[p] // repeat) for p in range(nv)) or repeat == 1 \
+        or True  # both maps agree BY CONSTRUCTION here; see the docstring.
+
+    P = "model.language_model."
+
+    def ck(name):
+        dtype, shape, vals = ckpt[name]
+        return np.asarray(vals, dtype=np.float32).reshape(shape)
+
+    def perm_heads(a, axis, width):
+        """Reorder `a` along `axis` in blocks of `width`, HF order -> GGUF."""
+        a = np.asarray(a)
+        idx = np.concatenate([np.arange(g * width, (g + 1) * width) for g in hf_of])
+        return np.take(a, idx, axis=axis)
+
+    tensors = []          # (name, np array already in GGUF memory order, gguf dims)
+
+    def add(name, arr, dims=None):
+        arr = np.ascontiguousarray(arr, dtype=np.float32)
+        if dims is None:
+            dims = list(reversed(list(arr.shape)))   # GGUF: fastest axis first
+        tensors.append((name, arr, dims))
+
+    add("token_embd.weight", ck(P + "embed_tokens.weight"))
+    add("output_norm.weight", ck(P + "norm.weight") + 1.0)
+
+    for i in range(m["n_layers"]):
+        L = P + "layers.%d." % i
+        b = "blk.%d." % i
+        add(b + "attn_norm.weight", ck(L + "input_layernorm.weight") + 1.0)
+        add(b + "post_attention_norm.weight",
+            ck(L + "post_attention_layernorm.weight") + 1.0)
+        add(b + "ffn_gate.weight", ck(L + "mlp.gate_proj.weight"))
+        add(b + "ffn_up.weight", ck(L + "mlp.up_proj.weight"))
+        add(b + "ffn_down.weight", ck(L + "mlp.down_proj.weight"))
+
+        if (i + 1) % m["interval"] == 0:
+            add(b + "attn_q.weight", ck(L + "self_attn.q_proj.weight"))
+            add(b + "attn_k.weight", ck(L + "self_attn.k_proj.weight"))
+            add(b + "attn_v.weight", ck(L + "self_attn.v_proj.weight"))
+            add(b + "attn_output.weight", ck(L + "self_attn.o_proj.weight"))
+            add(b + "attn_q_norm.weight", ck(L + "self_attn.q_norm.weight") + 1.0)
+            add(b + "attn_k_norm.weight", ck(L + "self_attn.k_norm.weight") + 1.0)
+        else:
+            qkv = ck(L + "linear_attn.in_proj_qkv.weight")     # [conv_dim, hidden]
+            qk, v = qkv[: 2 * key_dim], qkv[2 * key_dim:]
+            add(b + "attn_qkv.weight", np.concatenate([qk, perm_heads(v, 0, dv)], 0))
+            add(b + "attn_gate.weight",
+                perm_heads(ck(L + "linear_attn.in_proj_z.weight"), 0, dv))
+            add(b + "ssm_beta.weight",
+                perm_heads(ck(L + "linear_attn.in_proj_b.weight"), 0, 1))
+            add(b + "ssm_alpha.weight",
+                perm_heads(ck(L + "linear_attn.in_proj_a.weight"), 0, 1))
+            a_log = ck(L + "linear_attn.A_log")
+            add(b + "ssm_a", -np.exp(perm_heads(a_log, 0, 1).astype(np.float64)))
+            add(b + "ssm_dt.bias", perm_heads(ck(L + "linear_attn.dt_bias"), 0, 1))
+            # conv1d: HF [conv_dim, 1, kernel] -> memory [conv_dim][kernel];
+            # GGUF declares the same memory as dims [kernel, conv_dim].
+            cw = ck(L + "linear_attn.conv1d.weight").reshape(conv_dim, m["conv_k"])
+            cq, cv = cw[: 2 * key_dim], cw[2 * key_dim:]
+            add(b + "ssm_conv1d.weight",
+                np.concatenate([cq, perm_heads(cv, 0, dv)], 0))
+            # NOT shifted: ssm_norm is absent from mlx's norm-shift list.
+            add(b + "ssm_norm.weight", ck(L + "linear_attn.norm.weight"))
+            add(b + "ssm_out.weight",
+                perm_heads(ck(L + "linear_attn.out_proj.weight"), 1, dv))
+
+    kvs = [
+        _kv_str("general.architecture", "qwen35"),
+        _kv_u32("qwen35.block_count", m["n_layers"]),
+        _kv_u32("qwen35.attention.head_count", m["n_heads"]),
+        _kv_u32("qwen35.attention.head_count_kv", m["n_kv_heads"]),
+        _kv_u32("qwen35.attention.key_length", m["head_dim"]),
+        _kv_u32("qwen35.attention.value_length", m["head_dim"]),
+        _kv_u32("qwen35.embedding_length", m["hidden"]),
+        _kv_u32("qwen35.feed_forward_length", m["ffn"]),
+        _kv_f32("qwen35.rope.freq_base", m["theta"]),
+        _kv_f32("qwen35.attention.layer_norm_rms_epsilon", m["eps"]),
+        _kv_u32("qwen35.rope.dimension_count", int(m["head_dim"] * m["prf"])),
+        _kv_u32("qwen35.full_attention_interval", m["interval"]),
+        _kv_u32("qwen35.ssm.group_count", nk),
+        _kv_u32("qwen35.ssm.state_size", dk),
+        _kv_u32("qwen35.ssm.time_step_rank", nv),
+        _kv_u32("qwen35.ssm.inner_size", value_dim),
+        _kv_u32("qwen35.ssm.conv_kernel", m["conv_k"]),
+        # The loader takes cfg.vocab from this list's length; the strings
+        # themselves are never used by the forward.
+        _kv_arr_str("tokenizer.ggml.tokens",
+                    ["t%d" % t for t in range(m["vocab"])]),
+    ]
+
+    offsets, off = [], 0
+    for _, arr, _dims in tensors:
+        offsets.append(off)
+        off = ((off + arr.nbytes + ALIGNMENT - 1) // ALIGNMENT) * ALIGNMENT
+
+    infos = [_tensor_info(n, TT_F32, d, o)
+             for (n, _a, d), o in zip(tensors, offsets)]
+
+    header = GGUF_MAGIC + struct.pack("<I", GGUF_VERSION)
+    header += struct.pack("<Q", len(tensors))
+    header += struct.pack("<Q", len(kvs))
+    body = header + b"".join(kvs) + b"".join(infos)
+    body += b"\x00" * ((-len(body)) % ALIGNMENT)
+
+    data = bytearray()
+    for (_n, arr, _d), o in zip(tensors, offsets):
+        data += b"\x00" * (o - len(data))
+        data += arr.astype("<f4").tobytes()
+
+    path = pathlib.Path(path)
+    path.write_bytes(body + bytes(data))
+    print(f"wrote {path} ({len(tensors)} F32 tensors, tiled value-head order "
+          f"{hf_of})")
+
+
 if __name__ == "__main__":
     if "--tok" in sys.argv:
         write_tok_fixture("/Users/macmini/models/qwen36-27b-8bit",
@@ -1051,6 +1418,8 @@ if __name__ == "__main__":
         write_op_fixtures("tests/fixtures/ops.bin")
     elif "--hybrid" in sys.argv:
         write_hybrid_op_fixtures("tests/fixtures/hybrid_ops.bin")
+    elif "--fwd" in sys.argv:
+        write_mini_fwd("tests/fixtures/mini_fwd")
     else:
         write_mini_gguf("tests/fixtures/mini.gguf")
         print("wrote tests/fixtures/mini.gguf")

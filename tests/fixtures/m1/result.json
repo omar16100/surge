@@ -1,0 +1,198 @@
+{
+ "model": "/Users/macmini/models/qwen35-2b",
+ "prompts": 16,
+ "positions": 64,
+ "vocab": 248320,
+ "tolerance": 0.01,
+ "stock": {
+  "top1": 1023,
+  "of": 1024,
+  "max_delta": 0.178849458694458
+ },
+ "hf_norm": {
+  "top1": 1024,
+  "of": 1024,
+  "max_delta": 8.58306884765625e-05
+ },
+ "stock_vs_hf_norm_max_delta": 0.17881301045417786,
+ "stock_vs_hf_norm_top1": 1023,
+ "per_prompt": [
+  {
+   "index": 0,
+   "stock": {
+    "top1": 64,
+    "max_delta": 0.06937646865844727
+   },
+   "hf_norm": {
+    "top1": 64,
+    "max_delta": 4.38690185546875e-05
+   }
+  },
+  {
+   "index": 1,
+   "stock": {
+    "top1": 64,
+    "max_delta": 0.07660385221242905
+   },
+   "hf_norm": {
+    "top1": 64,
+    "max_delta": 5.340576171875e-05
+   }
+  },
+  {
+   "index": 2,
+   "stock": {
+    "top1": 64,
+    "max_delta": 0.07852786779403687
+   },
+   "hf_norm": {
+    "top1": 64,
+    "max_delta": 4.38690185546875e-05
+   }
+  },
+  {
+   "index": 3,
+   "stock": {
+    "top1": 63,
+    "max_delta": 0.1405779868364334
+   },
+   "hf_norm": {
+    "top1": 64,
+    "max_delta": 4.1484832763671875e-05
+   }
+  },
+  {
+   "index": 4,
+   "stock": {
+    "top1": 64,
+    "max_delta": 0.178849458694458
+   },
+   "hf_norm": {
+    "top1": 64,
+    "max_delta": 8.58306884765625e-05
+   }
+  },
+  {
+   "index": 5,
+   "stock": {
+    "top1": 64,
+    "max_delta": 0.060237884521484375
+   },
+   "hf_norm": {
+    "top1": 64,
+    "max_delta": 4.57763671875e-05
+   }
+  },
+  {
+   "index": 6,
+   "stock": {
+    "top1": 64,
+    "max_delta": 0.053284645080566406
+   },
+   "hf_norm": {
+    "top1": 64,
+    "max_delta": 4.291534423828125e-05
+   }
+  },
+  {
+   "index": 7,
+   "stock": {
+    "top1": 64,
+    "max_delta": 0.058264732360839844
+   },
+   "hf_norm": {
+    "top1": 64,
+    "max_delta": 6.556510925292969e-05
+   }
+  },
+  {
+   "index": 8,
+   "stock": {
+    "top1": 64,
+    "max_delta": 0.05468463897705078
+   },
+   "hf_norm": {
+    "top1": 64,
+    "max_delta": 4.57763671875e-05
+   }
+  },
+  {
+   "index": 9,
+   "stock": {
+    "top1": 64,
+    "max_delta": 0.05562221258878708
+   },
+   "hf_norm": {
+    "top1": 64,
+    "max_delta": 5.53131103515625e-05
+   }
+  },
+  {
+   "index": 10,
+   "stock": {
+    "top1": 64,
+    "max_delta": 0.0640261173248291
+   },
+   "hf_norm": {
+    "top1": 64,
+    "max_delta": 5.14984130859375e-05
+   }
+  },
+  {
+   "index": 11,
+   "stock": {
+    "top1": 64,
+    "max_delta": 0.055678606033325195
+   },
+   "hf_norm": {
+    "top1": 64,
+    "max_delta": 6.866455078125e-05
+   }
+  },
+  {
+   "index": 12,
+   "stock": {
+    "top1": 64,
+    "max_delta": 0.060428619384765625
+   },
+   "hf_norm": {
+    "top1": 64,
+    "max_delta": 5.53131103515625e-05
+   }
+  },
+  {
+   "index": 13,
+   "stock": {
+    "top1": 64,
+    "max_delta": 0.058319091796875
+   },
+   "hf_norm": {
+    "top1": 64,
+    "max_delta": 4.38690185546875e-05
+   }
+  },
+  {
+   "index": 14,
+   "stock": {
+    "top1": 64,
+    "max_delta": 0.05570793151855469
+   },
+   "hf_norm": {
+    "top1": 64,
+    "max_delta": 4.57763671875e-05
+   }
+  },
+  {
+   "index": 15,
+   "stock": {
+    "top1": 64,
+    "max_delta": 0.05993175506591797
+   },
+   "hf_norm": {
+    "top1": 64,
+    "max_delta": 4.76837158203125e-05
+   }
+  }
+ ],
+ "pass": true
+}

@@ -12,6 +12,8 @@ tests/%.bin: tests/%.c $(LIB_SRC)
 	$(CC) $(CFLAGS) -o $@ $< $(LIB_SRC) $(LDLIBS)
 surge-info: src/cli_info.c $(LIB_SRC)
 	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
+surge-ref: src/cli_ref.c $(LIB_SRC)
+	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
 # `debug` must DELETE the test binaries first. Without that, a preceding
 # `make check` leaves them newer than the sources, make considers them up to
 # date (it does not track CFLAGS), and `make debug` cheerfully re-runs the
@@ -26,6 +28,6 @@ debug:
 	@rm -f $(TESTS:.c=.bin)
 	@rm -rf $(TESTS:.c=.bin.dSYM)
 clean:
-	rm -f $(TESTS:.c=.bin) surge-info
-	rm -rf $(TESTS:.c=.bin.dSYM) surge-info.dSYM
+	rm -f $(TESTS:.c=.bin) surge-info surge-ref
+	rm -rf $(TESTS:.c=.bin.dSYM) surge-info.dSYM surge-ref.dSYM
 .PHONY: check debug clean

@@ -60,6 +60,8 @@
 #include "surge.h"
 
 #include <math.h>
+#include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 /* bf16 -> f32: the bf16 bit pattern is the top 16 bits of the f32 one.
@@ -413,3 +415,634 @@ void sg_ref_delta_step(float *S, const float *q, const float *k, const float *v,
         out[j] = (float)y;
     }
 }
+
+/* =====================================================================
+ * The reference forward pass
+ * =====================================================================
+ *
+ * Structure, one token at position `pos`, mirroring qwen3_5.py's
+ * Qwen3_5TextModel.__call__ / DecoderLayer.__call__ statement for statement:
+ *
+ *   x = embed_tokens[token]                       (NO scaling: qwen3_5 has none)
+ *   for each layer L:
+ *       r = (L is full attention ? attention : gated_deltanet)(rms_norm(x, ln1))
+ *       x = x + r
+ *       x = x + down_proj(silu(gate_proj(rms_norm(x, ln2))) * up_proj(...))
+ *   logits = lm_head(rms_norm(x, out_norm))       (lm_head == embed_tokens when tied)
+ *
+ * A layer is a full-attention layer iff (L + 1) % full_attention_interval
+ * == 0 (qwen3_5.py's DecoderLayer.is_linear, negated). sg_ref_state_new
+ * checks that rule against which tensor group the loader actually found and
+ * refuses a model where the two disagree, so the dispatch below can read
+ * either one.
+ *
+ * Everything above the ops is f32. Weights are widened from bf16 or
+ * dequantized from Q8_0 at the point of use for the big matmuls (so the
+ * model is never materialized in f32), and ONCE into owned f32 buffers for
+ * the small per-layer tensors -- the norms, the conv kernel, dt_bias and
+ * ssm_a. Those owned copies are also where sg_model.norms_are_residual is
+ * applied: the +1.0 mlx's sanitize adds to ln1/ln2/q_norm/k_norm/out_norm
+ * (and never to ssm_norm) cannot be done in place on a read-only mmap.
+ *
+ * NOT modelled, deliberately: batching, left padding, and therefore the
+ * DeltaNet mask path (create_ssm_mask returns None for the single-sequence
+ * ArraysCache this project targets, and create_attention_mask's causal mask
+ * is exactly "attend to positions 0..pos", which is what the loop below
+ * does by construction).
+ */
+
+/* ---------------------------------------------------------------------
+ * Typed weight access
+ * --------------------------------------------------------------------- */
+
+static uint64_t q8_row_bytes(uint32_t cols) { return (uint64_t)(cols / 32) * 34; }
+
+/* y = W x for a weight of any of the three dtypes the two checkpoint
+ * families use. sg_ref_state_new has already rejected anything else, and
+ * (for Q8_0) any cols that is not a multiple of 32. */
+static void wmatvec(const void *w, sg_tensor_type t, const float *x, float *y,
+                    uint32_t rows, uint32_t cols) {
+    switch (t) {
+    case SG_T_BF16: sg_ref_matvec_bf16((const uint16_t *)w, x, y, rows, cols); break;
+    case SG_T_Q8_0: sg_ref_matvec_q8(w, x, y, rows, cols); break;
+    default:        sg_ref_matvec_f32((const float *)w, x, y, rows, cols); break;
+    }
+}
+
+/* Widen n elements of a small (non-matmul) tensor into an owned f32 buffer.
+ *
+ * `shift` is the +1.0 that a residual RMSNorm weight needs, and WHERE IT IS
+ * APPLIED IS A DELIBERATE DIVERGENCE FROM mlx-lm. mlx runs
+ * TextModel.sanitize on the raw checkpoint arrays, so its `v + 1.0` happens
+ * in bf16 and the sum is re-rounded; here the stored bf16 is widened to f32
+ * FIRST and 1.0 is added in f32, which is what the model's own reference
+ * implementation does:
+ *
+ *   transformers/models/qwen3_5/modeling_qwen3_5.py, Qwen3_5RMSNorm.forward
+ *       output = output * (1.0 + self.weight.float())
+ *
+ * The difference is not academic: measured over 16 x 64 teacher-forced
+ * positions of Qwen3.5-2B it moves mlx's own logits by up to 1.79e-01 and
+ * flips one top-1 token. tools/tf_compare.py therefore measures surge
+ * against BOTH mlx-lm as shipped and mlx-lm with this one rounding
+ * corrected, and prints both. Same policy as sg_ref_rope_partial's angle
+ * precision: ref.c defines correct, and the gap is pinned rather than
+ * hidden. */
+static void wwiden(const void *w, sg_tensor_type t, float *out, uint64_t n, float shift) {
+    if (!w || !out) return;
+    if (t == SG_T_BF16) {
+        const uint16_t *b = (const uint16_t *)w;
+        for (uint64_t i = 0; i < n; i++) out[i] = bf16_to_f32(b[i]) + shift;
+    } else {
+        const float *f = (const float *)w;
+        for (uint64_t i = 0; i < n; i++) out[i] = f[i] + shift;
+    }
+}
+
+/* One row of a [rows, cols] weight, widened/dequantized into out[cols].
+ * Only used for the embedding lookup, where `row` is the token id. */
+static void wrow(const void *w, sg_tensor_type t, uint64_t row, uint32_t cols, float *out) {
+    if (!w || !out || cols == 0) return;
+    /* Q8_0 rows are whole 32-element blocks. sg_ref_state_new already
+     * rejects a model whose hidden size is not a multiple of 32, but a
+     * partial write here would leave the tail of the embedding buffer
+     * holding the PREVIOUS token's values, which no sanitizer can see and
+     * which looks like a subtly wrong model rather than a bug. */
+    if (t == SG_T_Q8_0 && cols % 32 != 0) {
+        for (uint32_t i = 0; i < cols; i++) out[i] = 0.0f;
+        return;
+    }
+    if (t == SG_T_BF16) {
+        const uint16_t *b = (const uint16_t *)w + row * cols;
+        for (uint32_t i = 0; i < cols; i++) out[i] = bf16_to_f32(b[i]);
+        return;
+    }
+    if (t == SG_T_Q8_0) {
+        const uint8_t *p = (const uint8_t *)w + row * q8_row_bytes(cols);
+        for (uint32_t b = 0; b < cols / 32; b++) {
+            const uint8_t *blk = p + (size_t)b * 34;
+            uint16_t sbits = (uint16_t)((uint16_t)blk[0] | ((uint16_t)blk[1] << 8));
+            float d = f16_to_f32(sbits);
+            const int8_t *q = (const int8_t *)(blk + 2);
+            for (uint32_t i = 0; i < 32; i++) out[b * 32 + i] = d * (float)q[i];
+        }
+        return;
+    }
+    memcpy(out, (const float *)w + row * cols, (size_t)cols * sizeof *out);
+}
+
+/* ---------------------------------------------------------------------
+ * State
+ * --------------------------------------------------------------------- */
+
+/* Per-layer union state. Exactly one of the two groups is populated,
+ * decided by the same tensor-presence rule the loader used. */
+typedef struct {
+    bool is_attn;
+    /* full attention: append-only f32 caches, [max_ctx, n_kv_heads, head_dim] */
+    float *k_cache, *v_cache;
+    /* gated DeltaNet: a fixed-size pair that does not grow with context */
+    float *conv_state;   /* [conv_kernel-1, conv_dim], oldest token first */
+    float *ssm_state;    /* [n_v_heads, head_v_dim, head_k_dim] */
+    /* owned f32 copies of the small tensors (norm shift already applied) */
+    float *ln1, *ln2;    /* [hidden] */
+    float *q_norm_w;     /* [head_dim] */
+    float *k_norm_w;     /* [head_dim] */
+    float *ssm_norm_w;   /* [head_v_dim] */
+    float *conv_w;       /* [conv_dim, conv_kernel] */
+    float *dt_bias;      /* [n_v_heads] */
+    float *ssm_a;        /* [n_v_heads]; A_log or -exp(A_log) per m->ssm_a_form */
+} sg_ref_layer;
+
+struct sg_ref_state {
+    /* The model this state was built for. sg_ref_forward takes the model
+     * again (the state deliberately does not own it), and every buffer size
+     * and every semantic flag below was fixed at sg_ref_state_new time from
+     * THAT model, so being handed a different one later is a silent
+     * buffer-overrun waiting to happen. Checked, not documented away. */
+    const sg_model *owner;
+    sg_cfg cfg;
+    uint32_t max_ctx;
+    uint32_t used;             /* number of positions already consumed */
+
+    /* derived widths */
+    uint32_t key_dim, value_dim, conv_dim;
+    uint32_t q_width;          /* n_heads * head_dim * 2 (queries + gate) */
+    uint32_t kv_width;         /* n_kv_heads * head_dim */
+    uint32_t attn_width;       /* n_heads * head_dim */
+
+    /* copied from sg_model so the forward never re-derives semantics */
+    sg_tensor_type mat_type;
+    sg_ssm_a_form a_form;
+    bool v_tiled;
+
+    sg_ref_layer *ls;          /* cfg.n_layers */
+    float *out_norm_w;         /* [hidden] */
+
+    /* scratch */
+    float *x, *h, *r;                       /* [hidden] */
+    float *qg, *kbuf, *vbuf, *scores, *ctx, *gate;
+    float *qkv, *zbuf, *abuf, *bbuf, *ybuf;
+    float *ff_gate, *ff_up;
+    double *dacc;                           /* [head_dim] */
+    float *logits;                          /* [vocab] */
+};
+
+static void *xzalloc(size_t n, size_t sz, bool *ok) {
+    if (!*ok) return NULL;
+    if (n == 0) return NULL;
+    void *p = calloc(n, sz);
+    if (!p) *ok = false;
+    return p;
+}
+
+void sg_ref_state_free(sg_ref_state *st) {
+    if (!st) return;
+    if (st->ls) {
+        for (uint32_t i = 0; i < st->cfg.n_layers; i++) {
+            sg_ref_layer *L = &st->ls[i];
+            free(L->k_cache); free(L->v_cache);
+            free(L->conv_state); free(L->ssm_state);
+            free(L->ln1); free(L->ln2);
+            free(L->q_norm_w); free(L->k_norm_w);
+            free(L->ssm_norm_w); free(L->conv_w);
+            free(L->dt_bias); free(L->ssm_a);
+        }
+        free(st->ls);
+    }
+    free(st->out_norm_w);
+    free(st->x); free(st->h); free(st->r);
+    free(st->qg); free(st->kbuf); free(st->vbuf);
+    free(st->scores); free(st->ctx); free(st->gate);
+    free(st->qkv); free(st->zbuf); free(st->abuf); free(st->bbuf); free(st->ybuf);
+    free(st->ff_gate); free(st->ff_up);
+    free(st->dacc);
+    free(st->logits);
+    free(st);
+}
+
+void sg_ref_state_reset(sg_ref_state *st) {
+    if (!st) return;
+    st->used = 0;
+    for (uint32_t i = 0; i < st->cfg.n_layers; i++) {
+        sg_ref_layer *L = &st->ls[i];
+        if (L->conv_state) {
+            memset(L->conv_state, 0,
+                   (size_t)(st->cfg.conv_kernel - 1) * st->conv_dim * sizeof(float));
+        }
+        if (L->ssm_state) {
+            memset(L->ssm_state, 0,
+                   (size_t)st->cfg.n_v_heads * st->cfg.head_v_dim * st->cfg.head_k_dim
+                       * sizeof(float));
+        }
+        /* The K/V caches are not cleared: nothing reads past `used`. */
+    }
+}
+
+sg_err sg_ref_state_new(const sg_model *m, uint32_t max_ctx, sg_ref_state **out) {
+    if (!out) return (sg_err){"ref: invalid arguments"};
+    *out = NULL;
+    if (!m || !m->layers || !m->tok_emb || !m->out_norm || !m->lm_head) {
+        return (sg_err){"ref: invalid arguments"};
+    }
+    const sg_cfg *c = &m->cfg;
+    if (max_ctx == 0) return (sg_err){"ref: max_ctx must be at least 1"};
+    if (c->n_layers == 0 || c->hidden == 0 || c->ffn_hidden == 0 || c->vocab == 0
+        || c->head_dim == 0 || c->n_heads == 0 || c->n_kv_heads == 0) {
+        return (sg_err){"ref: model config has a zero dimension"};
+    }
+    if (c->n_heads % c->n_kv_heads != 0) {
+        return (sg_err){"ref: n_heads is not a multiple of n_kv_heads"};
+    }
+    if (c->full_attn_interval == 0) {
+        return (sg_err){"ref: full_attn_interval is zero"};
+    }
+    if (m->wtype != SG_T_BF16 && m->wtype != SG_T_Q8_0 && m->wtype != SG_T_F32) {
+        return (sg_err){"ref: unsupported matmul weight dtype (want bf16, q8_0 or f32)"};
+    }
+    /* wwiden reads anything that is not BF16 as F32, so an F16 recorded in
+     * any of these three would be read at twice the width. */
+    if ((m->dense_type != SG_T_BF16 && m->dense_type != SG_T_F32)
+        || (m->ssm_a_type != SG_T_BF16 && m->ssm_a_type != SG_T_F32)
+        || (m->ssm_norm_type != SG_T_BF16 && m->ssm_norm_type != SG_T_F32)) {
+        return (sg_err){"ref: unsupported small-tensor dtype (want bf16 or f32)"};
+    }
+
+    /* Layer-kind census, and the cross-check between the two sources of
+     * truth for it. The loader decided by tensor presence; qwen3_5.py
+     * decides by (L+1) % full_attention_interval. Disagreement means the
+     * checkpoint is not the architecture the config claims, and guessing
+     * which one to believe would produce a model that runs and is wrong. */
+    uint32_t n_attn = 0, n_gdn = 0;
+    for (uint32_t i = 0; i < c->n_layers; i++) {
+        bool is_attn = (m->layers[i].q_proj != NULL);
+        bool want_attn = ((i + 1) % c->full_attn_interval) == 0;
+        if (is_attn != want_attn) {
+            fprintf(stderr,
+                    "ref: layer %u carries %s tensors but full_attention_interval %u "
+                    "says it should be %s\n", i,
+                    is_attn ? "full-attention" : "gated-DeltaNet",
+                    c->full_attn_interval, want_attn ? "full-attention" : "gated-DeltaNet");
+            return (sg_err){"ref: layer kind disagrees with full_attention_interval"};
+        }
+        if (is_attn) n_attn++; else n_gdn++;
+    }
+
+    if (n_attn > 0) {
+        if (c->rope_dim < 2 || c->rope_dim > c->head_dim || c->rope_dim % 2 != 0) {
+            return (sg_err){"ref: rope_dim must be even and in [2, head_dim]"};
+        }
+        /* pow(theta, -2i/rope_dim) with theta <= 0 is a NaN generator, and a
+         * NaN here poisons every logit with no other symptom. */
+        if (!(c->rope_theta > 1.0f) || !isfinite(c->rope_theta)) {
+            return (sg_err){"ref: rope_theta must be finite and greater than 1"};
+        }
+    }
+    if (!(c->rms_eps >= 0.0f) || !isfinite(c->rms_eps)) {
+        return (sg_err){"ref: rms_eps must be finite and non-negative"};
+    }
+
+    /* Every per-layer pointer the forward will dereference. The loaders
+     * guarantee complete groups, but this is a public entry point that
+     * already checks the three model-level pointers, and wwiden/wmatvec on a
+     * NULL is a crash rather than an error return. */
+    for (uint32_t i = 0; i < c->n_layers; i++) {
+        const sg_layer_w *w = &m->layers[i];
+        const void *shared[] = { w->ln1, w->ln2, w->gate_proj, w->up_proj, w->down_proj };
+        for (size_t k = 0; k < sizeof shared / sizeof *shared; k++) {
+            if (!shared[k]) return (sg_err){"ref: a layer is missing an MLP or norm tensor"};
+        }
+        if (w->q_proj) {
+            const void *a[] = { w->k_proj, w->v_proj, w->o_proj, w->q_norm, w->k_norm };
+            for (size_t k = 0; k < sizeof a / sizeof *a; k++) {
+                if (!a[k]) return (sg_err){"ref: a full-attention layer is incomplete"};
+            }
+        } else {
+            const void *d[] = { w->ssm_in_qkv, w->ssm_in_z, w->ssm_in_b, w->ssm_in_a,
+                                w->ssm_a, w->ssm_dt_bias, w->ssm_conv1d, w->ssm_norm,
+                                w->ssm_out };
+            for (size_t k = 0; k < sizeof d / sizeof *d; k++) {
+                if (!d[k]) return (sg_err){"ref: a gated-DeltaNet layer is incomplete"};
+            }
+        }
+    }
+    if (n_gdn > 0) {
+        if (c->n_k_heads == 0 || c->n_v_heads == 0 || c->head_k_dim == 0
+            || c->head_v_dim == 0 || c->conv_kernel == 0) {
+            return (sg_err){"ref: model has gated-DeltaNet layers but no DeltaNet dims"};
+        }
+        if (c->n_v_heads % c->n_k_heads != 0) {
+            return (sg_err){"ref: n_v_heads is not a multiple of n_k_heads"};
+        }
+    }
+
+    /* Every derived width below is a product of two config u32s, so compute
+     * them in u64 and refuse anything implausible BEFORE narrowing. Without
+     * this a checkpoint claiming n_v_heads = 1e5 and head_v_dim = 1e5 wraps
+     * value_dim to a small number, every allocation is sized from the wrapped
+     * value, and the forward writes past all of them. 1<<24 is far above any
+     * real model (the 27B's largest is conv_dim 10240) and far below the wrap
+     * point. */
+    const uint64_t width_max = 1u << 24;
+    uint64_t key_dim = (uint64_t)c->n_k_heads * c->head_k_dim;
+    uint64_t value_dim = (uint64_t)c->n_v_heads * c->head_v_dim;
+    uint64_t conv_dim = 2 * key_dim + value_dim;
+    uint64_t attn_width = (uint64_t)c->n_heads * c->head_dim;
+    uint64_t q_width = attn_width * 2;
+    uint64_t kv_width = (uint64_t)c->n_kv_heads * c->head_dim;
+    if (key_dim > width_max || value_dim > width_max || conv_dim > width_max
+        || q_width > width_max || kv_width > width_max
+        || (uint64_t)c->hidden > width_max || (uint64_t)c->ffn_hidden > width_max
+        || (uint64_t)c->conv_kernel > width_max) {
+        return (sg_err){"ref: a model dimension is implausibly large"};
+    }
+
+    bool ok = true;
+    sg_ref_state *st = calloc(1, sizeof *st);
+    if (!st) return (sg_err){"ref: out of memory"};
+    st->owner = m;
+    st->cfg = *c;
+    st->max_ctx = max_ctx;
+    st->mat_type = m->wtype;
+    st->a_form = m->ssm_a_form;
+    st->v_tiled = m->v_heads_tiled;
+    st->key_dim = (uint32_t)key_dim;
+    st->value_dim = (uint32_t)value_dim;
+    st->conv_dim = (uint32_t)conv_dim;
+    st->q_width = (uint32_t)q_width;
+    st->kv_width = (uint32_t)kv_width;
+    st->attn_width = (uint32_t)attn_width;
+
+    /* Q8_0 rows are whole 32-element blocks, so every matmul's `cols` must
+     * be a multiple of 32. sg_ref_matvec_q8 silently returns without
+     * touching y otherwise (Task 7 concern 7), which would be a
+     * uninitialized-output footgun several layers deep; check it once here
+     * instead. */
+    if (st->mat_type == SG_T_Q8_0) {
+        const uint32_t cols[] = { c->hidden, c->ffn_hidden, st->attn_width, st->value_dim };
+        for (size_t i = 0; i < sizeof cols / sizeof *cols; i++) {
+            if (cols[i] != 0 && cols[i] % 32 != 0) {
+                sg_ref_state_free(st);
+                return (sg_err){"ref: a Q8_0 matmul width is not a multiple of 32"};
+            }
+        }
+    }
+
+    st->ls = xzalloc(c->n_layers, sizeof *st->ls, &ok);
+    st->out_norm_w = xzalloc(c->hidden, sizeof(float), &ok);
+    st->x = xzalloc(c->hidden, sizeof(float), &ok);
+    st->h = xzalloc(c->hidden, sizeof(float), &ok);
+    st->r = xzalloc(c->hidden, sizeof(float), &ok);
+    st->ff_gate = xzalloc(c->ffn_hidden, sizeof(float), &ok);
+    st->ff_up = xzalloc(c->ffn_hidden, sizeof(float), &ok);
+    st->logits = xzalloc(c->vocab, sizeof(float), &ok);
+    st->dacc = xzalloc(c->head_dim, sizeof(double), &ok);
+    if (n_attn > 0) {
+        st->qg = xzalloc(st->q_width, sizeof(float), &ok);
+        st->kbuf = xzalloc(st->kv_width, sizeof(float), &ok);
+        st->vbuf = xzalloc(st->kv_width, sizeof(float), &ok);
+        st->scores = xzalloc(max_ctx, sizeof(float), &ok);
+        st->ctx = xzalloc(st->attn_width, sizeof(float), &ok);
+        st->gate = xzalloc(st->attn_width, sizeof(float), &ok);
+    }
+    if (n_gdn > 0) {
+        st->qkv = xzalloc(st->conv_dim, sizeof(float), &ok);
+        st->zbuf = xzalloc(st->value_dim, sizeof(float), &ok);
+        st->abuf = xzalloc(c->n_v_heads, sizeof(float), &ok);
+        st->bbuf = xzalloc(c->n_v_heads, sizeof(float), &ok);
+        st->ybuf = xzalloc(st->value_dim, sizeof(float), &ok);
+    }
+    if (!ok) { sg_ref_state_free(st); return (sg_err){"ref: out of memory"}; }
+
+    /* mlx's sanitize adds 1.0 to input_layernorm / post_attention_layernorm /
+     * model.norm / q_norm / k_norm, and to nothing else. ssm_norm is
+     * deliberately NOT in that list. */
+    float shift = m->norms_are_residual ? 1.0f : 0.0f;
+    wwiden(m->out_norm, m->dense_type, st->out_norm_w, c->hidden, shift);
+
+    for (uint32_t i = 0; i < c->n_layers; i++) {
+        const sg_layer_w *w = &m->layers[i];
+        sg_ref_layer *L = &st->ls[i];
+        L->is_attn = (w->q_proj != NULL);
+
+        L->ln1 = xzalloc(c->hidden, sizeof(float), &ok);
+        L->ln2 = xzalloc(c->hidden, sizeof(float), &ok);
+        if (!ok) { sg_ref_state_free(st); return (sg_err){"ref: out of memory"}; }
+        wwiden(w->ln1, m->dense_type, L->ln1, c->hidden, shift);
+        wwiden(w->ln2, m->dense_type, L->ln2, c->hidden, shift);
+
+        if (L->is_attn) {
+            L->q_norm_w = xzalloc(c->head_dim, sizeof(float), &ok);
+            L->k_norm_w = xzalloc(c->head_dim, sizeof(float), &ok);
+            L->k_cache = xzalloc((size_t)max_ctx * st->kv_width, sizeof(float), &ok);
+            L->v_cache = xzalloc((size_t)max_ctx * st->kv_width, sizeof(float), &ok);
+            if (!ok) { sg_ref_state_free(st); return (sg_err){"ref: out of memory"}; }
+            wwiden(w->q_norm, m->dense_type, L->q_norm_w, c->head_dim, shift);
+            wwiden(w->k_norm, m->dense_type, L->k_norm_w, c->head_dim, shift);
+        } else {
+            L->ssm_norm_w = xzalloc(c->head_v_dim, sizeof(float), &ok);
+            L->conv_w = xzalloc((size_t)st->conv_dim * c->conv_kernel, sizeof(float), &ok);
+            L->dt_bias = xzalloc(c->n_v_heads, sizeof(float), &ok);
+            L->ssm_a = xzalloc(c->n_v_heads, sizeof(float), &ok);
+            L->conv_state = xzalloc((size_t)(c->conv_kernel - 1) * st->conv_dim,
+                                    sizeof(float), &ok);
+            L->ssm_state = xzalloc((size_t)c->n_v_heads * c->head_v_dim * c->head_k_dim,
+                                   sizeof(float), &ok);
+            if (!ok) { sg_ref_state_free(st); return (sg_err){"ref: out of memory"}; }
+            /* ssm_norm and ssm_a have their own recorded dtypes; conv1d and
+             * dt_bias follow dense_type. None of the four is shifted. */
+            wwiden(w->ssm_norm, m->ssm_norm_type, L->ssm_norm_w, c->head_v_dim, 0.0f);
+            wwiden(w->ssm_a, m->ssm_a_type, L->ssm_a, c->n_v_heads, 0.0f);
+            wwiden(w->ssm_conv1d, m->dense_type, L->conv_w,
+                   (uint64_t)st->conv_dim * c->conv_kernel, 0.0f);
+            wwiden(w->ssm_dt_bias, m->dense_type, L->dt_bias, c->n_v_heads, 0.0f);
+        }
+    }
+
+    *out = st;
+    return SG_OK;
+}
+
+/* ---------------------------------------------------------------------
+ * The two layer kinds
+ * --------------------------------------------------------------------- */
+
+/* Qwen3NextAttention for one token. `in` is the already-normed hidden state,
+ * `out` receives the layer's residual contribution. */
+static void attn_layer(sg_ref_state *st, const sg_layer_w *w, sg_ref_layer *L,
+                       const float *in, float *out, uint32_t pos) {
+    const sg_cfg *c = &st->cfg;
+    uint32_t hd = c->head_dim;
+
+    /* q_proj is DOUBLE width: mlx reshapes to [n_heads, 2*head_dim] and
+     * splits on the LAST axis, so head h's gate sits immediately after head
+     * h's queries rather than in one block after all of them. */
+    wmatvec(w->q_proj, st->mat_type, in, st->qg, st->q_width, c->hidden);
+    wmatvec(w->k_proj, st->mat_type, in, st->kbuf, st->kv_width, c->hidden);
+    wmatvec(w->v_proj, st->mat_type, in, st->vbuf, st->kv_width, c->hidden);
+
+    for (uint32_t h = 0; h < c->n_heads; h++) {
+        float *qh = st->qg + (size_t)h * 2 * hd;
+        /* q_norm applies to the queries only, never to the gate. */
+        sg_ref_rmsnorm(qh, L->q_norm_w, hd, c->rms_eps);
+        sg_ref_rope_partial(qh, hd, c->rope_dim, pos, c->rope_theta);
+        memcpy(st->gate + (size_t)h * hd, qh + hd, (size_t)hd * sizeof(float));
+    }
+    for (uint32_t h = 0; h < c->n_kv_heads; h++) {
+        float *kh = st->kbuf + (size_t)h * hd;
+        sg_ref_rmsnorm(kh, L->k_norm_w, hd, c->rms_eps);
+        sg_ref_rope_partial(kh, hd, c->rope_dim, pos, c->rope_theta);
+    }
+
+    memcpy(L->k_cache + (size_t)pos * st->kv_width, st->kbuf,
+           (size_t)st->kv_width * sizeof(float));
+    memcpy(L->v_cache + (size_t)pos * st->kv_width, st->vbuf,
+           (size_t)st->kv_width * sizeof(float));
+    uint32_t used = pos + 1;
+
+    double scale = 1.0 / sqrt((double)hd);
+    uint32_t repeat = c->n_heads / c->n_kv_heads;
+    for (uint32_t h = 0; h < c->n_heads; h++) {
+        uint32_t hk = h / repeat;      /* GQA: mlx repeats the kv head axis */
+        const float *qh = st->qg + (size_t)h * 2 * hd;
+        for (uint32_t t = 0; t < used; t++) {
+            const float *kt = L->k_cache + ((size_t)t * c->n_kv_heads + hk) * hd;
+            double dot = 0.0;
+            for (uint32_t i = 0; i < hd; i++) dot += (double)qh[i] * (double)kt[i];
+            st->scores[t] = (float)(dot * scale);
+        }
+        /* The causal mask is implicit: only 0..pos are ever scored. */
+        sg_ref_softmax(st->scores, used);
+
+        for (uint32_t i = 0; i < hd; i++) st->dacc[i] = 0.0;
+        for (uint32_t t = 0; t < used; t++) {
+            const float *vt = L->v_cache + ((size_t)t * c->n_kv_heads + hk) * hd;
+            double p = (double)st->scores[t];
+            for (uint32_t i = 0; i < hd; i++) st->dacc[i] += p * (double)vt[i];
+        }
+        float *ch = st->ctx + (size_t)h * hd;
+        for (uint32_t i = 0; i < hd; i++) ch[i] = (float)st->dacc[i];
+    }
+
+    /* The output gate is a SIGMOID applied before o_proj. */
+    sg_ref_gate_sigmoid(st->ctx, st->gate, st->attn_width);
+    wmatvec(w->o_proj, st->mat_type, st->ctx, out, c->hidden, st->attn_width);
+}
+
+/* GatedDeltaNet for one token, with the conv tail and the delta-rule state
+ * carried in L. */
+static void gdn_layer(sg_ref_state *st, const sg_layer_w *w, sg_ref_layer *L,
+                      const float *in, float *out) {
+    const sg_cfg *c = &st->cfg;
+    uint32_t dk = c->head_k_dim, dv = c->head_v_dim;
+
+    wmatvec(w->ssm_in_qkv, st->mat_type, in, st->qkv, st->conv_dim, c->hidden);
+    wmatvec(w->ssm_in_z, st->mat_type, in, st->zbuf, st->value_dim, c->hidden);
+    wmatvec(w->ssm_in_b, st->mat_type, in, st->bbuf, c->n_v_heads, c->hidden);
+    wmatvec(w->ssm_in_a, st->mat_type, in, st->abuf, c->n_v_heads, c->hidden);
+
+    sg_ref_conv1d_causal(st->qkv, L->conv_w, L->conv_state, L->conv_state,
+                         st->conv_dim, c->conv_kernel);
+    sg_ref_silu(st->qkv, st->conv_dim);
+
+    float *q = st->qkv;
+    float *k = st->qkv + st->key_dim;
+    float *v = st->qkv + 2 * st->key_dim;
+
+    /* q and k are RMS-normed per key head with NO weight and a HARDCODED
+     * eps of 1e-6 (qwen3_5.py line 180-181, not the config's rms_norm_eps),
+     * then scaled: q by 1/head_k_dim and k by 1/sqrt(head_k_dim). They are
+     * not L2-normalized. */
+    double inv = 1.0 / sqrt((double)dk);
+    for (uint32_t h = 0; h < c->n_k_heads; h++) {
+        float *qh = q + (size_t)h * dk;
+        float *kh = k + (size_t)h * dk;
+        sg_ref_rmsnorm(qh, NULL, dk, 1e-6f);
+        sg_ref_rmsnorm(kh, NULL, dk, 1e-6f);
+        for (uint32_t i = 0; i < dk; i++) {
+            qh[i] = (float)((double)qh[i] * inv * inv);
+            kh[i] = (float)((double)kh[i] * inv);
+        }
+    }
+
+    for (uint32_t h = 0; h < c->n_v_heads; h++) {
+        uint32_t hk = sg_ssm_k_head(h, c->n_k_heads, c->n_v_heads, st->v_tiled);
+        float beta = sg_ref_sigmoid(st->bbuf[h]);
+        /* Dispatch on the recorded form: the GGUF stores -exp(A_log) and the
+         * safetensors store A_log, and reading one as the other stays in
+         * (0,1) and fails silently. */
+        float decay = (st->a_form == SG_SSM_A_NEG_EXP)
+            ? sg_ref_delta_decay_neg_a(L->ssm_a[h], st->abuf[h], L->dt_bias[h])
+            : sg_ref_delta_decay(L->ssm_a[h], st->abuf[h], L->dt_bias[h]);
+        sg_ref_delta_step(L->ssm_state + (size_t)h * dv * dk,
+                          q + (size_t)hk * dk, k + (size_t)hk * dk,
+                          v + (size_t)h * dv, beta, decay,
+                          st->ybuf + (size_t)h * dv, dk, dv);
+    }
+
+    /* RMSNormGated: silu(z) * rms_norm(y, w, eps), per value head, with the
+     * gate taken from the UNNORMALIZED z. */
+    for (uint32_t h = 0; h < c->n_v_heads; h++) {
+        float *yh = st->ybuf + (size_t)h * dv;
+        float *zh = st->zbuf + (size_t)h * dv;
+        sg_ref_rmsnorm(yh, L->ssm_norm_w, dv, c->rms_eps);
+        sg_ref_swiglu(zh, yh, dv);   /* zh = silu(zh) * yh */
+        memcpy(yh, zh, (size_t)dv * sizeof(float));
+    }
+
+    wmatvec(w->ssm_out, st->mat_type, st->ybuf, out, c->hidden, st->value_dim);
+}
+
+/* ---------------------------------------------------------------------
+ * One token
+ * --------------------------------------------------------------------- */
+
+sg_err sg_ref_forward(sg_ref_state *st, const sg_model *m, int32_t token,
+                      uint32_t pos, const float **logits) {
+    if (!st || !m || !m->layers) return (sg_err){"ref: invalid arguments"};
+    if (m != st->owner) {
+        return (sg_err){"ref: this state was built for a different sg_model"};
+    }
+    const sg_cfg *c = &st->cfg;
+    if (token < 0 || (uint32_t)token >= c->vocab) {
+        return (sg_err){"ref: token id out of range"};
+    }
+    if (pos >= st->max_ctx) return (sg_err){"ref: position exceeds max_ctx"};
+    /* The caches are append-only, so positions must arrive in order. A
+     * caller that restarts a sequence calls sg_ref_state_reset. */
+    if (pos != st->used) return (sg_err){"ref: positions must be presented in order"};
+
+    /* No embedding scale: qwen3_5.py's Qwen3_5TextModel returns
+     * embed_tokens(inputs) untouched. */
+    wrow(m->tok_emb, st->mat_type, (uint64_t)token, c->hidden, st->x);
+
+    for (uint32_t i = 0; i < c->n_layers; i++) {
+        const sg_layer_w *w = &m->layers[i];
+        sg_ref_layer *L = &st->ls[i];
+
+        memcpy(st->h, st->x, (size_t)c->hidden * sizeof(float));
+        sg_ref_rmsnorm(st->h, L->ln1, c->hidden, c->rms_eps);
+        if (L->is_attn) attn_layer(st, w, L, st->h, st->r, pos);
+        else            gdn_layer(st, w, L, st->h, st->r);
+        for (uint32_t j = 0; j < c->hidden; j++) st->x[j] += st->r[j];
+
+        memcpy(st->h, st->x, (size_t)c->hidden * sizeof(float));
+        sg_ref_rmsnorm(st->h, L->ln2, c->hidden, c->rms_eps);
+        wmatvec(w->gate_proj, st->mat_type, st->h, st->ff_gate, c->ffn_hidden, c->hidden);
+        wmatvec(w->up_proj, st->mat_type, st->h, st->ff_up, c->ffn_hidden, c->hidden);
+        sg_ref_swiglu(st->ff_gate, st->ff_up, c->ffn_hidden);
+        wmatvec(w->down_proj, st->mat_type, st->ff_gate, st->r, c->hidden, c->ffn_hidden);
+        for (uint32_t j = 0; j < c->hidden; j++) st->x[j] += st->r[j];
+    }
+
+    memcpy(st->h, st->x, (size_t)c->hidden * sizeof(float));
+    sg_ref_rmsnorm(st->h, st->out_norm_w, c->hidden, c->rms_eps);
+    /* m->lm_head aliases m->tok_emb when the embeddings are tied, which is
+     * exactly mlx's embed_tokens.as_linear(out). */
+    wmatvec(m->lm_head, st->mat_type, st->h, st->logits, c->vocab, c->hidden);
+
+    st->used = pos + 1;
+    if (logits) *logits = st->logits;
+    return SG_OK;
+}
+

@@ -96,6 +96,11 @@ bool sg_st_tensor_f32(const sg_st *s, const char *name, const float **data,
 /* config.json lookups: top level first, then inside "text_config" if absent. */
 bool sg_st_config_u32(const sg_st *s, const char *key, uint32_t *out);
 bool sg_st_config_f32(const sg_st *s, const char *key, float *out);
+/* Same nesting rules, for a JSON boolean. Needed because config.json states
+ * tie_word_embeddings and attention_bias as `true`/`false`, which the two
+ * numeric accessors correctly refuse; without this they read as "absent" and
+ * a contradiction with the tensor layout goes unnoticed. */
+bool sg_st_config_bool(const sg_st *s, const char *key, bool *out);
 
 /* Config extraction + weight-name mapping for the qwen3_5/qwen35 dense-attention
  * subset (Task 6). Real Qwen3.5/3.6 checkpoints are a hybrid of full (softmax)
@@ -111,6 +116,27 @@ typedef struct {
     uint32_t n_layers, n_heads, n_kv_heads, head_dim, hidden, ffn_hidden, vocab;
     float rope_theta, rms_eps;
     bool tied_embeddings;
+
+    /* Task 8 additions, needed by the forward pass and by nothing before it.
+     *
+     * rope_dim is mlx's int(head_dim * partial_rotary_factor), i.e. the
+     * number of leading head_dim elements RoPE actually rotates (64 of 256
+     * in both checkpoints; the GGUF states it outright as
+     * <arch>.rope.dimension_count).
+     *
+     * full_attn_interval mirrors qwen3_5.py's DecoderLayer rule: layer L is
+     * a full-attention layer iff (L + 1) % full_attn_interval == 0, and a
+     * gated-DeltaNet layer otherwise. It is a CROSS-CHECK, not the dispatch:
+     * both loaders still decide layer kind by tensor presence, and
+     * sg_ref_state_new rejects a model whose tensor layout and config
+     * disagree rather than silently trusting one of them.
+     *
+     * The five DeltaNet dims are zero on a model with no linear-attention
+     * layer. key_dim = n_k_heads*head_k_dim, value_dim = n_v_heads*head_v_dim
+     * and conv_dim = 2*key_dim + value_dim are derived, not stored. */
+    uint32_t rope_dim;
+    uint32_t full_attn_interval;
+    uint32_t n_k_heads, n_v_heads, head_k_dim, head_v_dim, conv_kernel;
 } sg_cfg;
 
 /* Per-layer weight pointers. Exactly one of the two attention groups is
@@ -165,15 +191,37 @@ typedef struct {
  *    k_norm when the checkpoint carries mtp.* tensors or an unsanitized
  *    conv1d weight -- the real 2B safetensors checkpoint carries both, so
  *    mlx shifts them at load time. The GGUF converter baked the shift in
- *    already. Measured means: ST layers.0.input_layernorm.weight +0.0956 and
- *    layers.3.self_attn.q_norm.weight +0.4231, versus GGUF
- *    blk.0.attn_norm.weight +0.9762 and blk.3.attn_q_norm.weight +1.2217.
- *    So ln1/ln2/q_norm/k_norm/out_norm from sg_model_from_st are "residual"
- *    (centred near 0) and need +1.0 before use, while the same fields from
- *    sg_model_from_gguf are already absolute. ssm_norm is NOT in mlx's shift
- *    list and needs no adjustment from either source. Task 8 owns applying
- *    this; tests/test_model.c pins the discrepancy so it cannot be
- *    rediscovered the hard way.
+ *    already. So ln1/ln2/q_norm/k_norm/out_norm from sg_model_from_st are
+ *    "residual" (centred near 0) and need +1.0 before use, while the same
+ *    fields from sg_model_from_gguf are already absolute. ssm_norm is NOT in
+ *    mlx's shift list and needs no adjustment from either source.
+ *
+ *    Evidence, SAME MODEL on both sides (Qwen3.6-27B-Q8_0.gguf against
+ *    /Users/macmini/models/qwen36-27b-8bit, an mlx repack of the same
+ *    weights, so its norms are already post-sanitize):
+ *
+ *      tensor                     |gguf - hf|   |gguf - (hf + 1)|
+ *      blk.0.attn_norm.weight       3.906e-03       1.004
+ *      blk.3.attn_q_norm.weight     3.906e-03       1.004
+ *      output_norm.weight           7.812e-03       1.008
+ *      blk.0.ssm_norm.weight        0.000e+00       1.000
+ *
+ *    The GGUF value IS the absolute weight to bf16 grid noise and is a full
+ *    1.0 away from the residual one; ssm_norm matches EXACTLY, which is what
+ *    "not in the shift list" looks like on both sides. On the raw
+ *    (unrepacked) 2B the same tensors are residual: mean
+ *    layers.0.input_layernorm.weight +0.0956 and
+ *    layers.3.self_attn.q_norm.weight +0.4231, against the GGUF's +0.9762
+ *    and +1.2217 for the corresponding tensors -- but note those two means
+ *    are from DIFFERENT checkpoints and only the table above is same-model.
+ *
+ *    Task 8 applies this, dispatching on sg_model.norms_are_residual, and
+ *    does the addition in f32 AFTER widening, which is transformers'
+ *    Qwen3_5RMSNorm semantics and deliberately NOT mlx-lm's (see the comment
+ *    on ref.c's wwiden for the measured consequence). tests/test_model.c
+ *    pins the per-source discrepancy, and tests/fixtures/mini_fwd stores
+ *    residual norms on purpose so the rule is exercised in a plain
+ *    `make check`.
  *
  * 3. ssm_a DOES NOT HOLD THE SAME QUANTITY IN BOTH SOURCES. On the
  *    safetensors side it is mlx's A_log verbatim. On the GGUF side the
@@ -241,6 +289,33 @@ typedef struct {
     bool v_heads_tiled;         /* true for GGUF: k_head = v_head % n_k_heads */
     sg_tensor_type ssm_a_type;    /* SG_T_F32 or SG_T_BF16; probed at load */
     sg_tensor_type ssm_norm_type; /* SG_T_F32 or SG_T_BF16; probed at load */
+
+    /* Dtype of every SMALL tensor that is not a matmul weight and not one of
+     * the two probed above: ln1, ln2, q_norm, k_norm, out_norm, ssm_conv1d,
+     * ssm_dt_bias. SG_T_F32 from the GGUF loader (verified per tensor while
+     * mapping, not assumed) and SG_T_BF16 from the safetensors loader (where
+     * it is true by construction: st_dense_tensor goes through sg_st_tensor,
+     * which returns BF16 and nothing else). This is the third row of the
+     * dtype table in sg_layer_w's comment, made machine-readable so the
+     * forward pass does not have to dispatch on wtype -- which describes the
+     * MATMUL weights only. */
+    sg_tensor_type dense_type;
+
+    /* True when the RMSNorm weights in ln1/ln2/q_norm/k_norm/out_norm are
+     * RESIDUAL and need +1.0 before use; false when they are absolute.
+     *
+     * This is note 2 on sg_layer_w turned into a flag. mlx's
+     * TextModel.sanitize adds 1.0 to exactly those five (and NOT to
+     * ssm_norm) when the checkpoint carries mtp.* tensors or an unsanitized
+     * conv1d.weight, so a checkpoint that mlx would shift is one surge must
+     * shift too. The safetensors loader reproduces mlx's own condition
+     * (unsanitized conv1d, i.e. conv1d.weight's last dim != 1, or an mtp.*
+     * tensor); the GGUF converter baked the shift in already, so the GGUF
+     * loader always reports false. See note 2 on sg_layer_w for the
+     * same-model measurements that establish this, and ref.c's wwiden for
+     * the fact that surge performs the addition in f32 (transformers'
+     * semantics) rather than in bf16 (mlx-lm's). */
+    bool norms_are_residual;
 } sg_model;
 
 /* The value-head to key-head map, which differs between the two sources
@@ -250,7 +325,9 @@ typedef struct {
  * choice is invisible on the 2B and wrong on every 27B layer. */
 static inline uint32_t sg_ssm_k_head(uint32_t v_head, uint32_t n_k_heads,
                                      uint32_t n_v_heads, bool tiled) {
-    if (n_k_heads == 0) return 0;
+    /* n_v_heads < n_k_heads would make the grouped divisor zero, so guard on
+     * the divisor rather than only on n_k_heads. */
+    if (n_k_heads == 0 || n_v_heads < n_k_heads) return 0;
     return tiled ? (v_head % n_k_heads) : (v_head / (n_v_heads / n_k_heads));
 }
 
@@ -338,5 +415,48 @@ void sg_ref_conv1d_causal(float *x, const float *w, const float *state_in,
 void sg_ref_delta_step(float *S, const float *q, const float *k, const float *v,
                        float beta, float decay, float *out,
                        uint32_t dk, uint32_t dv);
+
+/* ---------------------------------------------------------------------
+ * The reference forward pass (Task 8)
+ * ---------------------------------------------------------------------
+ *
+ * One scalar-C token step over the whole hybrid model, composed from the
+ * sg_ref_* ops above and nothing else. Everything is f32 (weights are
+ * widened from bf16 or dequantized from Q8_0 on the fly) with double
+ * accumulators inside the ops; there is no batching and no fused kernel.
+ *
+ * sg_ref_state owns the PER-LAYER UNION STATE, which is what makes this a
+ * hybrid rather than a transformer:
+ *
+ *   full-attention layer  ->  f32 K and V caches, [max_ctx, n_kv_heads, head_dim]
+ *   gated-DeltaNet layer  ->  a conv tail [conv_kernel-1, conv_dim] plus a
+ *                             delta-rule state S [n_v_heads, head_v_dim, head_k_dim]
+ *
+ * Only the attention layers grow with context; a DeltaNet layer's state is
+ * a fixed size no matter how long the sequence gets.
+ *
+ * It also owns f32 copies of every RMSNorm weight, which is where
+ * sg_model.norms_are_residual is applied (+1.0 on ln1/ln2/q_norm/k_norm/
+ * out_norm, never on ssm_norm) -- the checkpoint mmap is read-only, so the
+ * shift needs owned storage.
+ *
+ * sg_ref_state_new validates the model against the config before allocating:
+ * that every layer's tensor group agrees with full_attn_interval, that
+ * rope_dim is even and <= head_dim, and that the DeltaNet dims are present
+ * and consistent when any DeltaNet layer exists.
+ *
+ * sg_ref_forward runs ONE token at position pos and returns a pointer to
+ * cfg.vocab logits owned by the state (valid until the next call). Positions
+ * must be presented in order starting at 0; feeding the same state a
+ * position it has already seen is rejected, because the caches are
+ * append-only. */
+typedef struct sg_ref_state sg_ref_state;
+sg_err sg_ref_state_new(const sg_model *m, uint32_t max_ctx, sg_ref_state **out);
+void sg_ref_state_free(sg_ref_state *st);
+sg_err sg_ref_forward(sg_ref_state *st, const sg_model *m, int32_t token,
+                      uint32_t pos, const float **logits);
+/* Rewinds the caches to position 0 without reallocating, so one state can
+ * run several independent sequences. */
+void sg_ref_state_reset(sg_ref_state *st);
 
 #endif

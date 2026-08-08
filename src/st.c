@@ -966,6 +966,14 @@ bool sg_st_config_u32(const sg_st *s, const char *key, uint32_t *out) {
     return true;
 }
 
+bool sg_st_config_bool(const sg_st *s, const char *key, bool *out) {
+    if (!out) return false;
+    const jv *v = st_config_lookup(s, key);
+    if (!v || v->kind != JV_BOOL) return false;
+    *out = v->as.b;
+    return true;
+}
+
 bool sg_st_config_f32(const sg_st *s, const char *key, float *out) {
     if (!out) return false;
     const jv *v = st_config_lookup(s, key);

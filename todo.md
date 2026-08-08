@@ -9,7 +9,7 @@
 | 5 | safetensors | done |
 | 6 | model config | done |
 | 7 | ref ops (hybrid) | done |
-| 8 | ref forward + M1 gate | pending |
+| 8 | ref forward + M1 gate | done |
 | 9 | metal ops | pending |
 | 10 | metal decode + M2 gate | pending |
 
@@ -416,3 +416,118 @@
 - Matrix re-run, 5 env combos x {check, debug}: all rc=0, 0 failing suites,
   0 sanitizer reports. test_model.c 2 -> 59 checks ungated, 231 -> 446 with
   everything set. All five fixture artifacts regenerate byte-identically.
+
+## Task 8 Results (ref forward + M1 gate)
+
+### M1 GATE: PASSED
+
+Qwen3.5-2B bf16, teacher-forced, 16 prompts x 64 positions x 248320 logits
+= 1024 positions compared. `tools/tf_compare.py`, verbatim totals:
+
+```
+TOTAL   |  1023/1024 (99.90%)  max 1.7885e-01  |  1024/1024 (100.00%)  max 8.5831e-05
+           ^ vs mlx-lm as shipped                 ^ vs mlx-lm with transformers' f32 norm shift
+                                                    (THE GATE ORACLE)
+```
+
+- **top-1 agreement 1024/1024 = 100.00%**, **max |logit delta| 8.5831e-05**
+  (gate needs 100% and < 1e-2, so 116x inside tolerance).
+- Per prompt, max |delta| vs the gate oracle: 4.387e-05, 5.341e-05,
+  4.387e-05, 4.148e-05, 8.583e-05, 4.578e-05, 4.292e-05, 6.557e-05,
+  4.578e-05, 5.531e-05, 5.150e-05, 6.866e-05, 5.531e-05, 4.387e-05,
+  4.578e-05, 4.768e-05. Top-1 is 64/64 on every prompt.
+
+### The one real finding: mlx-lm adds the +1.0 norm shift in bf16
+
+mlx_lm/utils.py runs `model.sanitize(weights)` on the raw bf16 arrays, so
+qwen3_5.py's `weights[k] = v + 1.0` stays in bf16 and the sum is rounded.
+Around 1.1 that costs ~0.004 absolute per norm weight, and it moves the 2B's
+logits by up to **1.7881e-01** all by itself (measured mlx-vs-mlx, same
+weights, same f32 compute dtype).
+
+transformers/models/qwen3_5/modeling_qwen3_5.py `Qwen3_5RMSNorm.forward`
+does it in f32: `output = output * (1.0 + self.weight.float())`. surge
+follows transformers, so the gate oracle is mlx-lm with the 61 shifted norm
+tensors recomputed as `f32(w) + 1.0` (61 = 24 input_layernorm + 24
+post_attention_layernorm + 6 q_norm + 6 k_norm + 1 model.norm).
+
+The single top-1 disagreement against stock mlx-lm is prompt 3 position 26,
+and it is mlx's, not surge's: the two mlx oracles disagree at exactly that
+one position too (1023/1024 between themselves), stock mlx's own top-2 gap
+there is 0.00151, an order of magnitude smaller than the 0.0699 its bf16
+shift moves that prompt's logits. surge and corrected-mlx both say token
+760; stock mlx says 40.
+
+### Forward structure
+
+`sg_ref_state` carries the PER-LAYER UNION STATE: f32 K/V caches
+[max_ctx, n_kv_heads, head_dim] on full-attention layers, conv tail
+[conv_kernel-1, conv_dim] + delta S-matrix [n_v_heads, head_v_dim,
+head_k_dim] on DeltaNet layers, plus owned f32 copies of every norm weight
+(where the +1.0 shift is applied, since the mmap is read-only). Layer kind
+comes from tensor presence AND is cross-checked against
+`(L+1) % full_attention_interval == 0`; a disagreement is a hard error.
+Big matmuls read bf16/Q8_0 straight out of the mmap; the model is never
+materialized in f32.
+
+- 2B (bf16, safetensors): 1.28 s per position, single scalar core.
+- 27B (Q8_0, GGUF): 17.7 s per position.
+
+### Two ungated mlx oracles, one per checkpoint format
+
+`tests/fixtures/mini_fwd/` is a 4-layer hybrid qwen3_5 model (3 DeltaNet +
+1 attention) with mlx's own teacher-forced logits for 12 positions, shipped
+BOTH as safetensors and as a GGUF carrying every converter transform:
+
+| path | max abs delta vs mlx | top-1 |
+|---|---|---|
+| safetensors (`model.safetensors`) | 3.219e-06 | 12/12 |
+| GGUF (`model.gguf`) | 3.099e-06 | 12/12 |
+
+Both run in milliseconds in a plain `make check`. The GGUF twin is the only
+numeric coverage anywhere for `SG_SSM_A_NEG_EXP`, `v_heads_tiled`,
+`dense_type == SG_T_F32` and absolute (unshifted) GGUF norms: the 2B has
+n_v_heads == n_k_heads so it cannot expose the head map at all, and the real
+27B has no mlx oracle. Mutation-tested: making the forward ignore
+`v_heads_tiled`, ignore `ssm_a_form`, or always shift the norms moves the
+GGUF logits to 4.87 / 3.82 / 5.03 respectively (tolerance 1e-4) while
+leaving the safetensors fixture untouched.
+
+The fixture's `rms_norm_eps` is deliberately 1e-3, not the 1e-6 both real
+checkpoints use: qwen3_5.py hardcodes 1e-6 for the DeltaNet q/k
+normalization and uses the config's eps everywhere else, and at 1e-6 those
+are the same number, so confusing them was bit-identical and unfalsifiable.
+At 1e-3 the same mutation moves the logits by 2.18e-02.
+
+### Other results
+
+- GGUF end-to-end smoke, Qwen3.6-27B-Q8_0, greedy: `The capital of France
+  is` -> ` Paris.`
+- Task 7's last open item CLOSED: the `ssm_alpha`<->`in_proj_a` /
+  `ssm_beta`<->`in_proj_b` pairing, verified by dequantizing both sides of
+  the twin pair. Max abs delta under the named pairing / under the swap, per
+  layer: L0 1.22e-03, 5.05e-04 / 1.27e-01, 1.26e-01; L1 1.64e-03, 2.35e-03 /
+  3.34e-01, 3.34e-01; L2 1.82e-03, 2.05e-03 / 2.48e-01, 2.48e-01;
+  L4 1.96e-03, 1.69e-03 / 3.49e-01, 3.49e-01.
+- The norm-shift claim in surge.h is now backed by SAME-MODEL numbers
+  (27B GGUF vs the 27B mlx repack): |gguf - hf| is 3.906e-03 for
+  blk.0.attn_norm.weight and blk.3.attn_q_norm.weight, 7.812e-03 for
+  output_norm.weight and 0.000e+00 for blk.0.ssm_norm.weight, against
+  |gguf - (hf+1)| of 1.004 / 1.004 / 1.008 / 1.000.
+- Frozen regression fixtures: the full M1 dumps are 1017 MB, so
+  `tests/fixtures/m1/pNN.f32` holds a documented digest per position
+  ([argmax, max, mean, rms] + 64 stride-sampled logits, 278 KB total) plus
+  `ids.txt`. All 16 are rechecked under SURGE_ST and reproduce to
+  **2.218e-07**. The full dumps stay on disk, gitignored, and are only
+  re-frozen by an explicit `tf_compare.py --freeze` that refuses to run when
+  the gate fails.
+- Loader hardening (from the two adversarial reviews): every tensor's
+  ELEMENT COUNT is now checked against the config in both loaders (a
+  vocab_size or hidden_size that overstates the file was a heap overread and
+  ASan proved it); the GGUF loader verifies every tensor's dtype while
+  mapping; `attention_bias: true`, a `tie_word_embeddings` that contradicts
+  lm_head.weight, a GGUF `value_length != key_length`, and a DeltaNet dtype
+  that changes between layers are all now hard errors.
+- `sg_ref_state_new` additionally validates rope_theta, rms_eps, the
+  small-tensor dtypes, every per-layer pointer, and rejects derived widths
+  above 2^24 (computed in u64) so a lying config cannot wrap a u32 width.

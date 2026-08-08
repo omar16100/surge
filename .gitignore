@@ -6,3 +6,6 @@
 *.dSYM/
 .DS_Store
 surge-info
+surge-ref
+tests/fixtures/m1/*.full.f32
+tests/fixtures/m1/dumps.json

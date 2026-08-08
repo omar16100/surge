@@ -169,7 +169,13 @@ internal adversarial agent otherwise) at M1, M4, and M9 minimum.
   overhauls AGX kexts); the machine stays on 26.3 for the project duration per the
   llm-rnd freeze.
 
-## Open questions
+## Resolved owner decisions (2026-08-08)
 
-None blocking. Name (`surge`) and repo visibility (private vs public from day one) are
-owner preferences to state before M0 lands.
+- Name: `surge`, confirmed.
+- Visibility: public open-source from day one (github.com/omar16100/surge), MIT license
+  (matching fanpro).
+- Attribution: the README credits the llm-rnd experimentation campaign on this machine
+  (the firmware-limiter discovery, roofline measurements, and benchmarking methodology
+  that this engine's design exploits), linking the published write-up at
+  https://omarshabab.com/mac-studio-firmware-gpu-limiter/ and the public
+  github.com/omar16100/llm-benchmark harness.

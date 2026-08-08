@@ -2,8 +2,8 @@
 
 | # | Task | Status |
 |---|------|--------|
-| 1 | skeleton | in progress |
-| 2 | gguf reader | pending |
+| 1 | skeleton | done |
+| 2 | gguf reader | done |
 | 3 | surge-info + real GGUF | pending |
 | 4 | tokenizer | pending |
 | 5 | safetensors | pending |

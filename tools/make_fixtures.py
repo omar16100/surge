@@ -182,10 +182,59 @@ def write_tok_fixture(tokenizer_dir: str, out_path: str) -> None:
     print(f"wrote {out_path} ({len(TOK_FIXTURE_CASES)} cases)")
 
 
+def _f32_to_bf16_bytes(x: float) -> bytes:
+    """Round-to-nearest-even float32 -> bf16, packed as a little-endian u16.
+
+    All six fixture values below (0.5, 1, 2, 3, 4, 5) are exactly
+    representable in bf16 (zero mantissa bits below the truncation point),
+    so this is a plain truncation for them; the round-to-nearest-even bias
+    is included anyway so the helper is correct for arbitrary floats.
+    """
+    bits = struct.unpack("<I", struct.pack("<f", x))[0]
+    rounding_bias = 0x7FFF + ((bits >> 16) & 1)
+    bits = (bits + rounding_bias) >> 16
+    return struct.pack("<H", bits & 0xFFFF)
+
+
+def write_mini_safetensors(out_dir: str) -> None:
+    """Write the small safetensors fixture used by tests/test_st.c.
+
+    Single-shard model dir (no model.safetensors.index.json) containing
+    model.safetensors: one bf16 tensor "w" shape [2, 3], row-major values
+    0.5, 1, 2, 3, 4, 5; plus config.json {"hidden_size": 3}.
+    """
+    values = [0.5, 1.0, 2.0, 3.0, 4.0, 5.0]
+    data = b"".join(_f32_to_bf16_bytes(v) for v in values)
+    assert len(data) == 12
+
+    header_obj = {
+        "w": {"dtype": "BF16", "shape": [2, 3], "data_offsets": [0, len(data)]},
+    }
+    header_json = json.dumps(header_obj).encode("utf-8")
+    # Pad the header with spaces (valid insignificant JSON whitespace) so the
+    # data section starts 8-byte aligned, per the safetensors convention.
+    total_prefix = 8 + len(header_json)
+    pad = (-total_prefix) % 8
+    header_json += b" " * pad
+
+    out = pathlib.Path(out_dir)
+    out.mkdir(parents=True, exist_ok=True)
+
+    with (out / "model.safetensors").open("wb") as f:
+        f.write(struct.pack("<Q", len(header_json)))
+        f.write(header_json)
+        f.write(data)
+
+    (out / "config.json").write_text(json.dumps({"hidden_size": 3}), encoding="utf-8")
+    print(f"wrote {out_dir}/model.safetensors and {out_dir}/config.json")
+
+
 if __name__ == "__main__":
     if "--tok" in sys.argv:
         write_tok_fixture("/Users/macmini/models/qwen36-27b-8bit",
                           "tests/fixtures/tok_cases.jsonl")
+    elif "--st" in sys.argv:
+        write_mini_safetensors("tests/fixtures/mini_st")
     else:
         write_mini_gguf("tests/fixtures/mini.gguf")
         print("wrote tests/fixtures/mini.gguf")

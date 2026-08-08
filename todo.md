@@ -6,7 +6,7 @@
 | 2 | gguf reader | done |
 | 3 | surge-info + real GGUF | done |
 | 4 | tokenizer | done |
-| 5 | safetensors | pending |
+| 5 | safetensors | done |
 | 6 | model config | pending |
 | 7 | ref ops | pending |
 | 8 | ref forward + M1 gate | pending |
@@ -67,3 +67,53 @@
   lazy cache is not thread-safe. Re-verified full green (make check,
   SURGE_GGUF make check, both make debug/ASan variants, the 20 ad hoc
   cases, and a fresh doubling benchmark) after the fixes.
+
+## Task 5 Results (st.c safetensors bf16 loader)
+
+- src/st.c: mmap's every *.safetensors shard PROT_READ; shard filenames
+  come from model.safetensors.index.json's weight_map when present (never
+  a hardcoded "model-NNNNN-of-NNNNN" pattern -- the real validation model
+  uses the non-standard "model.safetensors-00001-of-00001.safetensors"),
+  else the single *.safetensors file in model_dir. Hand-written minimal
+  read-only JSON scanner (objects/arrays/strings/numbers/true/false/null;
+  escapes limited to \" \\ \n \t, anything else hard-errors; nesting depth
+  capped at 64; numbers via a bounded stack buffer then strtod/strtoll)
+  used for both the safetensors header and config.json.
+- Only BF16-dtype tensors are indexed/retrievable via sg_st_tensor; other
+  dtypes and tensors with rank > 4 (sg_st_tensor's dims is a fixed
+  uint64_t[4]) are still bounds-checked at open time but not indexed --
+  the real validation model has a real rank-5 BF16 tensor
+  (model.visual.patch_embed.proj.weight, [1024,3,2,16,16]) that exercises
+  this path. BF16 tensor data offsets are checked for 2-byte alignment.
+- config.json lookups (sg_st_config_u32/f32) check the top level first,
+  then inside "text_config" if absent -- Qwen3.5-2B's config.json nests
+  hidden_size (and most other hyperparameters) there.
+- tests/fixtures/mini_st/: single-shard fixture (write_mini_safetensors()
+  in tools/make_fixtures.py), one bf16 tensor w [2,3] + config.json
+  {"hidden_size": 3}. tests/test_st.c: fixture asserts run unconditionally
+  (dims, bf16 halves vs precomputed constants, config lookup, missing-key/
+  missing-tensor, truncated-shard-fails-cleanly); real-model asserts
+  env-gated on SURGE_ST=/Users/macmini/models/qwen35-2b (opens, finds
+  model.language_model.embed_tokens.weight -- the checkpoint's actual
+  tensor name; the brief's "model.embed_tokens.weight" doesn't exist in
+  this checkpoint -- dims[1] == hidden_size from config).
+- Review round (codex quota exhausted again; fell back to the same
+  adversarial general-purpose review agent convention as Task 4): found
+  one CONFIRMED bug -- several growable-array helpers (jp_parse_raw_string,
+  jp_parse_object, jp_parse_array, collect_shard_filenames's two name
+  lists) doubled a uint32_t capacity without an overflow guard; at
+  cap == 2^31 the next doubling wraps to 0, and realloc(ptr, 0) either
+  returns a valid pointer to a 0-byte block (release build -> heap buffer
+  overflow on the very next write) or frees ptr and returns NULL under
+  ASan's allocator (double-free on the following `if (!nb) free(buf)`
+  path) -- reproduced both behaviors directly on this platform. Only
+  reachable via inputs with billions of JSON members/array elements or a
+  ~2 GiB single string, i.e. not reachable by any real config/index file,
+  but fixed anyway (explicit `cap > UINT32_MAX / 2` guard before each
+  doubling, matching tok.c's Task 4 precedent for the same bug class) since
+  it's cheap and the project's stated bar is "reject what it cannot parse,
+  never misparse." No other bugs found; reviewer independently verified
+  zero leaks/double-frees across 19 crafted fixtures plus the real model
+  via a malloc-interposition harness, confirmed all 11 stated requirements
+  and the bf16 hex-constant sanity check. Re-verified full green (make
+  check, SURGE_ST make check, both make debug/ASan variants) after the fix.

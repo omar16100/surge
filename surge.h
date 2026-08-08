@@ -57,4 +57,20 @@ int64_t sg_tok_decode(const sg_tok *t, const int32_t *ids, uint64_t n,
                       char *buf, uint64_t buf_cap);
 int32_t sg_tok_eos(const sg_tok *t);
 
+/* Read-only safetensors bf16 loader + config.json (Task 5). */
+
+typedef struct sg_st sg_st;
+/* Opens model_dir: reads config.json plus every tensor shard (via
+ * model.safetensors.index.json's weight_map when present, otherwise the
+ * single *.safetensors file in model_dir). */
+sg_err sg_st_open(const char *model_dir, sg_st **out);
+void sg_st_close(sg_st *s);
+/* bf16 tensor view; name uses the checkpoint's own names. Only BF16-dtype
+ * tensors are retrievable; returns false if name is absent or not BF16. */
+bool sg_st_tensor(const sg_st *s, const char *name, const uint16_t **data,
+                  uint64_t dims[4], uint32_t *n_dims);
+/* config.json lookups: top level first, then inside "text_config" if absent. */
+bool sg_st_config_u32(const sg_st *s, const char *key, uint32_t *out);
+bool sg_st_config_f32(const sg_st *s, const char *key, float *out);
+
 #endif

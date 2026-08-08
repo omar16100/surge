@@ -20,7 +20,10 @@ indexer) is designed only after sub-project 1 ships its success bar.
 
 ## Goals and success bar (sub-project 1)
 
-Target model: Qwen3.6-27B (dense, `qwen3_5` architecture family), 8-bit first.
+Target model: Qwen3.6-27B (`qwen3_5` architecture family), 8-bit first. Post-Task-6
+correction: the architecture is HYBRID (1-in-4 full-attention layers, 3-in-4 gated
+DeltaNet linear-attention layers, attention output gate); the engine implements both
+layer types. The word "dense" in this spec previously reflected a wrong assumption.
 Plan-time addendum: exact-correctness validation runs on `Qwen/Qwen3.5-2B` bf16 (same
 architecture; disk cannot hold a 56 GB bf16 27B next to the quants), and the 27B is
 validated at Q8_0 against mlx-lm with the top-1/threshold gate.

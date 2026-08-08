@@ -124,6 +124,84 @@ static void st_open_truncated_shard(void) {
     rmdir(dir);
 }
 
+static void write_raw_safetensors(const char *path, const char *header, size_t header_len) {
+    FILE *f = fopen(path, "wb");
+    if (!f) return;
+    uint64_t hlen = (uint64_t)header_len; /* host is little-endian Apple Silicon */
+    fwrite(&hlen, sizeof(hlen), 1, f);
+    fwrite(header, 1, header_len, f);
+    fclose(f);
+}
+
+/* Regression test for a reviewer-confirmed spec gap: jp_parse_document used
+ * to stop as soon as it found one valid top-level JSON value and never
+ * checked whether the rest of the buffer was consumed, so a syntactically
+ * complete object immediately followed by garbage (still within
+ * header_len) opened successfully instead of being rejected. Exercises the
+ * bug via a crafted shard header, following test_gguf.c's
+ * build-a-tiny-file-in-a-temp-dir pattern for its truncation test. */
+static void st_open_header_trailing_garbage(void) {
+    char dir[128];
+    snprintf(dir, sizeof(dir), "/tmp/surge_st_trailing_hdr_%d", (int)getpid());
+    char mkcmd[192];
+    snprintf(mkcmd, sizeof(mkcmd), "mkdir -p %s", dir);
+    tt_assert(system(mkcmd) == 0, "mkdir for trailing-garbage header fixture should succeed");
+
+    char cfg_path[192];
+    snprintf(cfg_path, sizeof(cfg_path), "%s/config.json", dir);
+    FILE *cfg = fopen(cfg_path, "w");
+    tt_assert(cfg != NULL, "trailing-garbage fixture config.json should be writable");
+    if (cfg) { fputs("{\"hidden_size\": 3}", cfg); fclose(cfg); }
+
+    /* A syntactically complete, valid top-level object ("{}") immediately
+     * followed by non-whitespace garbage, all still counted within
+     * header_len. */
+    static const char header[] = "{}garbage";
+    char shard_path[192];
+    snprintf(shard_path, sizeof(shard_path), "%s/model.safetensors", dir);
+    write_raw_safetensors(shard_path, header, sizeof(header) - 1);
+
+    sg_st *s = NULL;
+    sg_err e = sg_st_open(dir, &s);
+    tt_assert(sg_failed(e), "opening a shard header with trailing garbage should fail");
+    tt_assert(s == NULL, "handle should stay NULL when the header has trailing garbage");
+    tt_assert(e.msg != NULL && strcmp(e.msg, "st: trailing content after json value") == 0,
+              "error should specifically flag trailing json content, got: %s",
+              e.msg ? e.msg : "(null)");
+
+    remove(shard_path);
+    remove(cfg_path);
+    rmdir(dir);
+}
+
+/* Same bug class as above, exercised via config.json instead of a shard
+ * header: jp_parse_document is the one shared entry point both callers use,
+ * so this pins the fix there rather than only at one call site. */
+static void st_open_config_trailing_garbage(void) {
+    char dir[128];
+    snprintf(dir, sizeof(dir), "/tmp/surge_st_trailing_cfg_%d", (int)getpid());
+    char mkcmd[192];
+    snprintf(mkcmd, sizeof(mkcmd), "mkdir -p %s", dir);
+    tt_assert(system(mkcmd) == 0, "mkdir for trailing-garbage config fixture should succeed");
+
+    char cfg_path[192];
+    snprintf(cfg_path, sizeof(cfg_path), "%s/config.json", dir);
+    FILE *cfg = fopen(cfg_path, "w");
+    tt_assert(cfg != NULL, "trailing-garbage config.json should be writable");
+    if (cfg) { fputs("{\"hidden_size\": 3}garbage", cfg); fclose(cfg); }
+
+    sg_st *s = NULL;
+    sg_err e = sg_st_open(dir, &s);
+    tt_assert(sg_failed(e), "opening a config.json with trailing garbage should fail");
+    tt_assert(s == NULL, "handle should stay NULL when config.json has trailing garbage");
+    tt_assert(e.msg != NULL && strcmp(e.msg, "st: trailing content after json value") == 0,
+              "error should specifically flag trailing json content, got: %s",
+              e.msg ? e.msg : "(null)");
+
+    remove(cfg_path);
+    rmdir(dir);
+}
+
 static void st_real_model(void) {
     const char *model_dir = getenv("SURGE_ST");
     if (!model_dir || !*model_dir) {
@@ -168,6 +246,8 @@ int main(void) {
     tt_run("st_fixture_open_close", st_fixture_open_close);
     tt_run("st_open_nonexistent", st_open_nonexistent);
     tt_run("st_open_truncated_shard", st_open_truncated_shard);
+    tt_run("st_open_header_trailing_garbage", st_open_header_trailing_garbage);
+    tt_run("st_open_config_trailing_garbage", st_open_config_trailing_garbage);
     tt_run("st_real_model", st_real_model);
     return tt_report();
 }

@@ -410,6 +410,16 @@ static sg_err jp_parse_document(const char *base, uint64_t size, jv **out) {
         *out = NULL;
         return (sg_err){"st: expected a json object at the top level"};
     }
+    /* The whole buffer must be consumed: valid JSON followed by trailing
+     * garbage (still within header_len, or after config.json's top-level
+     * object) must be rejected, not silently accepted as if the garbage
+     * weren't there. */
+    skip_ws(&p);
+    if (p.pos != p.size) {
+        jv_free(*out);
+        *out = NULL;
+        return (sg_err){"st: trailing content after json value"};
+    }
     return SG_OK;
 }
 

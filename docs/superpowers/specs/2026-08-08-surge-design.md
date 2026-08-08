@@ -21,6 +21,9 @@ indexer) is designed only after sub-project 1 ships its success bar.
 ## Goals and success bar (sub-project 1)
 
 Target model: Qwen3.6-27B (dense, `qwen3_5` architecture family), 8-bit first.
+Plan-time addendum: exact-correctness validation runs on `Qwen/Qwen3.5-2B` bf16 (same
+architecture; disk cannot hold a 56 GB bf16 27B next to the quants), and the 27B is
+validated at Q8_0 against mlx-lm with the top-1/threshold gate.
 
 1. Correctness: teacher-forced logit agreement against a bf16 reference at the
    thresholds established in llm-rnd (top-1 agreement, mean KL, margin distribution),
@@ -52,6 +55,8 @@ Components (one file each unless noted, interfaces in `surge.h`):
 
 - `gguf.c` - mmap GGUF v3 reader: metadata table, tensor directory, Q8_0 and bf16
   tensor views. No copies; weights stay mapped. Q4_K added in a later milestone.
+- `tok.c` - byte-level BPE tokenizer from GGUF metadata (plan-time addendum: the
+  original component list omitted the tokenizer).
 - `st.c` - safetensors bf16 loader for the reference path only.
 - `model_qwen.c` - the dense graph: embedding, RMSNorm, RoPE (family variant read from
   GGUF metadata), GQA attention, SwiGLU MLP, final norm + lm_head. Dimensions

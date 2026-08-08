@@ -569,6 +569,85 @@ static void ref_delta_decay_matches_mlx(void) {
     free(got);
 }
 
+/* The GGUF decay form. blk.N.ssm_a stores -exp(A_log) rather than A_log
+ * (convert_hf_to_gguf applies -torch.exp() on the way out, and llama.cpp
+ * multiplies the result straight into softplus), so that path must skip the
+ * exp and the negation. Reading it as A_log would give
+ * exp(-exp(-exp(A_log)*sp)), which is still a plausible-looking number in
+ * (0,1) and would never announce itself.
+ *
+ * Rather than invent a second fixture, this drives the GGUF form with
+ * -exp(a_log) taken from the existing mlx decay fixture and requires it to
+ * reproduce the mlx answer. So the GGUF path inherits the mlx fixture's
+ * validation instead of resting on the reading of a converter script. */
+static void ref_delta_decay_neg_a_matches_mlx(void) {
+    uint64_t n = 0;
+    const float *a_log = fx_f32(&g_hyb, "decay.a_log", 0, &n);
+    const float *a = fx_f32(&g_hyb, "decay.a", n, NULL);
+    const float *dt = fx_f32(&g_hyb, "decay.dt_bias", n, NULL);
+    const float *want = fx_f32(&g_hyb, "decay.out", n, NULL);
+
+    float *got = xmalloc(n * sizeof *got);
+    for (uint64_t i = 0; i < n; i++) {
+        float neg_a = (float)(-exp((double)a_log[i])); /* what the GGUF stores */
+        tt_assert(neg_a < 0.0f, "-exp(A_log) must be negative, got %g at %llu",
+                  (double)neg_a, (unsigned long long)i);
+        got[i] = sg_ref_delta_decay_neg_a(neg_a, a[i], dt[i]);
+        tt_assert(got[i] > 0.0f && got[i] <= 1.0f,
+                  "decay must land in (0,1], got %g at %llu",
+                  (double)got[i], (unsigned long long)i);
+    }
+    check_close("GGUF decay form exp(ssm_a*softplus) vs mlx", got, want, n, TOL_MLX);
+
+    /* And the wrong reading must actually differ here, or this test would
+     * pass for a build that ignored ssm_a_form entirely. */
+    double worst_wrong = 0.0;
+    for (uint64_t i = 0; i < n; i++) {
+        float wrong = sg_ref_delta_decay((float)(-exp((double)a_log[i])), a[i], dt[i]);
+        double d = fabs((double)wrong - (double)want[i]);
+        if (d > worst_wrong) worst_wrong = d;
+    }
+    tt_assert(worst_wrong > 1e-2,
+              "feeding the GGUF's ssm_a into the A_log form should be clearly wrong, "
+              "but the worst difference is only %.3e -- the two forms are no longer "
+              "distinguishable on this fixture", worst_wrong);
+    fprintf(stderr, "   %-38s wrong-form max |err| %.3e (must be large)\n",
+            "GGUF vs safetensors decay form", worst_wrong);
+    free(got);
+}
+
+/* The value-head to key-head map differs by source: mlx/safetensors groups
+ * (h / repeat), the GGUF converter tiles (h % n_k). Both real 27B layers hit
+ * this; the 2B cannot, because n_v == n_k makes every candidate agree. */
+static void ssm_head_map_conventions(void) {
+    /* 16 key heads feeding 48 value heads, the real 27B shape. */
+    const uint32_t nk = 16, nv = 48, repeat = 3;
+    bool ever_differ = false;
+    for (uint32_t h = 0; h < nv; h++) {
+        uint32_t grouped = sg_ssm_k_head(h, nk, nv, false);
+        uint32_t tiled = sg_ssm_k_head(h, nk, nv, true);
+        tt_assert(grouped == h / repeat, "grouped map for v-head %u should be %u, got %u",
+                  h, h / repeat, grouped);
+        tt_assert(tiled == h % nk, "tiled map for v-head %u should be %u, got %u",
+                  h, h % nk, tiled);
+        tt_assert(grouped < nk && tiled < nk, "both maps must stay in range for v-head %u", h);
+        if (grouped != tiled) ever_differ = true;
+    }
+    tt_assert(ever_differ,
+              "the two head-map conventions must actually differ at 16k/48v, or the "
+              "flag is not testing anything");
+
+    /* And the case that hides the bug: with n_v == n_k they coincide, which
+     * is exactly why the 2B cannot expose a wrong choice. */
+    for (uint32_t h = 0; h < 16; h++) {
+        tt_assert(sg_ssm_k_head(h, 16, 16, false) == sg_ssm_k_head(h, 16, 16, true),
+                  "with n_v == n_k the two conventions should agree at v-head %u", h);
+    }
+    /* Degenerate guard: n_k_heads == 0 must not divide by zero. */
+    tt_assert(sg_ssm_k_head(3, 0, 0, false) == 0, "n_k_heads == 0 should return 0");
+    tt_assert(sg_ssm_k_head(3, 0, 0, true) == 0, "n_k_heads == 0 should return 0 (tiled)");
+}
+
 static void ref_conv1d_causal_matches_mlx(void) {
     uint32_t ch = fx_dim(&g_hyb, "conv1d.channels");
     uint32_t ks = fx_dim(&g_hyb, "conv1d.ksize");
@@ -1010,6 +1089,8 @@ int main(void) {
     tt_run("ref_rope_real_dims_vs_mlx_and_exact", ref_rope_real_dims_vs_mlx_and_exact);
     tt_run("ref_activations_match_mlx", ref_activations_match_mlx);
     tt_run("ref_delta_decay_matches_mlx", ref_delta_decay_matches_mlx);
+    tt_run("ref_delta_decay_neg_a_matches_mlx", ref_delta_decay_neg_a_matches_mlx);
+    tt_run("ssm_head_map_conventions", ssm_head_map_conventions);
     tt_run("ref_conv1d_causal_matches_mlx", ref_conv1d_causal_matches_mlx);
     tt_run("ref_delta_step_matches_mlx", ref_delta_step_matches_mlx);
 

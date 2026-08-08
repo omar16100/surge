@@ -259,6 +259,166 @@ def write_mini_safetensors(out_dir: str) -> None:
           f"and {out_dir}/config.json")
 
 
+def _lcg_floats(n, seed):
+    """Deterministic small floats, stdlib only (keeps --st numpy-free)."""
+    out = []
+    x = seed & 0xFFFFFFFF
+    for _ in range(n):
+        x = (1103515245 * x + 12345) & 0x7FFFFFFF
+        out.append((x / 0x7FFFFFFF) * 2.0 - 1.0)
+    return out
+
+
+def _st_pack(tensors):
+    """tensors: list of (name, dtype, shape, [float values]) -> (header, data).
+
+    Emits F32 and BF16 only, in the given order, each at a 4-byte-aligned
+    offset so both dtypes are naturally aligned (st.c skips a misaligned F32
+    rather than indexing it, which would look like a missing tensor).
+    """
+    data = bytearray()
+    header = {}
+    for name, dtype, shape, values in tensors:
+        pad = (-len(data)) % 4
+        data += b"\x00" * pad
+        begin = len(data)
+        if dtype == "F32":
+            data += struct.pack("<%df" % len(values), *values)
+        elif dtype == "BF16":
+            data += b"".join(_f32_to_bf16_bytes(v) for v in values)
+        else:
+            raise ValueError(dtype)
+        header[name] = {"dtype": dtype, "shape": list(shape),
+                        "data_offsets": [begin, len(data)]}
+    return header, bytes(data)
+
+
+# Tiny hybrid model dims for the mini_model_st fixture. Chosen so the two
+# DeltaNet head counts differ (2 key heads feeding 4 value heads) and so
+# nothing is square.
+MINI_MODEL = dict(hidden=8, n_heads=2, n_kv_heads=1, head_dim=4, ffn=16, vocab=10,
+                  nk=2, nv=4, dk=4, dv=4, conv_k=4)
+
+
+def _mini_model_tensors(drop=None):
+    """Tensor list for a 2-layer hybrid model: layer 0 linear-attn, layer 1
+    full-attention. `drop` names a tensor suffix to omit (for the negative
+    test that a partial group is rejected)."""
+    m = MINI_MODEL
+    key_dim = m["nk"] * m["dk"]
+    value_dim = m["nv"] * m["dv"]
+    conv_dim = 2 * key_dim + value_dim
+    P = "model.language_model."
+    t = []
+    seed = [1]
+
+    def add(name, dtype, shape):
+        n = 1
+        for d in shape:
+            n *= d
+        seed[0] += 1
+        t.append((name, dtype, shape, _lcg_floats(n, seed[0] * 7919)))
+
+    add(P + "embed_tokens.weight", "BF16", [m["vocab"], m["hidden"]])
+    add(P + "norm.weight", "BF16", [m["hidden"]])
+
+    for layer in (0, 1):
+        L = P + "layers.%d." % layer
+        add(L + "input_layernorm.weight", "BF16", [m["hidden"]])
+        add(L + "post_attention_layernorm.weight", "BF16", [m["hidden"]])
+        add(L + "mlp.gate_proj.weight", "BF16", [m["ffn"], m["hidden"]])
+        add(L + "mlp.up_proj.weight", "BF16", [m["ffn"], m["hidden"]])
+        add(L + "mlp.down_proj.weight", "BF16", [m["hidden"], m["ffn"]])
+        if layer == 0:
+            # A_log is BF16 and norm.weight is F32 here ON PURPOSE: the real
+            # checkpoints disagree about these two (F32 in the Qwen3.5-2B,
+            # BF16 in the mlx 8-bit repack of the 27B), so making one of each
+            # exercises both branches of model_qwen.c's st_dense_tensor_any
+            # probe in a plain `make check`.
+            add(L + "linear_attn.in_proj_qkv.weight", "BF16", [conv_dim, m["hidden"]])
+            add(L + "linear_attn.in_proj_z.weight", "BF16", [value_dim, m["hidden"]])
+            add(L + "linear_attn.in_proj_b.weight", "BF16", [m["nv"], m["hidden"]])
+            add(L + "linear_attn.in_proj_a.weight", "BF16", [m["nv"], m["hidden"]])
+            add(L + "linear_attn.A_log", "BF16", [m["nv"]])
+            add(L + "linear_attn.dt_bias", "BF16", [m["nv"]])
+            add(L + "linear_attn.conv1d.weight", "BF16", [conv_dim, 1, m["conv_k"]])
+            add(L + "linear_attn.norm.weight", "F32", [m["dv"]])
+            add(L + "linear_attn.out_proj.weight", "BF16", [m["hidden"], value_dim])
+        else:
+            add(L + "self_attn.q_proj.weight", "BF16",
+                [2 * m["n_heads"] * m["head_dim"], m["hidden"]])
+            add(L + "self_attn.k_proj.weight", "BF16",
+                [m["n_kv_heads"] * m["head_dim"], m["hidden"]])
+            add(L + "self_attn.v_proj.weight", "BF16",
+                [m["n_kv_heads"] * m["head_dim"], m["hidden"]])
+            add(L + "self_attn.o_proj.weight", "BF16",
+                [m["hidden"], m["n_heads"] * m["head_dim"]])
+            add(L + "self_attn.q_norm.weight", "BF16", [m["head_dim"]])
+            add(L + "self_attn.k_norm.weight", "BF16", [m["head_dim"]])
+
+    if drop is not None:
+        before = len(t)
+        t = [x for x in t if not x[0].endswith(drop)]
+        assert len(t) == before - 1, f"drop target {drop!r} matched {before - len(t)} tensors"
+    return t
+
+
+def write_mini_model_st(out_dir: str, drop=None) -> None:
+    """Write a tiny but STRUCTURALLY REAL hybrid qwen3_5 safetensors model.
+
+    tests/fixtures/mini_model_st/ exists so that sg_model_from_st's
+    DeltaNet mapping runs in a plain `make check`. Before it, the entire
+    linear-attention path in model_qwen.c was only reachable under the
+    SURGE_ST-gated real-model test, i.e. it was dead code for anyone without
+    a multi-GB checkpoint on disk.
+
+    Two layers: layer 0 linear-attention (all nine ssm tensors), layer 1
+    full-attention (all six attention tensors). Both carry the shared MLP and
+    norms. Names use the multimodal "model.language_model." nesting the real
+    checkpoint uses, so the loader's nested-name fallback is exercised too.
+
+    tests/fixtures/mini_model_st_partial/ is the same model with
+    linear_attn.dt_bias removed, so the all-nine-or-none group invariant that
+    both loaders now enforce has a negative test.
+    """
+    m = MINI_MODEL
+    header, data = _st_pack(_mini_model_tensors(drop))
+    header_json = json.dumps(header).encode("utf-8")
+    header_json += b" " * ((-(8 + len(header_json))) % 8)
+
+    out = pathlib.Path(out_dir)
+    out.mkdir(parents=True, exist_ok=True)
+    with (out / "model.safetensors").open("wb") as f:
+        f.write(struct.pack("<Q", len(header_json)))
+        f.write(header_json)
+        f.write(data)
+
+    cfg = {
+        "model_type": "qwen3_5",
+        "tie_word_embeddings": True,
+        "text_config": {
+            "num_hidden_layers": 2,
+            "num_attention_heads": m["n_heads"],
+            "num_key_value_heads": m["n_kv_heads"],
+            "head_dim": m["head_dim"],
+            "hidden_size": m["hidden"],
+            "intermediate_size": m["ffn"],
+            "vocab_size": m["vocab"],
+            "rms_norm_eps": 1e-06,
+            "full_attention_interval": 2,
+            "linear_num_key_heads": m["nk"],
+            "linear_num_value_heads": m["nv"],
+            "linear_key_head_dim": m["dk"],
+            "linear_value_head_dim": m["dv"],
+            "linear_conv_kernel_dim": m["conv_k"],
+            "rope_parameters": {"rope_type": "default", "rope_theta": 10000000,
+                                "partial_rotary_factor": 0.25},
+        },
+    }
+    (out / "config.json").write_text(json.dumps(cfg, indent=1), encoding="utf-8")
+    print(f"wrote {out_dir} ({len(header)} tensors, drop={drop})")
+
+
 # ======================================================================
 # Op fixture container ("SURGEOPS") -- shared by tests/fixtures/ops.bin
 # (numpy-generated, base scalar ops) and tests/fixtures/hybrid_ops.bin
@@ -885,6 +1045,8 @@ if __name__ == "__main__":
                           "tests/fixtures/tok_cases.jsonl")
     elif "--st" in sys.argv:
         write_mini_safetensors("tests/fixtures/mini_st")
+        write_mini_model_st("tests/fixtures/mini_model_st")
+        write_mini_model_st("tests/fixtures/mini_model_st_partial", drop="linear_attn.dt_bias")
     elif "--ops" in sys.argv:
         write_op_fixtures("tests/fixtures/ops.bin")
     elif "--hybrid" in sys.argv:

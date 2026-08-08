@@ -1,11 +1,19 @@
 /* test_model.c - tests for model_qwen.c's config extraction + weight-name
  * mapping (sg_model_from_gguf, sg_model_from_st).
  *
- * Fully env-gated on SURGE_GGUF and SURGE_ST (auto-skip with a notice when
- * unset, matching test_tok.c's precedent for tests that need a real,
- * multi-GB model on disk rather than a small synthetic fixture -- there is
- * no fixture-based test here because Task 6 is a pure name-mapping layer
- * over gguf.c/st.c, which already have their own fixture coverage).
+ * Coverage comes in two tiers. The mini-model fixture tests
+ * (model_from_st_mini_fixture, model_from_st_rejects_partial_group) run
+ * UNCONDITIONALLY against tests/fixtures/mini_model_st{,_partial}/ and cover
+ * the whole safetensors mapping including the linear-attention path; Task 6
+ * originally had no fixture tier at all, which meant a plain `make check`
+ * ran two null-argument assertions and nothing else.
+ *
+ * The real-model tests stay env-gated on SURGE_GGUF and SURGE_ST (there is
+ * no synthetic substitute for a multi-GB checkpoint), and SURGE_GGUF_TWIN
+ * gates the GGUF-vs-HF cross-check. Skipped gates are recorded and reported
+ * as a loud banner at the end of the run rather than a line scrolling past,
+ * because "0 failures" from a run where the gates never executed is exactly
+ * the kind of green that hides a problem.
  *
  * Real-file correction pinned by these tests, discovered during
  * reconnaissance and NOT anticipated by the original task brief: both real
@@ -63,7 +71,7 @@ static void assert_cfg_sane(const sg_cfg *c, const char *label) {
  * "layer kind == which tensors are present" a safe rule for the forward
  * pass to dispatch on. */
 #define SSM_FIELDS(X) \
-    X(ssm_in_qkv) X(ssm_in_z) X(ssm_in_b) X(ssm_in_a) X(ssm_a_log) \
+    X(ssm_in_qkv) X(ssm_in_z) X(ssm_in_b) X(ssm_in_a) X(ssm_a) \
     X(ssm_dt_bias) X(ssm_conv1d) X(ssm_norm) X(ssm_out)
 
 static void assert_layer_full_attn(const sg_layer_w *lw, uint32_t idx, const char *label) {
@@ -131,6 +139,37 @@ static double bf16_mean(const void *p, uint64_t n) {
     return n ? s / (double)n : 0.0;
 }
 
+/* Skipped-gate registry, reported as a banner by main(). */
+#define MAX_SKIPS 8
+static struct { const char *env; const char *covers; const char *hint; } g_skips[MAX_SKIPS];
+static int g_n_skips = 0;
+
+static void note_skip(const char *env, const char *covers, const char *hint) {
+    if (g_n_skips < MAX_SKIPS) {
+        g_skips[g_n_skips].env = env;
+        g_skips[g_n_skips].covers = covers;
+        g_skips[g_n_skips].hint = hint;
+        g_n_skips++;
+    }
+    fprintf(stderr, "SKIP (%s unset): %s\n", env, covers);
+}
+
+static void report_skips(void) {
+    if (g_n_skips == 0) {
+        fprintf(stderr, "all real-model gates RAN (no env vars unset)\n");
+        return;
+    }
+    fprintf(stderr,
+            "\n!! %d real-model gate(s) DID NOT RUN. The check count above excludes\n"
+            "!! them, so a clean result here is NOT evidence about the real files.\n",
+            g_n_skips);
+    for (int i = 0; i < g_n_skips; i++) {
+        fprintf(stderr, "!!   %-16s %s\n", g_skips[i].env, g_skips[i].covers);
+        fprintf(stderr, "!!   %-16s   set e.g. %s\n", "", g_skips[i].hint);
+    }
+    fputc('\n', stderr);
+}
+
 static float g_gguf_rope_theta = 0.0f, g_gguf_rms_eps = 0.0f;
 static uint32_t g_gguf_vocab = 0;
 static bool g_gguf_ran = false;
@@ -142,9 +181,10 @@ static bool g_st_ran = false;
 static void model_from_gguf_real(void) {
     const char *path = getenv("SURGE_GGUF");
     if (!path || !*path) {
-        fprintf(stderr, "SKIP: SURGE_GGUF not set; skipping real-model gguf model test "
-                        "(set it to a qwen35 gguf, e.g. "
-                        "/Users/macmini/models/gguf/Qwen3.6-27B-Q8_0.gguf)\n");
+        note_skip("SURGE_GGUF",
+                  "real-GGUF config, hybrid layer mapping, DeltaNet tensor shapes, "
+                  "norm-weight scale (~110 checks)",
+                  "SURGE_GGUF=/Users/macmini/models/gguf/Qwen3.6-27B-Q8_0.gguf");
         return;
     }
 
@@ -247,8 +287,8 @@ static void model_from_gguf_real(void) {
                       "gguf layer 0 ssm_in_b should point at blk.0.ssm_beta.weight");
             tt_assert(m.layers[0].ssm_in_a == aa->data,
                       "gguf layer 0 ssm_in_a should point at blk.0.ssm_alpha.weight");
-            tt_assert(m.layers[0].ssm_a_log == al->data,
-                      "gguf layer 0 ssm_a_log should point at blk.0.ssm_a");
+            tt_assert(m.layers[0].ssm_a == al->data,
+                      "gguf layer 0 ssm_a should point at blk.0.ssm_a");
             tt_assert(m.layers[0].ssm_conv1d == cv->data,
                       "gguf layer 0 ssm_conv1d should point at blk.0.ssm_conv1d.weight");
 
@@ -322,9 +362,10 @@ static void model_from_gguf_real(void) {
 static void model_from_st_real(void) {
     const char *dir = getenv("SURGE_ST");
     if (!dir || !*dir) {
-        fprintf(stderr, "SKIP: SURGE_ST not set; skipping real-model st model test "
-                        "(set it to a safetensors model dir, e.g. "
-                        "/Users/macmini/models/qwen35-2b)\n");
+        note_skip("SURGE_ST",
+                  "real-safetensors config, hybrid layer mapping, F32/BF16 DeltaNet "
+                  "dtypes, norm-weight residual scale (~55 checks)",
+                  "SURGE_ST=/Users/macmini/models/qwen35-2b");
         return;
     }
 
@@ -434,7 +475,7 @@ static void model_from_st_real(void) {
             tt_assert(m.layers[0].ssm_in_z == z, "st layer 0 ssm_in_z wiring");
             tt_assert(m.layers[0].ssm_in_b == bw, "st layer 0 ssm_in_b wiring");
             tt_assert(m.layers[0].ssm_in_a == aw, "st layer 0 ssm_in_a wiring");
-            tt_assert(m.layers[0].ssm_a_log == al, "st layer 0 ssm_a_log wiring");
+            tt_assert(m.layers[0].ssm_a == al, "st layer 0 ssm_a wiring");
             tt_assert(m.layers[0].ssm_dt_bias == dt, "st layer 0 ssm_dt_bias wiring");
             tt_assert(m.layers[0].ssm_conv1d == cv, "st layer 0 ssm_conv1d wiring");
             tt_assert(m.layers[0].ssm_norm == nw, "st layer 0 ssm_norm wiring");
@@ -525,7 +566,7 @@ static void model_from_st_real(void) {
 static void model_loaders_agree_where_comparable(void) {
     if (!g_gguf_ran || !g_st_ran) {
         fprintf(stderr, "SKIP: cross-loader agreement check needs both "
-                        "SURGE_GGUF and SURGE_ST\n");
+                        "SURGE_GGUF and SURGE_ST (already reported above)\n");
         return;
     }
     tt_assert(g_gguf_vocab == g_st_vocab,
@@ -537,6 +578,246 @@ static void model_loaders_agree_where_comparable(void) {
     tt_assert(nearly_eq(g_gguf_rms_eps, g_st_rms_eps, 1e-9f),
               "gguf rms_eps (%f) and st rms_eps (%f) should agree",
               (double)g_gguf_rms_eps, (double)g_st_rms_eps);
+}
+
+/* ---------------------------------------------------------------------
+ * Ungated coverage of the safetensors DeltaNet mapping.
+ *
+ * tests/fixtures/mini_model_st/ is a 2-layer hybrid model (layer 0
+ * linear-attention, layer 1 full-attention) small enough to commit. Before
+ * it existed, every line of model_qwen.c's linear-attention mapping was
+ * reachable only under the SURGE_ST-gated real-model test, so a plain
+ * `make check` ran exactly two assertions in this file and none of the
+ * mapping. The fixture also deliberately stores linear_attn.A_log as BF16
+ * and linear_attn.norm.weight as F32, because the two real checkpoints
+ * disagree about those dtypes and both probe branches need exercising.
+ * --------------------------------------------------------------------- */
+
+static void model_from_st_mini_fixture(void) {
+    sg_st *s = NULL;
+    sg_err e = sg_st_open("tests/fixtures/mini_model_st", &s);
+    tt_assert(!sg_failed(e), "open mini_model_st should succeed: %s", e.msg ? e.msg : "");
+    if (!s) return;
+
+    sg_model m;
+    e = sg_model_from_st(s, &m);
+    tt_assert(!sg_failed(e), "sg_model_from_st on the mini model should succeed: %s",
+              e.msg ? e.msg : "");
+    if (sg_failed(e)) { sg_st_close(s); return; }
+
+    tt_assert(m.cfg.n_layers == 2, "mini n_layers should be 2, got %u", m.cfg.n_layers);
+    tt_assert(m.cfg.hidden == 8, "mini hidden should be 8, got %u", m.cfg.hidden);
+    tt_assert(m.cfg.head_dim == 4, "mini head_dim should be 4, got %u", m.cfg.head_dim);
+    tt_assert(m.cfg.tied_embeddings, "mini model has no lm_head.weight, should be tied");
+
+    /* The whole point: both layer kinds map correctly with no real model. */
+    assert_layer_linear_attn(&m.layers[0], 0, "mini_st");
+    assert_layer_full_attn(&m.layers[1], 1, "mini_st");
+
+    /* Per-source DeltaNet semantics for a safetensors model. */
+    tt_assert(m.ssm_a_form == SG_SSM_A_LOG,
+              "safetensors ssm_a is mlx's A_log verbatim, form should be SG_SSM_A_LOG");
+    tt_assert(!m.v_heads_tiled,
+              "safetensors uses mlx's grouped value-head order, v_heads_tiled should be false");
+    /* Both dtype-probe branches: BF16 A_log, F32 norm weight. */
+    tt_assert(m.ssm_a_type == SG_T_BF16,
+              "mini A_log is BF16, ssm_a_type should be SG_T_BF16, got %d", (int)m.ssm_a_type);
+    tt_assert(m.ssm_norm_type == SG_T_F32,
+              "mini linear_attn.norm.weight is F32, ssm_norm_type should be SG_T_F32, got %d",
+              (int)m.ssm_norm_type);
+
+    /* And that the pointers really are the tensors they claim to be. */
+    const uint16_t *qkv = NULL;
+    const float *nw = NULL;
+    uint64_t d[4] = {0};
+    bool ok = sg_st_tensor(s, "model.language_model.layers.0.linear_attn.in_proj_qkv.weight",
+                           &qkv, d, NULL);
+    tt_assert(ok, "mini layer 0 in_proj_qkv should be directly findable");
+    if (ok) {
+        tt_assert(m.layers[0].ssm_in_qkv == qkv, "mini ssm_in_qkv wiring");
+        /* conv_dim = 2*key_dim + value_dim = 2*(2*4) + (4*4) = 32. */
+        tt_assert(d[0] == 32 && d[1] == 8,
+                  "mini in_proj_qkv should be [32, 8], got [%llu, %llu]",
+                  (unsigned long long)d[0], (unsigned long long)d[1]);
+    }
+    ok = sg_st_tensor_f32(s, "model.language_model.layers.0.linear_attn.norm.weight",
+                          &nw, NULL, NULL);
+    tt_assert(ok, "mini layer 0 linear_attn.norm.weight should be findable as F32");
+    if (ok) tt_assert(m.layers[0].ssm_norm == nw, "mini ssm_norm wiring");
+
+    sg_model_free(&m);
+    sg_st_close(s);
+}
+
+/* The group invariant has to reject a partial group, not just accept
+ * complete ones: the partial fixture is the same model with
+ * linear_attn.dt_bias removed, which before this check loaded "fine" with a
+ * NULL sitting in the middle of an otherwise-populated DeltaNet layer. */
+static void model_from_st_rejects_partial_group(void) {
+    sg_st *s = NULL;
+    sg_err e = sg_st_open("tests/fixtures/mini_model_st_partial", &s);
+    tt_assert(!sg_failed(e), "open mini_model_st_partial should succeed: %s",
+              e.msg ? e.msg : "");
+    if (!s) return;
+
+    sg_model m;
+    e = sg_model_from_st(s, &m);
+    tt_assert(sg_failed(e),
+              "a layer with 8 of 9 DeltaNet tensors should be rejected, not loaded");
+    if (!sg_failed(e)) sg_model_free(&m);
+    else fprintf(stderr, "   (rejected as expected: %s)\n", e.msg);
+    sg_st_close(s);
+}
+
+/* ---------------------------------------------------------------------
+ * The GGUF verification that Task 7's first report wrongly deferred to the
+ * M1 gate.
+ *
+ * That deferral was structurally impossible: M1 runs the ref forward against
+ * mlx-lm on the 2B SAFETENSORS checkpoint, so it never touches a GGUF at
+ * all; there is no mlx oracle for a GGUF; and the 2B has n_v_heads ==
+ * n_k_heads (16 and 16), so the value-head ordering question cannot even
+ * manifest there. Nothing about the GGUF's DeltaNet contract would have been
+ * tested by it.
+ *
+ * What actually settles it is a checkpoint pair: the GGUF and an HF
+ * safetensors copy of THE SAME MODEL. Then ssm_a can be compared elementwise
+ * against A_log, which pins two things at once:
+ *
+ *   1. WHAT ssm_a HOLDS. If the GGUF stored A_log verbatim, ssm_a would
+ *      equal A_log. It does not; it equals -exp(A_log). The decay gate must
+ *      therefore skip the exp() and the negation on this path
+ *      (sg_ref_delta_decay_neg_a, selected by sg_model.ssm_a_form).
+ *   2. THE VALUE-HEAD ORDER. The equality only holds after un-tiling: GGUF
+ *      value head p carries HF value head g where p = (g % repeat) * n_k +
+ *      (g / repeat), which is exactly the statement that the GGUF's key-head
+ *      map is p %% n_k_heads while HF's is g / repeat. Under the identity
+ *      ordering the two disagree by ~50, so this is not a near-miss.
+ *
+ * Gated on SURGE_GGUF_TWIN, an HF safetensors dir of the same model as
+ * SURGE_GGUF (e.g. /Users/macmini/models/qwen36-27b-8bit, an mlx 8-bit
+ * repack of Qwen3.6-27B; its A_log and dt_bias stay unquantized, which is
+ * all this needs). The quantized in_proj_* tensors are not compared: the
+ * reorder permutation is shared across every reordered tensor, so pinning it
+ * on A_log pins it everywhere, and dequantizing mlx's affine format here
+ * would add a second thing that could be wrong.
+ * --------------------------------------------------------------------- */
+
+/* Reads through sg_st_read_f32, not a pointer accessor: the twin checkpoint
+ * is written by mlx, which does not align its data sections, so most of its
+ * tensors (A_log included) sit at odd byte offsets and the pointer
+ * accessors correctly refuse them. */
+static float twin_read1(const sg_st *s, const char *name, uint32_t i, bool *ok) {
+    float v = 0.0f;
+    *ok = sg_st_read_f32(s, name, i, 1, &v);
+    return v;
+}
+
+static void gguf_ssm_a_and_head_order_vs_hf_twin(void) {
+    const char *gpath = getenv("SURGE_GGUF");
+    const char *tdir = getenv("SURGE_GGUF_TWIN");
+    if (!gpath || !*gpath || !tdir || !*tdir) {
+        note_skip("SURGE_GGUF_TWIN",
+                  "GGUF ssm_a semantics (-exp(A_log)) and tiled value-head order, "
+                  "cross-checked against an HF copy of the same model",
+                  "SURGE_GGUF_TWIN=/Users/macmini/models/qwen36-27b-8bit "
+                  "(needs SURGE_GGUF too)");
+        return;
+    }
+
+    sg_gguf *g = NULL;
+    sg_err e = sg_gguf_open(gpath, &g);
+    tt_assert(!sg_failed(e), "open %s should succeed: %s", gpath, e.msg ? e.msg : "");
+    if (!g) return;
+    sg_st *s = NULL;
+    e = sg_st_open(tdir, &s);
+    tt_assert(!sg_failed(e), "open twin %s should succeed: %s", tdir, e.msg ? e.msg : "");
+    if (!s) { sg_gguf_close(g); return; }
+
+    uint32_t n_k = 0, n_v = 0;
+    bool have = sg_gguf_get_u32(g, "qwen35.ssm.group_count", &n_k)
+             && sg_gguf_get_u32(g, "qwen35.ssm.time_step_rank", &n_v);
+    tt_assert(have, "gguf should carry ssm.group_count and ssm.time_step_rank");
+    if (!have || n_k == 0 || n_v % n_k != 0) { sg_st_close(s); sg_gguf_close(g); return; }
+    tt_assert(n_v > n_k,
+              "the twin cross-check is only meaningful when n_v_heads (%u) > n_k_heads "
+              "(%u); with them equal the two head orders coincide", n_v, n_k);
+    uint32_t repeat = n_v / n_k;
+
+    /* Layers 0, 1, 2 are linear-attention (full_attention_interval 4). */
+    static const uint32_t layers[] = {0, 1, 2};
+    uint32_t checked = 0;
+    double worst_tiled = 0.0, worst_identity = 0.0;
+    int neg_total = 0, neg_count = 0;
+
+    for (size_t li = 0; li < sizeof layers / sizeof layers[0]; li++) {
+        uint32_t L = layers[li];
+        char gname[96], tname[192];
+        snprintf(gname, sizeof gname, "blk.%u.ssm_a", L);
+        snprintf(tname, sizeof tname,
+                 "language_model.model.layers.%u.linear_attn.A_log", L);
+
+        const sg_tensor *ga = sg_gguf_tensor(g, gname);
+        if (!ga) continue;
+        tt_assert(ga->type == SG_T_F32, "%s should be F32, got %d", gname, (int)ga->type);
+        tt_assert(ga->dims[0] == n_v, "%s should be [n_v_heads %u], got [%llu]",
+                  gname, n_v, (unsigned long long)ga->dims[0]);
+        if (ga->type != SG_T_F32 || ga->dims[0] != n_v) continue;
+        const float *gv = (const float *)ga->data;
+
+        bool ok = false;
+        (void)twin_read1(s, tname, 0, &ok);
+        if (!ok) continue;
+
+        for (uint32_t gi = 0; gi < n_v; gi++) {
+            float a_log = twin_read1(s, tname, gi, &ok);
+            if (!ok) break;
+            double want = -exp((double)a_log);
+            /* HF head gi sits at GGUF slot p under the converter's reorder. */
+            uint32_t p = (gi % repeat) * n_k + (gi / repeat);
+            double d_tiled = fabs((double)gv[p] - want);
+            double d_ident = fabs((double)gv[gi] - want);
+            if (d_tiled > worst_tiled) worst_tiled = d_tiled;
+            if (d_ident > worst_identity) worst_identity = d_ident;
+            /* And the key-head map that reorder implies. */
+            tt_assert(sg_ssm_k_head(p, n_k, n_v, true) == gi / repeat,
+                      "layer %u: GGUF slot %u should tile to the same key head (%u) that "
+                      "HF head %u groups to (%u)", L, p,
+                      sg_ssm_k_head(p, n_k, n_v, true), gi, gi / repeat);
+            neg_total++;
+            if (gv[gi] < 0.0f) neg_count++;
+        }
+        checked++;
+    }
+
+    tt_assert(checked > 0, "no linear-attention layer could be cross-checked; is "
+                           "SURGE_GGUF_TWIN really a copy of the same model?");
+    if (checked == 0) { sg_st_close(s); sg_gguf_close(g); return; }
+
+    /* bf16 A_log round-tripped through exp() lands around 1e-6 relative;
+     * the values reach ~140 in magnitude, so allow a little absolute room. */
+    tt_assert(worst_tiled < 1e-3,
+              "GGUF ssm_a should equal -exp(HF A_log) under the TILED value-head "
+              "reindex, but the worst mismatch is %.3e", worst_tiled);
+    /* And the wrong reading must be unmistakably wrong, not marginally so:
+     * if this ever got small, the test would have stopped proving anything. */
+    tt_assert(worst_identity > 1.0,
+              "the identity (non-reordered) value-head reading should be grossly "
+              "wrong, but its worst mismatch is only %.3e -- the tiled-vs-grouped "
+              "distinction is no longer being tested", worst_identity);
+    tt_assert(neg_count == neg_total,
+              "all GGUF ssm_a values should be strictly negative (they are "
+              "-exp(A_log)), got %d of %d", neg_count, neg_total);
+
+    fprintf(stderr,
+            "   twin cross-check over %u linear-attn layers, %u v-heads each:\n"
+            "     ssm_a vs -exp(A_log), tiled reindex   max |err| %.3e  (PASS)\n"
+            "     ssm_a vs -exp(A_log), identity order  max |err| %.3e  (must be large)\n"
+            "     ssm_a strictly negative               %d/%d\n",
+            checked, n_v, worst_tiled, worst_identity, neg_count, neg_total);
+
+    sg_st_close(s);
+    sg_gguf_close(g);
 }
 
 static void model_from_gguf_null_args(void) {
@@ -554,8 +835,12 @@ static void model_from_st_null_args(void) {
 int main(void) {
     tt_run("model_from_gguf_null_args", model_from_gguf_null_args);
     tt_run("model_from_st_null_args", model_from_st_null_args);
+    tt_run("model_from_st_mini_fixture", model_from_st_mini_fixture);
+    tt_run("model_from_st_rejects_partial_group", model_from_st_rejects_partial_group);
     tt_run("model_from_gguf_real", model_from_gguf_real);
     tt_run("model_from_st_real", model_from_st_real);
     tt_run("model_loaders_agree_where_comparable", model_loaders_agree_where_comparable);
+    tt_run("gguf_ssm_a_and_head_order_vs_hf_twin", gguf_ssm_a_and_head_order_vs_hf_twin);
+    report_skips();
     return tt_report();
 }

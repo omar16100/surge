@@ -508,6 +508,7 @@ typedef struct {
     const void *data;    /* pointer into the owning shard's mmap */
     uint64_t nbytes;
     bool is_f32;         /* false => BF16 (sg_st_tensor), true => F32 */
+    bool aligned;        /* false => raw-pointer accessors refuse it */
 } st_tensor;
 
 struct sg_st {
@@ -690,39 +691,29 @@ static sg_err st_add_tensor(sg_st *s, const char *name, uint32_t name_len, const
     uint64_t nbytes = end - begin;
     uint64_t abs_off = data_start + begin; /* begin <= map_size - data_start, so no overflow */
 
-    /* Natural alignment is required so the mmap pointer can be handed out as
-     * a uint16_t or float pointer directly.
-     *
-     * The two failure modes are treated differently by dtype, on purpose:
-     *
-     *  - BF16 keeps its original hard-error behaviour. This loader has always
-     *    been "the bf16 loader", so a bf16 tensor it cannot represent is a
-     *    file it cannot honestly load.
-     *  - F32 only started being indexed in Task 7, and before that ANY
-     *    non-BF16 tensor was validated-but-not-indexed and could never fail
-     *    an open. Hard-erroring on it now would newly reject checkpoints that
-     *    loaded fine before, including for a caller that only ever wanted the
-     *    bf16 tensors: the safetensors spec does not require 8 + header_len
-     *    to be a multiple of 4, so a legal shard can put every F32 tensor at
-     *    a 2-aligned offset. So an F32 tensor that is misaligned or whose
-     *    byte length disagrees with its shape is skipped, not fatal --
-     *    exactly the pre-Task-7 contract for a dtype this loader cannot
-     *    represent. It then reads as absent through sg_st_tensor_f32.
-     *
-     * Both real checkpoints are clean on both counts (the 2B's data section
-     * starts at 76656, and all 36 of its F32 tensors are 4-aligned). */
-    if (is_f32) {
-        if (nbytes != expected_bytes || abs_off % elem_size != 0) {
-            return SG_OK; /* validated, not indexed */
-        }
-    } else {
-        if (nbytes != expected_bytes) {
-            return (sg_err){"st: bf16 tensor byte length does not match its shape"};
-        }
-        if (abs_off % elem_size != 0) {
-            return (sg_err){"st: bf16 tensor offset is not 2-byte aligned"};
-        }
+    /* A byte length that disagrees with the declared shape is a corrupt
+     * header for either dtype: the file is lying about itself, and no
+     * accessor could serve it correctly. */
+    if (nbytes != expected_bytes) {
+        return (sg_err){"st: tensor byte length does not match its shape"};
     }
+
+    /* ALIGNMENT IS NOT GUARANTEED BY THE FORMAT, and real writers do not
+     * provide it. The safetensors spec fixes only the 8-byte header length
+     * prefix; nothing requires 8 + header_len (where the data section starts)
+     * to be even, let alone a multiple of 4. Measured on the mlx 8-bit repack
+     * of Qwen3.6-27B: its six shards start their data sections at 67061,
+     * 49536, 49742, 50283, 50184 and 12735, so 1143 of its 2180 tensors --
+     * including plain BF16 layer weights -- sit at odd byte offsets.
+     *
+     * Dereferencing a misaligned uint16_t or float pointer is undefined even
+     * though arm64 tolerates it, so such a tensor is INDEXED but flagged, and
+     * the raw-pointer accessors refuse it while sg_st_read_f32 (which
+     * memcpy's) serves it. Rejecting the file instead, which is what this did
+     * before, made an entire legitimate checkpoint family unloadable; handing
+     * out the pointer anyway would have been UB that UBSan flags and that a
+     * stricter target could fault on. */
+    bool aligned = (abs_off % elem_size == 0);
 
     if (s->n_tensors == s->tensors_cap) {
         uint64_t ncap = s->tensors_cap ? s->tensors_cap * 2 : 16;
@@ -741,6 +732,7 @@ static sg_err st_add_tensor(sg_st *s, const char *name, uint32_t name_len, const
     t->data = (const void *)((const uint8_t *)map + abs_off);
     t->nbytes = nbytes;
     t->is_f32 = is_f32;
+    t->aligned = aligned;
     return SG_OK;
 }
 
@@ -880,7 +872,7 @@ static const st_tensor *st_find(const sg_st *s, const char *name, bool want_f32)
 bool sg_st_tensor(const sg_st *s, const char *name, const uint16_t **data,
                   uint64_t dims[4], uint32_t *n_dims) {
     const st_tensor *t = st_find(s, name, false);
-    if (!t) return false;
+    if (!t || !t->aligned) return false;
     if (data) *data = (const uint16_t *)t->data;
     if (dims) memcpy(dims, t->dims, sizeof(t->dims));
     if (n_dims) *n_dims = t->n_dims;
@@ -890,10 +882,38 @@ bool sg_st_tensor(const sg_st *s, const char *name, const uint16_t **data,
 bool sg_st_tensor_f32(const sg_st *s, const char *name, const float **data,
                       uint64_t dims[4], uint32_t *n_dims) {
     const st_tensor *t = st_find(s, name, true);
-    if (!t) return false;
+    if (!t || !t->aligned) return false;
     if (data) *data = (const float *)t->data;
     if (dims) memcpy(dims, t->dims, sizeof(t->dims));
     if (n_dims) *n_dims = t->n_dims;
+    return true;
+}
+
+bool sg_st_read_f32(const sg_st *s, const char *name, uint64_t first,
+                    uint64_t count, float *out) {
+    if (!out) return false;
+    const st_tensor *t = st_find(s, name, true);
+    bool is_f32 = (t != NULL);
+    if (!t) t = st_find(s, name, false);
+    if (!t) return false;
+
+    uint64_t esz = is_f32 ? 4u : 2u;
+    uint64_t elems = t->nbytes / esz;
+    if (first > elems || count > elems - first) return false;
+
+    const uint8_t *base = (const uint8_t *)t->data + first * esz;
+    for (uint64_t i = 0; i < count; i++) {
+        /* memcpy, not a cast: this is the accessor that exists precisely
+         * because the source may be misaligned. */
+        if (is_f32) {
+            memcpy(&out[i], base + i * 4, 4);
+        } else {
+            uint16_t h;
+            memcpy(&h, base + i * 2, 2);
+            uint32_t bits = (uint32_t)h << 16;
+            memcpy(&out[i], &bits, 4);
+        }
+    }
     return true;
 }
 

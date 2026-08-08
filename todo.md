@@ -365,3 +365,54 @@
   failures. `make check` and `make debug` (ASan + UBSan) green with 0
   sanitizer reports in all four env-var combinations. All three fixture
   generators regenerate byte-identically.
+
+## Task 7 fix round (coordinator verdict: needs fixes)
+
+- Found that /Users/macmini/models/qwen36-27b-8bit is an HF safetensors copy
+  of the SAME model as the 27B GGUF, which let both Critical items be settled
+  elementwise instead of by reading converter source:
+  GGUF blk.L.ssm_a == -exp(HF A_log) to 1.8e-6 under the tiled value-head
+  reindex, and off by up to 57 under the identity ordering.
+- C1: blk.N.ssm_a holds -exp(A_log), NOT A_log (also: all 2304 values are
+  strictly negative, while A_log is mixed-sign in both HF checkpoints).
+  Field renamed ssm_a_log -> ssm_a; added sg_ssm_a_form enum and
+  sg_model.ssm_a_form; added sg_ref_delta_decay_neg_a (exp(ssm_a*softplus)).
+  Chose an explicit per-source semantic over normalizing at load, because
+  A_log = log(-ssm_a) would force the loader to own tensor memory (the mmap
+  is read-only) for no gain. Test drives the GGUF form with -exp(a_log) from
+  the mlx decay fixture and reproduces mlx to 6e-8, and asserts the WRONG
+  form is off by 0.999 on the same data.
+- C2: the GGUF value-head map is TILED (hk = hv % n_k) while mlx/safetensors
+  is grouped (hk = hv / repeat). Added sg_model.v_heads_tiled and the
+  sg_ssm_k_head() helper; test checks both maps over the real 27B shape,
+  asserts they differ somewhere, and asserts they coincide when n_v == n_k
+  (which is why the 2B cannot expose a wrong choice).
+- H1: retracted the report's "M1 will catch it" claim, which was structurally
+  impossible (M1 runs on the 2B safetensors, there is no mlx oracle for a
+  GGUF, and the 2B has n_v == n_k). Implemented the real check instead:
+  gguf_ssm_a_and_head_order_vs_hf_twin, gated on SURGE_GGUF + the new
+  SURGE_GGUF_TWIN. Still open: the ssm_alpha/beta <-> in_proj_a/b pairing,
+  which needs a dequantizer; concrete plan recorded in the report.
+- M1: check_layer_groups() now rejects a partial DeltaNet/attention group in
+  both loaders (was a silent 8/9 load with a NULL waiting). Negative test is
+  ungated via a new mini_model_st_partial fixture.
+- H2: `make check` with no env vars ran 2 assertions in test_model.c; it now
+  runs 59. New mini_model_st fixture is a structurally real 2-layer hybrid
+  safetensors model (layer 0 linear-attn, layer 1 full-attn). Skipped gates
+  now print what they cover and how many checks are lost, plus a `!!` banner
+  at the end of the run.
+- D1 (found while implementing H1, would have broken Task 8): A_log and
+  norm.weight are F32 in the 2B but BF16 in the 27B twin, so the F32-only
+  lookup returned NULL for every DeltaNet layer of the latter. Loader now
+  probes both and records sg_model.ssm_a_type / ssm_norm_type.
+- D2 (found while implementing H1, blocking): safetensors guarantees NO data
+  alignment and mlx does not provide it -- the twin's shards start at 67061 /
+  49536 / 49742 / 50283 / 50184 / 12735 and 1143 of its 2180 tensors sit at
+  odd offsets. The old hard error rejected the whole file. Misaligned tensors
+  are now indexed but flagged, the pointer accessors refuse them (no UB), and
+  the new sg_st_read_f32 memcpy-copies and widens. Task 8 consequence:
+  sg_model_from_st leaves layer pointers NULL on such a checkpoint and must
+  read through sg_st_read_f32 or normalize into owned buffers.
+- Matrix re-run, 5 env combos x {check, debug}: all rc=0, 0 failing suites,
+  0 sanitizer reports. test_model.c 2 -> 59 checks ungated, 231 -> 446 with
+  everything set. All five fixture artifacts regenerate byte-identically.

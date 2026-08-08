@@ -66,9 +66,25 @@ typedef struct sg_st sg_st;
 sg_err sg_st_open(const char *model_dir, sg_st **out);
 void sg_st_close(sg_st *s);
 /* bf16 tensor view; name uses the checkpoint's own names. Only BF16-dtype
- * tensors are retrievable; returns false if name is absent or not BF16. */
+ * tensors are retrievable; returns false if name is absent, not BF16, or
+ * not 2-byte aligned in the file (see sg_st_read_f32 for that last case). */
 bool sg_st_tensor(const sg_st *s, const char *name, const uint16_t **data,
                   uint64_t dims[4], uint32_t *n_dims);
+/* Copies `count` elements starting at element `first` out of a tensor of
+ * EITHER dtype into `out`, widening bf16 to f32. Unlike the two pointer
+ * accessors this works on a tensor at any byte offset, because it memcpy's
+ * rather than casting.
+ *
+ * That matters more than it sounds: the safetensors format guarantees no
+ * alignment for the data section, and real writers exploit that. The mlx
+ * 8-bit repack of Qwen3.6-27B starts its six shards' data sections at
+ * 67061 / 49536 / 49742 / 50283 / 50184 / 12735, leaving 1143 of its 2180
+ * tensors -- ordinary BF16 layer weights included -- on odd byte offsets.
+ * sg_st_tensor and sg_st_tensor_f32 return false for those (handing out a
+ * misaligned typed pointer would be UB); this is how to read them. Returns
+ * false if the name is absent or the range is out of bounds. */
+bool sg_st_read_f32(const sg_st *s, const char *name, uint64_t first,
+                    uint64_t count, float *out);
 /* f32 tensor view, same contract as sg_st_tensor but for F32-dtype tensors.
  * Real Qwen3.5 checkpoints store two per-linear-attention-layer tensors as
  * F32 while everything around them is BF16 (linear_attn.A_log and
@@ -108,7 +124,7 @@ typedef struct {
  *   ssm_in_z     blk.N.attn_gate.weight     linear_attn.in_proj_z.weight
  *   ssm_in_b     blk.N.ssm_beta.weight      linear_attn.in_proj_b.weight
  *   ssm_in_a     blk.N.ssm_alpha.weight     linear_attn.in_proj_a.weight
- *   ssm_a_log    blk.N.ssm_a                linear_attn.A_log
+ *   ssm_a        blk.N.ssm_a                linear_attn.A_log
  *   ssm_dt_bias  blk.N.ssm_dt.bias          linear_attn.dt_bias
  *   ssm_conv1d   blk.N.ssm_conv1d.weight    linear_attn.conv1d.weight
  *   ssm_norm     blk.N.ssm_norm.weight      linear_attn.norm.weight
@@ -116,8 +132,10 @@ typedef struct {
  * (GGUF names are relative to blk.N; safetensors names to
  * model[.language_model].layers.N.)
  *
- * TWO THINGS A CALLER MUST NOT ASSUME (both verified against the real
- * Qwen3.6-27B-Q8_0.gguf and Qwen3.5-2B safetensors checkpoints):
+ * FOUR THINGS A CALLER MUST NOT ASSUME. Items 1, 2 and 4 were verified by
+ * comparing the GGUF against an HF safetensors copy of THE SAME MODEL
+ * (/Users/macmini/models/qwen36-27b-8bit, an mlx 8-bit repack of
+ * Qwen3.6-27B) tensor by tensor; item 3 against the 2B and the 27B.
  *
  * 1. sg_model.wtype does NOT describe these pointers. It is the embedding
  *    table's type and nothing more. The actual per-field dtypes are:
@@ -128,13 +146,17 @@ typedef struct {
  *      ssm_out                                 Q8_0        BF16
  *      ln1, ln2, q_norm, k_norm                F32         BF16
  *      ssm_conv1d, ssm_dt_bias                 F32         BF16
- *      ssm_a_log, ssm_norm                     F32         F32
+ *      ssm_a, ssm_norm                         F32         F32 or BF16 (!)
  *
  *    Note in particular that ssm_conv1d and ssm_dt_bias differ BY SOURCE,
- *    and that ssm_a_log/ssm_norm are F32 even in the bf16 checkpoint (mlx's
- *    cast_predicate deliberately exempts A_log). Dispatching on wtype for
- *    any of these reads the wrong format. Until the forward pass carries a
- *    per-tensor type (Task 8), the rule is: matmul weights follow wtype,
+ *    and that ssm_a/ssm_norm are NOT reliably F32 on the safetensors side:
+ *    they are F32 in the Qwen3.5-2B bf16 checkpoint (mlx's cast_predicate
+ *    exempts A_log from casting) but BF16 in the mlx 8-bit repack of the
+ *    27B. That is why sg_model carries ssm_a_type / ssm_norm_type: the
+ *    loader probes both dtypes and records which one it found. Dispatching
+ *    on wtype for any of these reads the wrong format. Until the forward
+ *    pass carries a full per-tensor type (Task 8), the rule is: matmul
+ *    weights follow wtype, ssm_a and ssm_norm follow their recorded types,
  *    everything else in the table above is what the table says.
  *
  * 2. The RMSNorm weights are NOT on the same scale across the two sources.
@@ -151,13 +173,56 @@ typedef struct {
  *    sg_model_from_gguf are already absolute. ssm_norm is NOT in mlx's shift
  *    list and needs no adjustment from either source. Task 8 owns applying
  *    this; tests/test_model.c pins the discrepancy so it cannot be
- *    rediscovered the hard way. */
+ *    rediscovered the hard way.
+ *
+ * 3. ssm_a DOES NOT HOLD THE SAME QUANTITY IN BOTH SOURCES. On the
+ *    safetensors side it is mlx's A_log verbatim. On the GGUF side the
+ *    converter has already applied -exp() to it, so blk.N.ssm_a stores
+ *    -exp(A_log) and llama.cpp multiplies it straight into softplus with no
+ *    exp and no negation. Consequences for the decay gate:
+ *
+ *      safetensors:  decay = exp(-exp(ssm_a) * softplus(a + dt_bias))
+ *      GGUF:         decay = exp(     ssm_a  * softplus(a + dt_bias))
+ *
+ *    Reading the GGUF value as A_log would compute exp(-exp(-exp(A_log)*..))
+ *    which is wrong AND silently plausible-looking (still in (0,1)), so this
+ *    is dispatched explicitly on sg_model.ssm_a_form rather than assumed.
+ *    Verified elementwise, not inferred: for every linear-attention layer of
+ *    the 27B, GGUF blk.L.ssm_a equals -exp(HF A_log) under the reindexing in
+ *    item 4, to 1.8e-6 (bf16 round-trip noise). All 2304 GGUF ssm_a values
+ *    are strictly negative, which alone rules out the A_log reading, since
+ *    A_log is genuinely mixed-sign in both HF checkpoints.
+ *
+ * 4. THE VALUE-HEAD TO KEY-HEAD MAP DIFFERS BY SOURCE. The GGUF converter
+ *    reorders the value-head rows of in_proj_qkv / in_proj_z / in_proj_a /
+ *    in_proj_b / A_log / dt_bias, the conv1d channels, and the out_proj
+ *    columns, so that llama.cpp can consume them with a TILED repeat:
+ *
+ *      safetensors (mlx/HF):  k_head = v_head / (n_v_heads / n_k_heads)
+ *      GGUF:                  k_head = v_head % n_k_heads
+ *
+ *    Use sg_ssm_k_head() with sg_model.v_heads_tiled rather than open-coding
+ *    either one. This only bites when n_v_heads != n_k_heads, which is why
+ *    the 2B (16 and 16) cannot expose it and the 27B (16 k, 48 v) hits it on
+ *    every linear-attention layer. Verified by recovering the permutation:
+ *    GGUF ssm_a matches -exp(HF A_log) to 1.8e-6 under the tiled reindex and
+ *    is off by up to 57 under the identity ordering. */
 typedef struct {
     const void *q_proj, *k_proj, *v_proj, *o_proj, *q_norm, *k_norm,
                *gate_proj, *up_proj, *down_proj, *ln1, *ln2;
-    const void *ssm_in_qkv, *ssm_in_z, *ssm_in_b, *ssm_in_a, *ssm_a_log,
+    /* ssm_a is A_log on the safetensors path and -exp(A_log) on the GGUF
+     * path; see note 3 above and sg_model.ssm_a_form. Named ssm_a, not
+     * ssm_a_log, precisely because it is not always a log. */
+    const void *ssm_in_qkv, *ssm_in_z, *ssm_in_b, *ssm_in_a, *ssm_a,
                *ssm_dt_bias, *ssm_conv1d, *ssm_norm, *ssm_out;
 } sg_layer_w; /* per layer; the unused attention group's fields are NULL */
+
+/* What sg_layer_w.ssm_a actually stores, so the decay gate can dispatch
+ * instead of guessing. See note 3 on sg_layer_w. */
+typedef enum {
+    SG_SSM_A_LOG = 0,      /* A_log:      decay = exp(-exp(v) * softplus(..)) */
+    SG_SSM_A_NEG_EXP = 1   /* -exp(A_log): decay = exp(     v  * softplus(..)) */
+} sg_ssm_a_form;
 
 typedef struct {
     sg_cfg cfg;
@@ -167,7 +232,27 @@ typedef struct {
      * It does NOT describe the norm/conv/bias tensors -- see the dtype table
      * in sg_layer_w's comment above before dispatching on this. */
     sg_tensor_type wtype;
+
+    /* Per-source DeltaNet semantics. All three are properties of the file
+     * format, not of the individual layer, so they live here rather than in
+     * sg_layer_w. Zeroed (A_log / grouped / F32) on a model with no
+     * linear-attention layers. */
+    sg_ssm_a_form ssm_a_form;   /* SG_SSM_A_NEG_EXP for GGUF, SG_SSM_A_LOG for st */
+    bool v_heads_tiled;         /* true for GGUF: k_head = v_head % n_k_heads */
+    sg_tensor_type ssm_a_type;    /* SG_T_F32 or SG_T_BF16; probed at load */
+    sg_tensor_type ssm_norm_type; /* SG_T_F32 or SG_T_BF16; probed at load */
 } sg_model;
+
+/* The value-head to key-head map, which differs between the two sources
+ * (see note 4 on sg_layer_w). n_k_heads must be nonzero and must divide
+ * n_v_heads. Always route through this rather than open-coding a division
+ * or a modulo: the two agree whenever n_v_heads == n_k_heads, so a wrong
+ * choice is invisible on the 2B and wrong on every 27B layer. */
+static inline uint32_t sg_ssm_k_head(uint32_t v_head, uint32_t n_k_heads,
+                                     uint32_t n_v_heads, bool tiled) {
+    if (n_k_heads == 0) return 0;
+    return tiled ? (v_head % n_k_heads) : (v_head / (n_v_heads / n_k_heads));
+}
 
 sg_err sg_model_from_gguf(const sg_gguf *g, sg_model *m);
 sg_err sg_model_from_st(const sg_st *s, sg_model *m);
@@ -212,8 +297,19 @@ void sg_ref_silu(float *x, uint32_t n);
 void sg_ref_gate_sigmoid(float *x, const float *gate, uint32_t n);
 float sg_ref_sigmoid(float x);
 float sg_ref_softplus(float x);   /* log(1 + e^x), computed stably */
-/* Gated DeltaNet decay gate for one head: exp(-exp(a_log) * softplus(a + dt_bias)). */
+/* Gated DeltaNet decay gate for one head, in the two forms the two
+ * checkpoint families store (see note 3 on sg_layer_w, and dispatch on
+ * sg_model.ssm_a_form rather than on which source you think you have):
+ *
+ *   SG_SSM_A_LOG      (safetensors/mlx) exp(-exp(a_log) * softplus(a + dt_bias))
+ *   SG_SSM_A_NEG_EXP  (GGUF)            exp(     neg_a  * softplus(a + dt_bias))
+ *
+ * The two are the same function composed differently: feeding
+ * neg_a = -exp(a_log) into the second gives the first. tests/test_ref_ops.c
+ * asserts that identity across the whole mlx decay fixture, so the GGUF form
+ * inherits the fixture's validation instead of being taken on trust. */
 float sg_ref_delta_decay(float a_log, float a, float dt_bias);
+float sg_ref_delta_decay_neg_a(float neg_a, float a, float dt_bias);
 
 /* One step of the per-channel causal depthwise conv with carried state.
  * x[channels] is the current token's input, replaced in place by the conv

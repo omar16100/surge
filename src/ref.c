@@ -141,10 +141,30 @@ float sg_ref_softplus(float x) {
 
 float sg_ref_delta_decay(float a_log, float a, float dt_bias) {
     /* gated_delta.compute_g: exp(-exp(A_log) * softplus(a + dt_bias)).
-     * A_log is kept in f32 by mlx's cast_predicate even in a quantized
-     * checkpoint, so there is no precision subtlety to reproduce here. */
+     * This is the safetensors/mlx form, where the stored tensor really is
+     * A_log. */
     double g = exp((double)a_log) * (double)sg_ref_softplus(a + dt_bias);
     return (float)exp(-g);
+}
+
+float sg_ref_delta_decay_neg_a(float neg_a, float a, float dt_bias) {
+    /* The GGUF form. convert_hf_to_gguf's Qwen3Next path applies
+     * -torch.exp() to A_log while writing blk.N.ssm_a, and llama.cpp then
+     * multiplies that value straight into softplus with no exp and no
+     * negation. So the exponentiation has already happened on disk and doing
+     * it again here would compute exp(-exp(-exp(A_log)*sp)), which stays in
+     * (0,1) and therefore fails silently rather than loudly.
+     *
+     * Verified elementwise rather than inferred: across every
+     * linear-attention layer of Qwen3.6-27B, GGUF blk.L.ssm_a equals
+     * -exp(A_log) of the matching HF checkpoint to 1.8e-6 once the value
+     * heads are un-tiled, and all 2304 values are strictly negative (A_log
+     * itself is mixed-sign in both HF checkpoints).
+     *
+     * neg_a is negative, so the product is negative and exp() of it lands in
+     * (0,1] as a decay must. */
+    double g = (double)neg_a * (double)sg_ref_softplus(a + dt_bias);
+    return (float)exp(g);
 }
 
 void sg_ref_silu(float *x, uint32_t n) {

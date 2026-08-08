@@ -116,6 +116,46 @@ static bool gguf_arch_recognized(const char *a) {
     return a && (strcmp(a, "qwen35") == 0 || strcmp(a, "qwen3_5") == 0);
 }
 
+/* Every layer must be cleanly one kind or the other: all six attention
+ * tensors and no ssm tensors, or all nine ssm tensors and no attention
+ * tensors. Both loaders detect layer kind purely by tensor presence, so a
+ * PARTIAL group is the one thing that quietly breaks that rule -- the
+ * forward pass would see a non-NULL q_proj (or ssm_in_qkv), decide the layer
+ * kind from it, and then dereference a NULL sibling several ops later, far
+ * from the actual cause. A renamed or dropped tensor in a future converter
+ * is exactly how that would arrive, so it is rejected at load time with the
+ * layer index and the counts, not left as a landmine.
+ *
+ * The MLP/norm tensors are not checked here; they are REQ'd on every layer
+ * already and a missing one fails earlier with its own message. */
+static sg_err check_layer_groups(const sg_layer_w *lw, uint32_t layer) {
+    const void *attn[] = { lw->q_proj, lw->k_proj, lw->v_proj,
+                           lw->o_proj, lw->q_norm, lw->k_norm };
+    const void *ssm[] = { lw->ssm_in_qkv, lw->ssm_in_z, lw->ssm_in_b,
+                          lw->ssm_in_a, lw->ssm_a, lw->ssm_dt_bias,
+                          lw->ssm_conv1d, lw->ssm_norm, lw->ssm_out };
+    unsigned n_attn = 0, n_ssm = 0;
+    for (size_t i = 0; i < sizeof attn / sizeof *attn; i++) if (attn[i]) n_attn++;
+    for (size_t i = 0; i < sizeof ssm / sizeof *ssm; i++) if (ssm[i]) n_ssm++;
+
+    /* Static messages only: sg_err carries a const char *, so it cannot own
+     * a formatted string. The counts go to stderr, which is where anyone
+     * debugging a rejected checkpoint will be looking anyway. */
+    if (n_attn == 6 && n_ssm == 0) return SG_OK;
+    if (n_attn == 0 && n_ssm == 9) return SG_OK;
+
+    fprintf(stderr,
+            "model: layer %u has an incomplete tensor group: %u/6 full-attention "
+            "tensors and %u/9 gated-DeltaNet tensors present (a layer must be "
+            "entirely one kind or the other)\n", layer, n_attn, n_ssm);
+    if (n_attn == 0 && n_ssm == 0) {
+        return (sg_err){"model: layer has neither a full-attention nor a "
+                        "gated-DeltaNet tensor group"};
+    }
+    return (sg_err){"model: layer has an incomplete full-attention or "
+                    "gated-DeltaNet tensor group"};
+}
+
 sg_err sg_model_from_gguf(const sg_gguf *g, sg_model *m) {
     if (!m) return (sg_err){"model: invalid arguments"};
     memset(m, 0, sizeof(*m));
@@ -227,11 +267,14 @@ sg_err sg_model_from_gguf(const sg_gguf *g, sg_model *m) {
         OPT("blk.%u.attn_gate.weight", ssm_in_z);
         OPT("blk.%u.ssm_beta.weight", ssm_in_b);
         OPT("blk.%u.ssm_alpha.weight", ssm_in_a);
-        OPT("blk.%u.ssm_a", ssm_a_log);
+        OPT("blk.%u.ssm_a", ssm_a);
         OPT("blk.%u.ssm_dt.bias", ssm_dt_bias);
         OPT("blk.%u.ssm_conv1d.weight", ssm_conv1d);
         OPT("blk.%u.ssm_norm.weight", ssm_norm);
         OPT("blk.%u.ssm_out.weight", ssm_out);
+
+        sg_err ge = check_layer_groups(lw, i);
+        if (sg_failed(ge)) { free(layers); return ge; }
     }
 #undef REQ
 #undef OPT
@@ -242,6 +285,12 @@ sg_err sg_model_from_gguf(const sg_gguf *g, sg_model *m) {
     m->lm_head = output_t ? output_t->data : tok_emb_t->data;
     m->layers = layers;
     m->wtype = tok_emb_t->type;
+    /* Per-source DeltaNet semantics (see notes 3 and 4 in surge.h). Both are
+     * properties of the GGUF converter, not of this particular file. */
+    m->ssm_a_form = SG_SSM_A_NEG_EXP;
+    m->v_heads_tiled = true;
+    m->ssm_a_type = SG_T_F32;    /* blk.N.ssm_a is F32 in the real file */
+    m->ssm_norm_type = SG_T_F32; /* blk.N.ssm_norm.weight likewise */
     return SG_OK;
 }
 
@@ -276,6 +325,23 @@ static const void *st_dense_tensor_f32(const sg_st *s, const char *suffix) {
     const float *data = NULL;
     if (sg_st_tensor_f32(s, plain, &data, NULL, NULL)) return data;
     if (sg_st_tensor_f32(s, nested, &data, NULL, NULL)) return data;
+    return NULL;
+}
+
+/* Same probe, but for the two DeltaNet tensors whose dtype is NOT stable
+ * across safetensors checkpoints: linear_attn.A_log and linear_attn.norm.
+ * weight are F32 in the Qwen3.5-2B bf16 checkpoint (mlx's cast_predicate
+ * exempts A_log from casting) and BF16 in the mlx 8-bit repack of
+ * Qwen3.6-27B. A F32-only lookup silently returns NULL on the latter, so
+ * this tries F32 first, then BF16, and reports which it found through
+ * *found_type. Callers record that on sg_model so the forward pass can read
+ * the right width instead of guessing from sg_model.wtype. */
+static const void *st_dense_tensor_any(const sg_st *s, const char *suffix,
+                                       sg_tensor_type *found_type) {
+    const void *p = st_dense_tensor_f32(s, suffix);
+    if (p) { if (found_type) *found_type = SG_T_F32; return p; }
+    p = st_dense_tensor(s, suffix);
+    if (p) { if (found_type) *found_type = SG_T_BF16; return p; }
     return NULL;
 }
 
@@ -336,6 +402,9 @@ sg_err sg_model_from_st(const sg_st *s, sg_model *m) {
     sg_layer_w *layers = calloc(cfg.n_layers, sizeof(*layers));
     if (!layers) return (sg_err){"model: out of memory"};
 
+    /* Defaults matter: a model with no linear-attention layer at all leaves
+     * these untouched, and F32 is the dtype the 2B uses. */
+    sg_tensor_type a_type = SG_T_F32, norm_type = SG_T_F32;
     char suffix[160];
 #define REQ(fmt, field, errmsg) do { \
         int _r = snprintf(suffix, sizeof suffix, fmt, i); \
@@ -349,10 +418,12 @@ sg_err sg_model_from_st(const sg_st *s, sg_model *m) {
         if (_r <= 0 || (size_t)_r >= sizeof suffix) { free(layers); return (sg_err){"model: safetensors tensor name too long"}; } \
         lw->field = st_dense_tensor(s, suffix); \
     } while (0)
-#define OPT_F32(fmt, field) do { \
+#define OPT_ANY(fmt, field, type_out) do { \
         int _r = snprintf(suffix, sizeof suffix, fmt, i); \
         if (_r <= 0 || (size_t)_r >= sizeof suffix) { free(layers); return (sg_err){"model: safetensors tensor name too long"}; } \
-        lw->field = st_dense_tensor_f32(s, suffix); \
+        sg_tensor_type _t = SG_T_F32; \
+        lw->field = st_dense_tensor_any(s, suffix, &_t); \
+        if (lw->field) (type_out) = _t; \
     } while (0)
 
     for (uint32_t i = 0; i < cfg.n_layers; i++) {
@@ -384,15 +455,18 @@ sg_err sg_model_from_st(const sg_st *s, sg_model *m) {
         OPT("layers.%u.linear_attn.in_proj_z.weight", ssm_in_z);
         OPT("layers.%u.linear_attn.in_proj_b.weight", ssm_in_b);
         OPT("layers.%u.linear_attn.in_proj_a.weight", ssm_in_a);
-        OPT_F32("layers.%u.linear_attn.A_log", ssm_a_log);
+        OPT_ANY("layers.%u.linear_attn.A_log", ssm_a, a_type);
         OPT("layers.%u.linear_attn.dt_bias", ssm_dt_bias);
         OPT("layers.%u.linear_attn.conv1d.weight", ssm_conv1d);
-        OPT_F32("layers.%u.linear_attn.norm.weight", ssm_norm);
+        OPT_ANY("layers.%u.linear_attn.norm.weight", ssm_norm, norm_type);
         OPT("layers.%u.linear_attn.out_proj.weight", ssm_out);
+
+        sg_err ge = check_layer_groups(lw, i);
+        if (sg_failed(ge)) { free(layers); return ge; }
     }
 #undef REQ
 #undef OPT
-#undef OPT_F32
+#undef OPT_ANY
 
     m->cfg = cfg;
     m->tok_emb = tok_emb;
@@ -404,6 +478,12 @@ sg_err sg_model_from_st(const sg_st *s, sg_model *m) {
      * from sg_st_tensor_f32 and are F32 even in this checkpoint. See the
      * per-field dtype table in surge.h's sg_layer_w comment. */
     m->wtype = SG_T_BF16;
+    /* Safetensors keeps mlx's own semantics: ssm_a is A_log verbatim and the
+     * value heads are in mlx's grouped order (see notes 3 and 4 in surge.h). */
+    m->ssm_a_form = SG_SSM_A_LOG;
+    m->v_heads_tiled = false;
+    m->ssm_a_type = a_type;
+    m->ssm_norm_type = norm_type;
     return SG_OK;
 }
 

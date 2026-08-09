@@ -563,4 +563,57 @@ void *sg_gpu_buf_host(void *buf);
 sg_err sg_gpu_run_op(sg_gpu *g, const char *kernel, void *a, void *b, void *out,
                      const uint32_t params[8]);
 
+/* ---------------------------------------------------------------------
+ * The full Metal decode path (Task 10)
+ * ---------------------------------------------------------------------
+ *
+ * The GPU twin of sg_ref_state + sg_ref_forward: same hybrid structure, same
+ * per-layer dispatch rule, same union state, same norm-shift rule, same
+ * source flags (ssm_a_form, v_heads_tiled). One token per call, every layer
+ * encoded into ONE command buffer, committed once and waited on once.
+ *
+ * WHAT IS AND IS NOT REPRODUCIBLE. These are not bit-identical to
+ * sg_ref_forward and cannot be: ref.c accumulates in double and Metal has no
+ * f64, so the gap is ~1e-7 per op and compounds across 24 layers. The M2 gate
+ * is therefore byte-exact GREEDY TOKENS, never byte-exact logits, and the
+ * argmax must be computed the same way on both sides (lowest index wins an
+ * exact tie) so a genuinely close position cannot flip on convention alone.
+ * What IS exact: every run of the GPU path on the same input produces the
+ * same bytes (Task 9's determinism property), so a divergence is always a
+ * real numerical difference and never a scheduling artifact.
+ *
+ * THREE HOST-SIDE STEPS, all deliberate: the embedding lookup (the token id
+ * is known before the command buffer opens, so ref.c's wrow runs verbatim),
+ * the RoPE cos/sin table (computed in double per position and uploaded as
+ * f32 -- see sg_ref_rope_partial's note on why an f32 angle is not good
+ * enough), and the norm-weight widening plus the +1.0 residual shift, which
+ * happens once at load into surge-owned buffers exactly as ref.c does it.
+ *
+ * WEIGHT DTYPES. bf16 and f32 matmul weights are wrapped with no copy;
+ * Q8_0 is rejected with a clear error (it is M3's job). sg_gpu_wrap needs a
+ * 4-byte-aligned base: every tensor of the Qwen3.5-2B bf16 checkpoint
+ * satisfies that (its safetensors data section starts at byte 76656 and all
+ * 632 tensor offsets are multiples of 4), but a checkpoint whose tensors sit
+ * at odd offsets -- the mlx 8-bit 27B repack does, see sg_st_read_f32 -- will
+ * fail here rather than bind a misaligned pointer, and needs its weights
+ * copied into owned buffers first.
+ *
+ * The KV cache is fp32 for M2 (fp16 arrives with M5) and holds K then V in
+ * one buffer per full-attention layer, [2, max_ctx, n_kv_heads, head_dim].
+ * It is sized from max_ctx, so pass the actual run length plus whatever
+ * margin you want -- NOT max_position_embeddings, which is 262144 on this
+ * model family and would be 24 GB of cache for a 64-token decode.
+ *
+ * Order of use: sg_gpu_init -> sg_gpu_load_model -> sg_gpu_state_new ->
+ * sg_gpu_forward per token with pos = 0, 1, 2, ... A second sequence needs
+ * sg_gpu_state_reset first; feeding a position out of order is an error,
+ * because the caches are append-only. */
+sg_err sg_gpu_load_model(sg_gpu *g, const sg_model *m);
+sg_err sg_gpu_state_new(sg_gpu *g, const sg_model *m, uint32_t max_ctx);
+void sg_gpu_state_reset(sg_gpu *g);
+/* Runs one token and returns cfg.vocab logits in host memory, owned by the
+ * gpu and valid until the next call. */
+sg_err sg_gpu_forward(sg_gpu *g, const sg_model *m, int32_t token, uint32_t pos,
+                      const float **logits);
+
 #endif

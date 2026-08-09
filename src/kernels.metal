@@ -466,3 +466,218 @@ kernel void k_delta_step(device float *S         [[buffer(0)]],
         out[j] = y;
     }
 }
+
+/* =====================================================================
+ * Task 10: the fused/strided variants the full decode path needs
+ * =====================================================================
+ *
+ * Every kernel below is a shape variant of one already above, written so a
+ * whole hybrid layer can be encoded without a per-head dispatch (a 2B token
+ * step is ~540 dispatches with these and ~1700 without). The arithmetic is
+ * deliberately IDENTICAL to its single-shape sibling -- same accumulation
+ * order, same tg_sum tree, same precise:: calls -- so Task 9's per-op parity
+ * numbers carry over unchanged.
+ */
+
+/* RMSNorm over `heads` slices of `n` elements, one threadgroup per slice,
+ * with an arbitrary element STRIDE between slices. The stride is what lets
+ * this normalize the query half of the interleaved [head, 2*head_dim]
+ * q_proj output in place without first gathering it: q lives at
+ * [h*2*head_dim, +head_dim) and the attention output gate sits in the other
+ * half, untouched. `out` may alias `x` (thread lid writes only the elements
+ * it read, after tg_sum's trailing barrier). */
+kernel void k_rmsnorm_heads(device const float *x [[buffer(0)]],
+                            device const float *w [[buffer(1)]],
+                            device float *out     [[buffer(2)]],
+                            constant uint *p      [[buffer(3)]],
+                            uint h   [[threadgroup_position_in_grid]],
+                            uint lid [[thread_position_in_threadgroup]])
+{
+    uint n = p[0], heads = p[1];
+    float eps = as_type<float>(p[2]);
+    bool has_w = p[3] != 0u;
+    uint stride = p[4];
+    if (h >= heads || n == 0u) return;
+
+    device const float *xh = x + (size_t)h * stride;
+    device float *oh = out + (size_t)h * stride;
+
+    threadgroup float red[SG_TG];
+    float acc = 0.0f;
+    for (uint i = lid; i < n; i += SG_TG) acc += xh[i] * xh[i];
+    float sumsq = tg_sum(red, lid, acc);
+    float scale = 1.0f / precise::sqrt(sumsq / (float)n + eps);
+    for (uint i = lid; i < n; i += SG_TG) {
+        oh[i] = has_w ? (xh[i] * scale * w[i]) : (xh[i] * scale);
+    }
+}
+
+/* k_rope for `heads` slices at a fixed element stride, one thread per
+ * (head, element). Same half-split pairing and same untouched
+ * [rope_dim, head_dim) tail as k_rope; `out` may alias `x` because thread
+ * (h, i) writes only elements no other thread reads. */
+kernel void k_rope_heads(device const float *x  [[buffer(0)]],
+                         device const float *cs [[buffer(1)]],
+                         device float *out      [[buffer(2)]],
+                         constant uint *p       [[buffer(3)]],
+                         uint g [[thread_position_in_grid]])
+{
+    uint head_dim = p[0], rope_dim = p[1], heads = p[2], stride = p[3];
+    if (head_dim == 0u || g >= heads * head_dim) return;
+    uint h = g / head_dim, i = g % head_dim;
+    uint half_dim = rope_dim / 2u;
+
+    device const float *xh = x + (size_t)h * stride;
+    device float *oh = out + (size_t)h * stride;
+
+    if (i < half_dim) {
+        float c = cs[i], s = cs[half_dim + i];
+        float lo = xh[i], hi = xh[i + half_dim];
+        oh[i] = lo * c - hi * s;
+        oh[i + half_dim] = lo * s + hi * c;
+    } else if (i >= rope_dim) {
+        oh[i] = xh[i];
+    }
+}
+
+/* The attention output gate when the gate is INTERLEAVED with the queries:
+ * out[h*n + i] = x[h*n + i] * sigmoid(gate[h*gstride + goff + i]). With
+ * gstride == n and goff == 0 this is exactly k_gate_sigmoid. */
+kernel void k_gate_sigmoid_strided(device const float *x    [[buffer(0)]],
+                                   device const float *gate [[buffer(1)]],
+                                   device float *out        [[buffer(2)]],
+                                   constant uint *p         [[buffer(3)]],
+                                   uint g [[thread_position_in_grid]])
+{
+    uint n = p[0], heads = p[1], gstride = p[2], goff = p[3];
+    if (n == 0u || g >= heads * n) return;
+    uint h = g / n, i = g % n;
+    out[(size_t)h * n + i] = x[(size_t)h * n + i]
+                           * sg_sigmoid(gate[(size_t)h * gstride + goff + i]);
+}
+
+/* out[i] = a[i] * scale. One multiply, not two: ref.c writes the DeltaNet
+ * query scaling as (double)q * inv * inv with inv = 1/sqrt(head_k_dim), so
+ * the host passes the f32 rounding of the whole product and this commits one
+ * rounding rather than two.
+ *
+ * That is closer to ref, NOT identical to it, and the difference is worth
+ * stating precisely. For the query scale the two agree exactly: head_k_dim is
+ * a power of two on both checkpoints, inv*inv rounds to exactly 1/head_k_dim
+ * in f32, and scaling an f32 by a power of two is exact. For the key scale
+ * (1/sqrt(head_k_dim), irrational) ref rounds a double product to f32 while
+ * this rounds an f32 product, and the two can land one ulp apart -- roughly
+ * 6e-8 relative, which is the same order as every other f32-versus-f64 gap in
+ * this file and well inside the measured whole-model logit delta. */
+kernel void k_scale(device const float *a      [[buffer(0)]],
+                    device const float *unused [[buffer(1)]],
+                    device float *out          [[buffer(2)]],
+                    constant uint *p           [[buffer(3)]],
+                    uint i [[thread_position_in_grid]])
+{
+    (void)unused;
+    if (i >= p[0]) return;
+    out[i] = a[i] * as_type<float>(p[1]);
+}
+
+/* The residual add. out may alias a (that is how it is always called). */
+kernel void k_add(device const float *a [[buffer(0)]],
+                  device const float *b [[buffer(1)]],
+                  device float *out     [[buffer(2)]],
+                  constant uint *p      [[buffer(3)]],
+                  uint i [[thread_position_in_grid]])
+{
+    if (i >= p[0]) return;
+    out[i] = a[i] + b[i];
+}
+
+/* log(1+u) for u in (0, 1]. MSL has no log1p at all (not in the default
+ * namespace and not in precise::), and the naive precise::log(1+u) loses the
+ * whole value when u falls below the f32 gap at 1.0: at u = 2e-9 it returns
+ * 0 where the true answer is 2e-9. This is Goldberg's compensation -- the
+ * computed y-1 is exactly the rounding error 1+u actually committed, so
+ * log(y) * u/(y-1) puts the lost bits back. Accurate to ~1 ulp, and exact by
+ * construction on the branch where 1+u rounds to 1. */
+static inline float sg_log1p(float u) {
+    float y = 1.0f + u;
+    if (y == 1.0f) return u;
+    return precise::log(y) * (u / (y - 1.0f));
+}
+
+/* sg_ref_softplus: logaddexp(x, 0) == max(x,0) + log1p(e^-|x|), exact at
+ * both tails (x for large positive x, e^x for large negative x). */
+static inline float sg_softplus(float x) {
+    return fmax(x, 0.0f) + sg_log1p(precise::exp(-fabs(x)));
+}
+
+/* The two DeltaNet per-head gates, one thread per value head.
+ *   beta[h]  = sigmoid(b[h])
+ *   decay[h] = exp(-exp(ssm_a[h]) * softplus(a[h] + dt_bias[h]))   (A_log form)
+ *            = exp(     ssm_a[h]  * softplus(a[h] + dt_bias[h]))   (-exp form)
+ * Splitting these out of k_delta_multi is what keeps the whole token in one
+ * command buffer: ref.c computes them on the CPU from two matvec outputs, and
+ * reading those back would mean a commit-and-wait in the middle of a layer. */
+kernel void k_delta_gates(device const float *ab  [[buffer(0)]],  /* a[n] then b[n] */
+                          device const float *adt [[buffer(1)]],  /* ssm_a[n] then dt_bias[n] */
+                          device float *gates     [[buffer(2)]],  /* beta[n] then decay[n] */
+                          constant uint *p        [[buffer(3)]],
+                          uint h [[thread_position_in_grid]])
+{
+    uint n = p[0];
+    bool neg_exp = p[1] != 0u;
+    if (h >= n) return;
+    float sp = sg_softplus(ab[h] + adt[n + h]);
+    float av = adt[h];
+    gates[h] = sg_sigmoid(ab[n + h]);
+    gates[n + h] = neg_exp ? precise::exp(av * sp)
+                           : precise::exp(-(precise::exp(av) * sp));
+}
+
+/* k_delta_step for EVERY value head of a layer, one threadgroup per head,
+ * with the value-head to key-head map (sg_ssm_k_head) applied inside so the
+ * two checkpoint conventions both work. Per-head arithmetic and statement
+ * order are k_delta_step's verbatim; only the indexing and the beta/decay
+ * source differ (a buffer, not params, since the gates are produced on the
+ * GPU by k_delta_gates). */
+kernel void k_delta_multi(device float *S           [[buffer(0)]],
+                          device const float *qkv   [[buffer(1)]],
+                          device float *out         [[buffer(2)]],
+                          constant uint *p          [[buffer(3)]],
+                          device const float *gates [[buffer(4)]],
+                          uint h   [[threadgroup_position_in_grid]],
+                          uint lid [[thread_position_in_threadgroup]])
+{
+    uint dk = p[0], dv = p[1], n_v = p[2], n_k = p[3], key_dim = p[4];
+    bool tiled = p[5] != 0u;
+    if (h >= n_v || dk == 0u || dv == 0u) return;
+
+    uint hk = 0u;
+    if (n_k != 0u && n_v >= n_k) hk = tiled ? (h % n_k) : (h / (n_v / n_k));
+
+    device const float *q = qkv + (size_t)hk * dk;
+    device const float *k = qkv + key_dim + (size_t)hk * dk;
+    device const float *v = qkv + 2u * key_dim + (size_t)h * dv;
+    device float *Sh = S + (size_t)h * dv * dk;
+    device float *oh = out + (size_t)h * dv;
+
+    float beta = gates[h], decay = gates[n_v + h];
+
+    for (uint j = lid; j < dv; j += SG_TG) {
+        device float *row = Sh + (size_t)j * dk;
+
+        float kv = 0.0f;
+        for (uint i = 0; i < dk; i++) {
+            float s = row[i] * decay;
+            row[i] = s;
+            kv += s * k[i];
+        }
+        float delta = (v[j] - kv) * beta;
+        float y = 0.0f;
+        for (uint i = 0; i < dk; i++) {
+            float s = row[i] + k[i] * delta;
+            row[i] = s;
+            y += s * q[i];
+        }
+        oh[j] = y;
+    }
+}

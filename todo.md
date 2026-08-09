@@ -602,3 +602,201 @@ was unenforced -- `run_op` now rejects an output whose buffer and byte range
 intersect an input's; `sg_gpu_wrap` accepted pointers it could not bind --
 now requires 4-byte alignment and checks both length steps for wraparound.
 Suite went 60 -> 75 checks, no measured error changed.
+
+## Task 10 Results (full Metal decode path, M2 gate)
+
+New files: `src/cli_metal.c` (the `surge` binary), `tests/test_gpu_fwd.c`.
+Extended: `src/kernels.metal` (+7 kernels), `src/metal.m` (+the batched
+per-token encoder, model load and decode state), `surge.h`, `Makefile`
+(a `surge` target and a static pattern rule for the two Metal tests).
+
+### M2 GATE: PASSED, 4/4 byte-exact
+
+Qwen3.5-2B bf16, greedy 64 tokens from the 4 frozen M1 fixture prompts
+(`tests/fixtures/m1/prompts.json` indices 0-3, 64-token prompts).
+`surge` (Metal) token ids vs `surge --ref` (Task 8 CPU forward) token ids:
+
+| prompt | tokens | result | first divergence |
+|---|---|---|---|
+| 0 | 64 | EXACT | none |
+| 1 | 64 | EXACT | none |
+| 2 | 64 | EXACT | none |
+| 3 | 64 | EXACT | none |
+
+256 of 256 generated token ids identical. No near-tie exception was needed
+or used.
+
+Reproduce (the ids files are `sed -n "$((i+1))p" tests/fixtures/m1/ids.txt`):
+
+```
+for i in 0 1 2 3; do
+  ./surge /Users/macmini/models/qwen35-2b --ids "$(cat m2out/p$i.ids)" -n 64 \
+      > m2out/metal_p$i.txt
+  ./surge /Users/macmini/models/qwen35-2b --ids "$(cat m2out/p$i.ids)" -n 64 --ref \
+      > m2out/sref_p$i.txt
+  diff <(grep gen_ids m2out/metal_p$i.txt) <(grep gen_ids m2out/sref_p$i.txt)
+done
+```
+
+### How far the gate was from failing
+
+Both paths dumped every position's logits for prompt 0 (`--logits`, 127
+forward passes each, 126 MB per file):
+
+- max |logit delta| Metal vs ref: **2.855e-05** (max |ref logit| 27.29, so
+  1.05e-06 relative), mean 1.09e-06
+- argmax agreement **127/127**
+- smallest top1-top2 gap on the ref path over those 127 positions:
+  **4.784e-02**, i.e. the gate had a **8360x** margin at its tightest point
+
+Across all 256 generated tokens of the 4 prompts (`--margins`), the smallest
+top1-top2 gap was **3.278e-02** and NO gap was below 1e-2. So the byte-exact
+result is not luck: the closest call in the whole gate is three orders of
+magnitude wider than the paths' worst disagreement.
+
+### Throughput (no gate; the M4 baseline)
+
+Qwen3.5-2B bf16 on M3 Ultra, idle machine, single sequence, fp32 KV:
+
+| phase | rate |
+|---|---|
+| decode (63 forwards after a 64-token prompt) | **75.6 - 76.1 tok/s** |
+| prompt (64 forwards, one token at a time, cold mmap) | 57.3 - 57.6 tok/s |
+| CPU reference decode, same run | 0.70 tok/s |
+
+So the Metal path is ~108x the scalar reference. 75.8 tok/s on a 4.55 GB
+checkpoint is ~345 GB/s of weight traffic against the M3 Ultra's 819 GB/s
+peak, i.e. ~42 percent of roofline with a naive one-threadgroup-per-output-row
+matvec and 542 dispatches per token. The prompt phase is SLOWER than decode
+only because it pays the first pass of page faults over the 4.55 GB mapping;
+both phases run the identical single-token step.
+
+### Structure
+
+`sg_gpu_forward` encodes ALL 24 layers into ONE MTLCommandBuffer, commits
+once and waits once: 542 dispatches per token (18 per attention layer, 24 per
+DeltaNet layer, 2 for the final norm and lm_head). Serial dispatch type, so
+Metal inserts the barriers between them.
+
+Three things stay on the host, each deliberately:
+
+1. the embedding lookup (the token id is known before the command buffer
+   opens, so ref.c's `wrow` runs verbatim and contributes zero divergence);
+2. the RoPE cos/sin table, computed in DOUBLE per position and uploaded as
+   f32 (Task 9's finding: the f32-rounded angle is 8e-3 wrong at position
+   262143, which no f32 kernel can undo);
+3. the norm widening and the +1.0 residual shift, done once at load into
+   owned f32 buffers exactly as `sg_ref_state_new` does it.
+
+The DeltaNet gates are the one place where work MOVED to the GPU relative to
+ref: `beta = sigmoid(in_proj_b)` and the decay come from two matvec outputs
+that only exist on device mid-layer, so `k_delta_gates` computes them there.
+Reading them back would mean a commit-and-wait inside each of the 18 DeltaNet
+layers. That is a real f64 -> f32 step, and it is inside the 2.9e-05 measured
+above.
+
+Seven kernels added, each a shape variant of an existing one with identical
+arithmetic, so Task 9's per-op parity numbers carry over: `k_rmsnorm_heads`
+(strided multi-head, so the interleaved [head, 2*head_dim] q_proj output can
+be normalized in place without a gather), `k_rope_heads`,
+`k_gate_sigmoid_strided`, `k_scale`, `k_add`, `k_delta_gates`,
+`k_delta_multi` (all value heads in one dispatch, with the value-head to
+key-head map inside).
+
+MSL has no `log1p` in either namespace, so softplus needed one:
+`sg_log1p` uses Goldberg's compensation (`log(y) * u/(y-1)` with `y = 1+u`),
+which is exact on the branch where `1+u` rounds to 1 and ~1 ulp elsewhere.
+The naive `log(1+u)` returns 0 for u = 2e-9 and would have silently zeroed
+softplus on the negative tail.
+
+### Alignment (Task 7's D2 concern, checked not assumed)
+
+The Qwen3.5-2B safetensors data section starts at byte 76656 and **all 632
+tensors sit at 4-byte-aligned file offsets**, so every weight is wrapped with
+no copy and no fallback was needed. The mlx 8-bit 27B repack is the
+checkpoint that does not have this property (1143 of 2180 tensors on odd
+offsets); `sg_gpu_wrap` refuses those with a clear error rather than binding
+a misaligned pointer, and a future path for them must copy through
+`sg_st_read_f32`. Q8_0 matmul weights are rejected at
+`sg_gpu_load_model` with a message pointing at M3.
+
+### KV cache sizing
+
+fp32 for M2 (fp16 is M5's), one buffer per full-attention layer holding K
+then V as [2, max_ctx, n_kv_heads, head_dim]. `max_ctx` comes from the actual
+run length (prompt + generated), never from `max_position_embeddings`: that
+is 262144 here, which would be 24 GB of cache and 8 GB of attention score
+scratch for a 128-position run. The 4 gate runs allocate 128 positions x 6
+attention layers x 2 x 512 floats = 3 MB total.
+
+### New test: tests/test_gpu_fwd.c (ungated, milliseconds)
+
+The mini hybrid fixture through BOTH paths, both checkpoint formats:
+
+| fixture | matmuls | norms | ssm_a | v-heads | worst rel gap vs ref | argmax |
+|---|---|---|---|---|---|---|
+| mini/safetensors | bf16 | residual | A_log | grouped | 1.299e-06 | 12/12 |
+| mini/gguf | f32 | absolute | -exp(A_log) | TILED | 1.299e-06 | 12/12 |
+
+Between them they cover both matvec kernels, both decay forms, both
+value-head maps and both norm conventions ON THE GPU. The gguf twin has
+n_v_heads 4 != n_k_heads 2, which the real 2B (16 and 16) cannot expose.
+Each also asserts that a rerun after `sg_gpu_state_reset` is BYTE-identical,
+which is the determinism the token gate rests on, and that a Q8_0 model is
+refused at load (gated on SURGE_GGUF).
+
+### Suites
+
+- `SURGE_ST=... SURGE_GGUF=... make check`: green, 9 suites, 0 failures
+  (test_gpu_fwd 75, test_metal_ops 81 after the review fix below).
+- `make debug` (ASan + UBSan, -DSURGE_NO_METAL): green, 0 failures, 0
+  sanitizer reports.
+- Additionally, and NOT part of `make debug`: `tests/test_gpu_fwd.c` built
+  with `-fsanitize=address` and again with `-fsanitize=undefined` WITH Metal
+  live runs clean. (ASan's leak detector is unavailable on macOS, so this
+  catches overflows and UB in the new load/free code but not leaks.)
+
+### Review round (codex gpt-5.5)
+
+No semantic mismatch found between `enc_attn`/`enc_gdn` and
+`attn_layer`/`gdn_layer` (q/gate interleave and strides, query-only q_norm,
+K/V split and v_off, conv tail layout, DeltaNet eps and scaling placement,
+value-head map, decay forms, RMSNormGated gate source, residual/MLP ordering
+all confirmed), and no out-of-bounds device access from the batched
+encoder's skipped per-dispatch checks. Four findings, all fixed:
+
+1. (medium, PRE-EXISTING from Task 9) `bufs_overlap` compared MTLBuffer
+   identity, but `newBufferWithBytesNoCopy` returns a NEW object per call, so
+   two wraps of one host range read as disjoint and the documented no-alias
+   rule could be bypassed. Now compares HOST BYTE RANGES. Two new tests: two
+   wraps of one array must be rejected, and disjoint slices of the same array
+   must still be allowed (so the fix is not a false positive).
+2. (low) the `k_scale` comment claimed it "reproduces" ref's double scaling.
+   It does exactly for the query scale (1/head_k_dim is a power of two on
+   both checkpoints, so the f32 multiply is exact) but only to ~1 ulp for the
+   key scale. Comment corrected to say so.
+3. (low) `--logits` writes n_prompt + n_gen - 1 rows, not n_prompt + n_gen:
+   the last generated token's own forward is deliberately skipped. The file
+   header said otherwise; corrected, with the row-to-token index rule spelled
+   out.
+4. (low) the attention score scratch is sized from max_ctx but was only
+   released in `sg_gpu_free`, so it outlived the state that sized it. Now
+   released in `gpu_free_state`; `sg_gpu_run_op` regrows it on demand.
+
+### Concerns / deviations
+
+- The gate is exact on THIS model at THIS length. The measured headroom
+  (8360x at the tightest position) says it should stay exact, but the
+  divergence is ~1e-5 absolute and grows with depth, so a much longer decode
+  or a larger model can eventually land on a genuine near-tie. That is a
+  property of f32 vs f64, not a bug, and `--margins` is the tool for
+  diagnosing it.
+- `sg_gpu_run_op`'s per-dispatch size checks are deliberately NOT run by the
+  batched encoder (they would be ~540 strcmp chains per token). The shapes
+  are instead validated once, in `gpu_check_model` and `sg_gpu_state_new`,
+  and every offset binding was re-derived by hand and by review. A future
+  shape change has to go back through both.
+- Only bf16 and f32 matmul weights are supported; the 27B Q8_0 GGUF does not
+  run on the Metal path yet.
+- The prompt is processed one token at a time, exactly like decode. Batched
+  prefill is not part of M2.

@@ -1073,6 +1073,41 @@ static void metal_rejects_bad_arguments(void) {
     e = sg_gpu_wrap(g_gpu, odd, UINT64_MAX, &handle);
     tt_assert(sg_failed(e), "sg_gpu_wrap should reject a length that overflows");
     free(odd);
+
+    /* The alias guard has to work on HOST RANGES, not on MTLBuffer identity.
+     * newBufferWithBytesNoCopy hands back a different object every call, so
+     * two wraps of the same array are two handles over one set of bytes and
+     * an identity test would call them disjoint. Found by review; the mmap'd
+     * weights of a real checkpoint are exactly the memory this happens to. */
+    float *shared = xmalloc(4096 * sizeof *shared);
+    for (int i = 0; i < 4096; i++) shared[i] = (float)i;
+    void *w1 = NULL, *w2 = NULL;
+    e = sg_gpu_wrap(g_gpu, shared, 16 * sizeof *shared, &w1);
+    tt_assert(!sg_failed(e), "wrap 1: %s", e.msg ? e.msg : "ok");
+    e = sg_gpu_wrap(g_gpu, shared, 16 * sizeof *shared, &w2);
+    tt_assert(!sg_failed(e), "wrap 2: %s", e.msg ? e.msg : "ok");
+    if (w1 && w2) {
+        uint32_t mv[8] = {4, 4, 0, 0, 0, 0, 0, 0};
+        e = sg_gpu_run_op(g_gpu, "k_matvec_f32", w1, w1, w2, mv);
+        tt_assert(sg_failed(e),
+                  "two separate wraps of one host range must count as overlapping");
+    }
+    /* Non-overlapping slices of the SAME array must still be allowed, or the
+     * fix would have turned a missed alias into a false positive. */
+    void *w3 = NULL, *w4 = NULL;
+    e = sg_gpu_wrap(g_gpu, shared, 16 * sizeof *shared, &w3);
+    tt_assert(!sg_failed(e), "wrap 3: %s", e.msg ? e.msg : "ok");
+    e = sg_gpu_wrap(g_gpu, shared + 2048, 4 * sizeof *shared, &w4);
+    tt_assert(!sg_failed(e), "wrap 4: %s", e.msg ? e.msg : "ok");
+    if (w3 && w4) {
+        uint32_t mv[8] = {4, 4, 0, 0, 0, 0, 0, 0};
+        e = sg_gpu_run_op(g_gpu, "k_matvec_f32", w3, w3, w4, mv);
+        tt_assert(!sg_failed(e), "disjoint slices of one array must be allowed: %s",
+                  e.msg ? e.msg : "ok");
+    }
+    sg_gpu_buf_free(w1); sg_gpu_buf_free(w2);
+    sg_gpu_buf_free(w3); sg_gpu_buf_free(w4);
+    free(shared);
 }
 
 /* -------------------------------------------------------------------- */

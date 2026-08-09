@@ -30,19 +30,26 @@ $(METALLIB): src/kernels.metal
 	xcrun -sdk macosx metal -fno-fast-math -Wall -c $< -o src/kernels.air
 	xcrun -sdk macosx metallib src/kernels.air -o $@
 
-# The metal test is the one binary that links src/metal.m and needs the
-# frameworks, so it gets an explicit rule instead of the pattern rule above
-# (an explicit rule wins). Under -DSURGE_NO_METAL -- which is how `debug`
-# runs -- the test source compiles down to a skip notice, so nothing Metal
-# is built or linked and ASan's MallocStackLogging never meets the driver.
+# The tests that link src/metal.m need the frameworks and the metallib, so
+# they get a static pattern rule instead of the generic one above (an
+# explicit rule wins). Under -DSURGE_NO_METAL -- which is how `debug` runs --
+# these sources compile down to a skip notice, so nothing Metal is built or
+# linked and ASan's MallocStackLogging never meets the driver.
+METAL_TESTS = tests/test_metal_ops.bin tests/test_gpu_fwd.bin
 ifeq (,$(findstring SURGE_NO_METAL,$(CFLAGS)))
-tests/test_metal_ops.bin: tests/test_metal_ops.c $(LIB_SRC) src/metal.m $(METALLIB)
-	$(CC) $(CFLAGS) $(METAL_DEFS) -o $@ src/metal.m tests/test_metal_ops.c \
+$(METAL_TESTS): tests/%.bin: tests/%.c $(LIB_SRC) src/metal.m $(METALLIB)
+	$(CC) $(CFLAGS) $(METAL_DEFS) -o $@ src/metal.m $< \
 	  $(LIB_SRC) $(FRAMEWORKS) $(LDLIBS)
 else
-tests/test_metal_ops.bin: tests/test_metal_ops.c
+$(METAL_TESTS): tests/%.bin: tests/%.c
 	$(CC) $(CFLAGS) -o $@ $<
 endif
+
+# `surge` (Task 10): the Metal decode path, with --ref selecting the scalar
+# CPU forward for an A/B against the identical driver loop.
+surge: src/cli_metal.c $(LIB_SRC) src/metal.m $(METALLIB)
+	$(CC) $(CFLAGS) $(METAL_DEFS) -o $@ src/cli_metal.c src/metal.m \
+	  $(LIB_SRC) $(FRAMEWORKS) $(LDLIBS)
 
 # `debug` must DELETE the test binaries first. Without that, a preceding
 # `make check` leaves them newer than the sources, make considers them up to
@@ -58,6 +65,6 @@ debug:
 	@rm -f $(TESTS:.c=.bin)
 	@rm -rf $(TESTS:.c=.bin.dSYM)
 clean:
-	rm -f $(TESTS:.c=.bin) surge-info surge-ref $(METALLIB) src/kernels.air
-	rm -rf $(TESTS:.c=.bin.dSYM) surge-info.dSYM surge-ref.dSYM
+	rm -f $(TESTS:.c=.bin) surge-info surge-ref surge $(METALLIB) src/kernels.air
+	rm -rf $(TESTS:.c=.bin.dSYM) surge-info.dSYM surge-ref.dSYM surge.dSYM
 .PHONY: check debug clean

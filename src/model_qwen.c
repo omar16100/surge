@@ -464,8 +464,12 @@ sg_err sg_model_from_gguf(const sg_gguf *g, sg_model *m) {
         /* The mirror-image group: present only on a linear-attention layer,
          * NULL on a full-attention one (see file header note 8). Names are
          * verbatim from the real file's tensor directory, including the two
-         * that do not follow the ".weight" convention (ssm_a is the bare
-         * A_log vector and the dt bias is spelled ssm_dt.bias). */
+         * that do not follow the ".weight" convention (ssm_a and the dt bias,
+         * spelled ssm_dt.bias). ssm_a does NOT hold A_log on this GGUF path:
+         * the converter has already applied -exp() to it, so it stores
+         * -exp(A_log) and is consumed via sg_ref_delta_decay_neg_a. The
+         * safetensors path stores A_log verbatim and is consumed via
+         * sg_ref_delta_decay. See file header note 3. */
         if (!sh.have_ssm_dims && sg_gguf_tensor(g, (snprintf(name, sizeof name,
                 "blk.%u.ssm_a", i), name))) {
             free(layers);

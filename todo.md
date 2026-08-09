@@ -11,7 +11,7 @@
 | 7 | ref ops (hybrid) | done |
 | 8 | ref forward + M1 gate | done |
 | 9 | metal ops | done |
-| 10 | metal decode + M2 gate | pending |
+| 10 | metal decode + M2 gate | done |
 
 ## Task 3 Results (Qwen3.6-27B-Q8_0.gguf)
 

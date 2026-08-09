@@ -298,14 +298,19 @@ def main():
     prompts = build_prompts(args.prompts, args.positions, tokenizer)
     out_dir = pathlib.Path(args.out)
     out_dir.mkdir(parents=True, exist_ok=True)
-    (out_dir / "prompts.json").write_text(
-        json.dumps([{"index": i, "preview": p[0], "ids": p[1]}
-                    for i, p in enumerate(prompts)], indent=1),
-        encoding="utf-8")
+    # prompts.json / ids.txt are the committed fixture's metadata; only
+    # --freeze may overwrite them (same gate as the pNN.f32 digests below),
+    # so a casual ad hoc run against the default --out cannot clobber the
+    # checked-in prompt set.
+    if args.freeze:
+        (out_dir / "prompts.json").write_text(
+            json.dumps([{"index": i, "preview": p[0], "ids": p[1]}
+                        for i, p in enumerate(prompts)], indent=1),
+            encoding="utf-8")
 
-    (out_dir / "ids.txt").write_text(
-        "".join(",".join(str(x) for x in p[1]) + "\n" for p in prompts),
-        encoding="utf-8")
+        (out_dir / "ids.txt").write_text(
+            "".join(",".join(str(x) for x in p[1]) + "\n" for p in prompts),
+            encoding="utf-8")
 
     # Sidecar manifest: what the dumps on disk actually are. Without it
     # --reuse silently accepts a dump from a different prompt set, a
@@ -412,6 +417,10 @@ def main():
     # rewritten as a side effect of running the gate. Overwriting them on a
     # FAIL (or from stale --reuse bytes) would bake the regression in and
     # make tests/test_ref_fwd.c's frozen check pass forever afterwards.
+    # result.json is committed fixture metadata too, so it gets the same
+    # --freeze gate as prompts.json / ids.txt / the pNN.f32 digests above: a
+    # non-freeze run must still print the full comparison (done above) but
+    # must not touch the checked-in file.
     if args.freeze:
         if not ok:
             print("NOT freezing: --freeze requires the gate to pass")
@@ -420,24 +429,27 @@ def main():
                 write_digest(out_dir / f"p{i:02d}.f32", surge[i], np)
             print(f"froze {len(paths)} regression digests in {out_dir}")
 
-    (out_dir / "result.json").write_text(json.dumps({
-        "model": args.model,
-        "prompts": len(prompts),
-        "positions": args.positions,
-        "vocab": V,
-        "tolerance": args.tol,
-        "stock": {"top1": tot_s, "of": n_all, "max_delta": worst_s},
-        "hf_norm": {"top1": tot_h, "of": n_all, "max_delta": worst_h},
-        "stock_vs_hf_norm_max_delta": between,
-        "stock_vs_hf_norm_top1": between_top1,
-        "per_prompt": [
-            {"index": i,
-             "stock": {"top1": rows_stock[i][0], "max_delta": rows_stock[i][2]},
-             "hf_norm": {"top1": rows_hf[i][0], "max_delta": rows_hf[i][2]}}
-            for i in range(len(prompts))],
-        "pass": bool(ok),
-    }, indent=1), encoding="utf-8")
-    print(f"wrote {out_dir}/result.json and {len(paths)} logit dumps")
+        (out_dir / "result.json").write_text(json.dumps({
+            "model": args.model,
+            "prompts": len(prompts),
+            "positions": args.positions,
+            "vocab": V,
+            "tolerance": args.tol,
+            "stock": {"top1": tot_s, "of": n_all, "max_delta": worst_s},
+            "hf_norm": {"top1": tot_h, "of": n_all, "max_delta": worst_h},
+            "stock_vs_hf_norm_max_delta": between,
+            "stock_vs_hf_norm_top1": between_top1,
+            "per_prompt": [
+                {"index": i,
+                 "stock": {"top1": rows_stock[i][0], "max_delta": rows_stock[i][2]},
+                 "hf_norm": {"top1": rows_hf[i][0], "max_delta": rows_hf[i][2]}}
+                for i in range(len(prompts))],
+            "pass": bool(ok),
+        }, indent=1), encoding="utf-8")
+        print(f"wrote {out_dir}/result.json and {len(paths)} logit dumps")
+    else:
+        print(f"non-freeze run: prompts.json / ids.txt / result.json in {out_dir} "
+              f"left untouched (pass --freeze to update the committed fixtures)")
     return 0 if ok else 1
 
 

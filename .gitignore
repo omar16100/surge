@@ -9,3 +9,7 @@ surge-info
 surge-ref
 tests/fixtures/m1/*.full.f32
 tests/fixtures/m1/dumps.json
+# Metal build artifacts (rebuilt from src/kernels.metal by `make`)
+src/kernels.air
+src/kernels.metallib
+__pycache__/

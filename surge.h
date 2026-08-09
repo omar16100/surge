@@ -459,4 +459,108 @@ sg_err sg_ref_forward(sg_ref_state *st, const sg_model *m, int32_t token,
  * run several independent sequences. */
 void sg_ref_state_reset(sg_ref_state *st);
 
+/* ---------------------------------------------------------------------
+ * Metal per-op kernels (Task 9), implemented in src/metal.m + src/kernels.metal
+ * ---------------------------------------------------------------------
+ *
+ * Every kernel here is a DECODE-STEP op: one token, batch of one. Weights
+ * are bf16 (or f32 for the small tensors), activations are f32, and every
+ * reduction has a FIXED SHAPE that does not depend on thread scheduling:
+ * each thread accumulates a strided slice in index order into a private
+ * register, then a binary tree over threadgroup memory folds the 256
+ * partials in a fixed order. No atomics, no simd_* reduction intrinsic
+ * (whose fold order the Metal spec does not pin down), no read-modify-write
+ * of a shared accumulator. So a kernel run twice on the same bytes produces
+ * the same bytes, which tests/test_metal_ops.c asserts 100 runs deep and
+ * which is what makes Task 10's byte-exact gate reachable.
+ *
+ * The kernels do NOT reproduce ref.c's double-precision accumulators: Metal
+ * has no f64. Parity against the ref ops is therefore ~1e-7 relative on
+ * these sizes, not exact. The one place that gap would have been large is
+ * RoPE, where ref computes the angle and its sine/cosine in double at
+ * positions up to 262143; the fix is that the HOST precomputes cos/sin in
+ * double and uploads them as f32, so the kernel only does the rotation
+ * (see k_rope's `b` buffer below).
+ *
+ * All buffers are f32 unless stated. A buffer handle is whatever
+ * sg_gpu_wrap / sg_gpu_alloc returned, never a raw pointer.
+ *
+ * kernel            a                     b                          out
+ * k_rmsnorm         x[n]                  w[n] (or NULL)             x'[n]
+ * k_rope            x[head_dim]           cos[rope_dim/2],sin[..]    x'[head_dim]
+ * k_matvec_bf16     w[rows*cols] (bf16)   x[cols]                    y[rows]
+ * k_matvec_f32      w[rows*cols]          x[cols]                    y[rows]
+ * k_softmax         x[n]                  -                          p[n]
+ * k_swiglu          gate[n]               up[n]                      silu(gate)*up
+ * k_silu            x[n]                  -                          silu(x)
+ * k_gate_sigmoid    x[n]                  gate[n]                    x*sigmoid(gate)
+ * k_attn_decode     q[heads*q_stride]     k_cache | v_cache          ctx[heads*head_dim]
+ * k_conv1d_step     x[channels]           w[channels*ksize]          y[channels] | state[(ksize-1)*channels]
+ * k_delta_step      S[dv*dk] (in AND out) q[dk] | k[dk] | v[dv]      y[dv]
+ * k_rmsnorm_gated   y[heads*dv]           z[heads*dv] | w[dv]        silu(z)*rms_norm(y,w)
+ *
+ * `|` means "concatenated in one buffer". params[] per kernel:
+ *
+ *   k_rmsnorm        [0]=n [1]=eps bits (f32 bit pattern) [2]=1 if b holds w
+ *   k_rope           [0]=head_dim [1]=rope_dim (even, 2..head_dim)
+ *   k_matvec_*       [0]=rows [1]=cols
+ *   k_softmax        [0]=n
+ *   k_swiglu/k_silu/k_gate_sigmoid  [0]=n
+ *   k_attn_decode    [0]=n_heads [1]=n_kv_heads [2]=head_dim [3]=seq_len
+ *                    [4]=q_stride (head_dim, or 2*head_dim when the queries
+ *                    are interleaved with the attention output gate)
+ *                    [5]=v_cache offset in FLOATS inside b
+ *                    [6]=softmax scale bits (host computes 1/sqrt(head_dim))
+ *   k_conv1d_step    [0]=channels [1]=ksize
+ *   k_delta_step     [0]=dk [1]=dv [2]=beta bits [3]=decay bits
+ *   k_rmsnorm_gated  [0]=dv [1]=n_heads [2]=eps bits
+ *
+ * Aliasing: `out` must not alias `a` or `b`, with two documented exceptions
+ * that mirror the ref ops' own in-place contract: k_conv1d_step's carried
+ * state lives in out[channels ..] and is read then rewritten, and
+ * k_delta_step updates S (buffer `a`) in place.
+ */
+typedef struct sg_gpu sg_gpu;
+
+/* Opens the default Metal device, its command queue and kernels.metallib,
+ * and builds every pipeline state up front (so a missing or stale metallib
+ * fails here rather than mid-decode). Returns an error on a machine with no
+ * Metal device; callers that must stay portable should treat that as "skip
+ * the GPU path", not as a fatal error.
+ *
+ * The metallib is looked up in this order: $SURGE_METALLIB, the
+ * SG_METALLIB_PATH the Makefile bakes in, ./src/kernels.metallib, and
+ * kernels.metallib next to the running executable. */
+sg_err sg_gpu_init(sg_gpu **out);
+void sg_gpu_free(sg_gpu *g);
+
+/* Wraps caller memory (typically a checkpoint mmap) with no copy.
+ *
+ * Metal requires a PAGE-ALIGNED base, which a tensor inside a GGUF never
+ * is, so this rounds the base DOWN to a page boundary and remembers the
+ * offset inside the returned handle; the whole rounded range
+ * [base & ~(page-1), base + nbytes rounded up to a page) must be readable,
+ * which holds for a file mapping and for any page-granular allocation.
+ * The wrapped memory must outlive the handle and must not move.
+ *
+ * `ptr` must additionally be 4-byte aligned, because the remembered offset
+ * is handed to setBuffer:offset:, whose granularity is 4 bytes. GGUF's
+ * 32-byte tensor alignment satisfies that; a safetensors tensor at an odd
+ * byte offset (see sg_st_read_f32's note) does not, and has to be copied
+ * rather than wrapped. */
+sg_err sg_gpu_wrap(sg_gpu *g, const void *ptr, uint64_t nbytes, void **buf_out);
+/* Fresh shared-storage buffer, zero-filled. *host_out (optional) receives a
+ * CPU pointer to its contents: the M-series GPU is unified-memory, so this
+ * is the same memory the kernels see, with no upload or download step. */
+sg_err sg_gpu_alloc(sg_gpu *g, uint64_t nbytes, void **buf_out, void **host_out);
+void sg_gpu_buf_free(void *buf);
+/* CPU pointer to a buffer's contents (offset applied), or NULL. */
+void *sg_gpu_buf_host(void *buf);
+
+/* One-shot dispatch: encode `kernel`, commit, wait. `b` may be NULL for the
+ * kernels whose table row above has no second input. Synchronous by design;
+ * Task 10 is what batches a whole layer into one command buffer. */
+sg_err sg_gpu_run_op(sg_gpu *g, const char *kernel, void *a, void *b, void *out,
+                     const uint32_t params[8]);
+
 #endif

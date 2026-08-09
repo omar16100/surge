@@ -10,7 +10,7 @@
 | 6 | model config | done |
 | 7 | ref ops (hybrid) | done |
 | 8 | ref forward + M1 gate | done |
-| 9 | metal ops | pending |
+| 9 | metal ops | done |
 | 10 | metal decode + M2 gate | pending |
 
 ## Task 3 Results (Qwen3.6-27B-Q8_0.gguf)
@@ -531,3 +531,74 @@ At 1e-3 the same mutation moves the logits by 2.18e-02.
 - `sg_ref_state_new` additionally validates rope_theta, rms_eps, the
   small-tensor dtypes, every per-layer pointer, and rejects derived widths
   above 2^24 (computed in u64) so a lying config cannot wrap a u32 width.
+
+## Task 9 Results (Metal per-op kernels, deterministic, parity vs ref)
+
+New files: `src/kernels.metal` (12 kernels), `src/metal.m` (device/queue/
+metallib, no-copy buffer wrap, one-shot dispatch), `tests/test_metal_ops.c`,
+`tests/fixture.h` (the SURGEOPS reader, extracted from test_ref_ops.c so both
+tests share one copy). Makefile gains a `src/kernels.metallib` rule and an
+explicit rule for the one test binary that links `src/metal.m`.
+
+Kernels, all bf16 weights / f32 activations, all reductions folded by a
+fixed-shape tree over threadgroup memory (no atomics, no simd_sum):
+`k_rmsnorm`, `k_rmsnorm_gated`, `k_rope`, `k_matvec_bf16`, `k_matvec_f32`,
+`k_softmax`, `k_swiglu`, `k_silu`, `k_gate_sigmoid`, `k_attn_decode`,
+`k_conv1d_step`, `k_delta_step`.
+
+### Parity vs the Task 7 ref ops (same fixture inputs, 75 checks, 0 failures)
+
+Worst relative error over all ops: **1.536e-06** (attn_decode, 8 heads,
+seq 1200), against a 1e-4 bar. Per op, worst case:
+
+| op | worst rel |
+|---|---|
+| rmsnorm (weighted / none / n=4000) | 7.5e-08 |
+| rope (full, partial, real 256/64/1e7 out to pos 262143) | 9.0e-08 |
+| matvec_bf16 (8x64, 96x1000, wrapped mmap) | 1.2e-07 |
+| matvec_f32 (q_proj 256x48) | 8.8e-08 |
+| softmax (n=32, n=3000) | 7.2e-08 |
+| swiglu / silu / gate_sigmoid | 7.0e-08 |
+| conv1d_step (6ch chained, 256ch chained, carried state) | 7.2e-08 |
+| delta_step (3 chained tokens + final state) | 1.5e-07 |
+| rmsnorm_gated | 9.4e-08 |
+| attn_decode (fixture GQA seq 5 / synthetic seq 1200 / compact q_stride) | 1.5e-06 |
+
+The residual is ref.c's double accumulators against Metal's f32; there is no
+f64 in Metal. RoPE is the one op where that would have been fatal (the
+f32-rounded angle is 8e-3 wrong at position 262143), so the cos/sin table is
+computed on the CPU in double and uploaded as f32; parity there is 4.1e-08 at
+every position tested including 262143.
+
+### Determinism
+
+100 runs on identical input, byte-identical output: k_matvec_bf16,
+k_matvec_f32, k_rmsnorm, k_rmsnorm_gated, k_softmax, k_attn_decode and
+k_delta_step, all 100/100 (the last also byte-identical in its in-place state
+S). This is the property Task 10's byte-exact gate rests on.
+
+### Build / portability
+
+- `xcrun metal` needs Xcode's Metal toolchain, a separate download on
+  macOS 26: `xcodebuild -downloadComponent MetalToolchain` (688 MB).
+- `make check` green; the metal test prints a skip and exits 0 when
+  `sg_gpu_init` fails (verified by running it from a directory where the
+  metallib is not findable).
+- `make debug` passes `-DSURGE_NO_METAL`, which compiles the metal test down
+  to a skip notice, so ASan/UBSan never loads the Metal driver. Green.
+- Clean under `MTL_DEBUG_LAYER=1 MTL_SHADER_VALIDATION=1`, and
+  `clang --analyze` on src/metal.m reports nothing (the file is manual
+  retain/release, not ARC).
+
+### Review round (codex gpt-5.5)
+
+No shader race, no ref-order mismatch (delta step order, conv shift, RoPE
+half-split and tail, GQA mapping, RMSNormGated ordering all confirmed against
+ref.c) and no retain/release imbalance. Three hardening findings, all fixed
+and each now pinned by a test: `check_sizes()` multiplied uint32 params into a
+byte count that could WRAP (a wrapped requirement is small, so an undersized
+buffer would have passed) -- now checked mul/add; the documented no-alias rule
+was unenforced -- `run_op` now rejects an output whose buffer and byte range
+intersect an input's; `sg_gpu_wrap` accepted pointers it could not bind --
+now requires 4-byte alignment and checks both length steps for wraparound.
+Suite went 60 -> 75 checks, no measured error changed.

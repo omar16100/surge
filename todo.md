@@ -800,3 +800,14 @@ encoder's skipped per-dispatch checks. Four findings, all fixed:
   run on the Metal path yet.
 - The prompt is processed one token at a time, exactly like decode. Batched
   prefill is not part of M2.
+
+## Benchmark vs mlx-lm (2026-08-10, honest baseline)
+Qwen3.5-2B bf16, decode tok/s, paired interleaved A/B/A/B, fresh gate 21.78 TFLOPS, fans max.
+- surge (M2 Metal): 75.82 / 75.99 / 75.90  -> ~75.9 tok/s
+- mlx-lm 0.31.3:     133.98 / 133.58 / 133.69 -> ~133.7 tok/s
+VERDICT: surge is 0.57x of mlx-lm (mlx 1.76x faster). surge does NOT beat mlx on speed yet.
+This is expected at M2 (correctness milestone). The speed target is M4 (kernel excellence):
+542 GPU dispatches/token and ~42% of peak bandwidth today vs the M4 plan (<40 fused
+dispatches/token, weight repack, autotuned threadgroups). Where surge already wins: decode
+is byte-exact deterministic run-to-run (M2 proved it); mlx-lm is not bit-reproducible at
+depth on this model class. Log: ~/bench_logs/surge_vs_mlx_20260810_130910.

@@ -9,10 +9,12 @@
  */
 
 #include "surge.h"
+#include <ctype.h>
 #include <fcntl.h>
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -227,4 +229,149 @@ void sg_bench_check_ingestion(uint64_t n_ids, uint32_t max_ctx, uint64_t expect_
             "bench: check_ingestion: n_ids=%llu max_ctx=%u expect=[%llu,%llu] ok=%s\n",
             (unsigned long long)n_ids, max_ctx, (unsigned long long)expect_min,
             (unsigned long long)expect_max, *ok ? "true" : "false");
+}
+
+/* --------------------------------------------------------------------
+ * Task B4: NIAH recall scorer.
+ * -------------------------------------------------------------------- */
+
+/* The exact anchor phrase prefix this project's NIAH prompt generator
+ * writes for every needle. Extraction keys on this literal, not on a bare
+ * digit-run heuristic, so the prompt's trailing question line (which
+ * repeats the city names with no codes attached) can never be mistaken
+ * for a needle and filler digit runs elsewhere never inflate ground
+ * truth -- see the contract comment in surge.h. */
+static const char *const NIAH_ANCHOR = "IMPORTANT RECORD: the secret access code for ";
+
+sg_err sg_bench_extract_needles(const char *prompt, sg_bench_needle *out, uint32_t cap,
+                                 uint32_t *n_out) {
+    if (n_out) *n_out = 0;
+    if (!prompt || !out || cap == 0 || !n_out) {
+        return (sg_err){"bench: extract_needles: invalid arguments"};
+    }
+
+    size_t anchor_len = strlen(NIAH_ANCHOR);
+    uint32_t count = 0;
+    const char *p = prompt;
+
+    while ((p = strstr(p, NIAH_ANCHOR)) != NULL) {
+        const char *anchor_pos = p;
+
+        /* Always resume the NEXT strstr search exactly one byte past
+         * where THIS anchor occurrence started, whether this candidate
+         * turns out valid or not, and regardless of how far city/code
+         * parsing below consumes. Jumping straight past a failed (or a
+         * successful) match instead would risk stepping over a DIFFERENT
+         * anchor occurrence that starts inside the text this candidate
+         * consumed -- e.g. a malformed "city" scan that swallows the
+         * literal "IMPORTANT" of a following, well-formed occurrence.
+         * One-byte steps make that impossible; the extra strstr calls are
+         * negligible at this file's scale (a handful of needles). */
+        p = anchor_pos + 1;
+
+        const char *city_start = anchor_pos + anchor_len;
+
+        /* City: a capitalized word (first letter uppercase, then any run
+         * of letters, no spaces), bounded to the field's capacity so an
+         * unexpectedly long token can never overflow the fixed-size
+         * out[].city array. */
+        if (!isupper((unsigned char)city_start[0])) continue;
+        const char *q = city_start;
+        size_t city_len = 0;
+        while (isalpha((unsigned char)*q) && city_len < SG_BENCH_NEEDLE_CITY_MAX - 1) {
+            q++;
+            city_len++;
+        }
+
+        /* Literal " is " between city and code. */
+        const char *r = q;
+        if (r[0] != ' ' || r[1] != 'i' || r[2] != 's' || r[3] != ' ') continue;
+        r += 4;
+
+        /* Code: a run of digits, bounded to the field's capacity, then a
+         * literal '.' immediately after the last digit -- required by the
+         * exact anchor phrase, so a code with no trailing '.' (i.e. not
+         * this needle format at all) is rejected rather than partially
+         * matched. This project's needle codes are always 8+ digits (see
+         * surge.h); a shorter digit run is rejected too, since it cannot
+         * be a real needle in this format. */
+        const char *code_start = r;
+        size_t code_len = 0;
+        while (isdigit((unsigned char)r[code_len]) && code_len < SG_BENCH_NEEDLE_CODE_MAX - 1) {
+            code_len++;
+        }
+        if (code_len < 8 || r[code_len] != '.') continue;
+
+        if (count >= cap) {
+            fprintf(stderr,
+                    "bench: extract_needles: cap %u reached, stopping scan (more matches "
+                    "may remain unscanned)\n", cap);
+            break;
+        }
+        memcpy(out[count].city, city_start, city_len);
+        out[count].city[city_len] = '\0';
+        memcpy(out[count].code, code_start, code_len);
+        out[count].code[code_len] = '\0';
+        count++;
+    }
+
+    *n_out = count;
+    fprintf(stderr, "bench: extract_needles: found %u needle pair(s) (cap=%u)\n", count, cap);
+    return SG_OK;
+}
+
+/* Naive bounded substring search: does hay[0..hay_len) contain needle (a
+ * NUL-terminated C string) anywhere? Unlike strstr, this never reads past
+ * hay_len, so it is safe to call on a LINE slice of a larger buffer that
+ * is not itself NUL-terminated at the line boundary. */
+static bool bench_mem_find(const char *hay, size_t hay_len, const char *needle) {
+    size_t needle_len = strlen(needle);
+    if (needle_len == 0 || needle_len > hay_len) return false;
+    for (size_t i = 0; i + needle_len <= hay_len; i++) {
+        if (memcmp(hay + i, needle, needle_len) == 0) return true;
+    }
+    return false;
+}
+
+void sg_bench_score_niah(const char *gen, const sg_bench_needle *needles, uint32_t n_needles,
+                          uint32_t *retrieval_hits, uint32_t *assoc_hits) {
+    if (retrieval_hits) *retrieval_hits = 0;
+    if (assoc_hits) *assoc_hits = 0;
+    if (!gen || !needles || n_needles == 0) return;
+
+    size_t gen_len = strlen(gen);
+    uint32_t r_hits = 0, a_hits = 0;
+
+    for (uint32_t i = 0; i < n_needles; i++) {
+        const char *code = needles[i].code;
+        const char *city = needles[i].city;
+        if (code[0] == '\0') continue;
+
+        bool retrieved = strstr(gen, code) != NULL;
+        if (retrieved) r_hits++;
+        if (!retrieved || city[0] == '\0') continue;
+
+        /* Walk gen's lines by tracking [line_start, j) offsets -- no
+         * strtok, no copy, no write into gen. A trailing '\r' is trimmed
+         * from each line so CRLF-terminated gen output still associates
+         * correctly. */
+        bool assoc = false;
+        size_t line_start = 0;
+        for (size_t j = 0; j <= gen_len && !assoc; j++) {
+            if (j != gen_len && gen[j] != '\n') continue;
+            size_t line_len = j - line_start;
+            if (line_len > 0 && gen[line_start + line_len - 1] == '\r') line_len--;
+            if (bench_mem_find(gen + line_start, line_len, code) &&
+                bench_mem_find(gen + line_start, line_len, city)) {
+                assoc = true;
+            }
+            line_start = j + 1;
+        }
+        if (assoc) a_hits++;
+    }
+
+    if (retrieval_hits) *retrieval_hits = r_hits;
+    if (assoc_hits) *assoc_hits = a_hits;
+    fprintf(stderr, "bench: score_niah: retrieval=%u/%u assoc=%u/%u\n",
+            r_hits, n_needles, a_hits, n_needles);
 }

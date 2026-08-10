@@ -842,4 +842,82 @@ sg_err sg_bench_read_file(const char *path, char **out, size_t *len);
 void sg_bench_check_ingestion(uint64_t n_ids, uint32_t max_ctx, uint64_t expect_min,
                               uint64_t expect_max, bool *ok);
 
+/* ---------------------------------------------------------------------
+ * NIAH recall scorer (Task B4, src/bench.c)
+ * ---------------------------------------------------------------------
+ *
+ * PURE C, no Metal, no GPU, no Foundation -- same safety property as the
+ * rest of bench.c. Ground truth in the 256K NIAH prompt
+ * (/Users/macmini/models/niah_256k_prompt.txt) is a set of "needle" pairs
+ * (city, code) buried in filler text, each written EXACTLY as:
+ *
+ *     IMPORTANT RECORD: the secret access code for <City> is <DIGITS>.
+ *
+ * where <City> is a single capitalized word (first letter uppercase, then
+ * letters, no spaces) and <DIGITS> is a run of 8 or more digits
+ * immediately followed by '.'. The prompt's trailing question line lists
+ * the city names again WITHOUT codes ("... cities from the text above:
+ * Reykjavik, Ouagadougou, ..."); extraction keys on the FULL anchor
+ * phrase (not a bare "8-digit number" heuristic) specifically so that
+ * line cannot be mistaken for a needle and so filler digit runs elsewhere
+ * in the text never inflate ground truth. */
+
+#define SG_BENCH_NEEDLE_CITY_MAX 32   /* longest city name + NUL, e.g. "Ouagadougou" */
+#define SG_BENCH_NEEDLE_CODE_MAX 24   /* longest code digit run + NUL (spec: "8+ digits") */
+#define SG_BENCH_MAX_NEEDLES 16       /* fixed cap on sg_bench_extract_needles' output array */
+
+typedef struct {
+    char city[SG_BENCH_NEEDLE_CITY_MAX];   /* NUL-terminated, letters only */
+    char code[SG_BENCH_NEEDLE_CODE_MAX];   /* NUL-terminated, digits only */
+} sg_bench_needle;
+
+/* Scans prompt for every occurrence of the anchor phrase
+ *     "IMPORTANT RECORD: the secret access code for <City> is <DIGITS>."
+ * and writes each (city, code) pair into out[0..*n_out). out must have
+ * room for at least `cap` entries; SG_BENCH_MAX_NEEDLES is the project's
+ * standing cap (8 real needles in the live prompt, headroom to 16). A
+ * candidate is accepted only when the FULL phrase matches: the anchor
+ * literal, then an uppercase letter followed by zero or more further
+ * letters (the city, stopped at the first non-letter), then " is ", then
+ * 8 or more digits (the code), then a literal '.' immediately after the
+ * last digit. Anything that does not match that exact shape (including
+ * the trailing question line, which names cities but never followed by
+ * "is <digits>.", and a lowercase-first or non-letter "city") is silently
+ * skipped, not counted. A failed candidate never causes a later, valid
+ * anchor occurrence to be missed (scanning resumes one byte past where
+ * each attempt started, not past however much of the failed candidate it
+ * consumed). Scanning never mutates *prompt and never reads past its NUL
+ * terminator.
+ *
+ * On success (SG_OK), *n_out is the number of pairs written (<= cap); if
+ * more than `cap` matches exist in prompt, scanning stops at cap and a
+ * notice is printed to stderr (*n_out == cap, not an error). Returns a
+ * failed sg_err (nothing written, *n_out left at 0) if prompt/out/n_out is
+ * NULL or cap == 0. */
+sg_err sg_bench_extract_needles(const char *prompt, sg_bench_needle *out, uint32_t cap,
+                                 uint32_t *n_out);
+
+/* Scores a generated answer `gen` against the ground-truth needles:
+ *
+ *   *retrieval_hits = count of needles[i] whose code appears ANYWHERE in
+ *       gen as a raw substring (adjacent punctuation like "13072624." or
+ *       "(13072624)" does not block the match; it is a plain substring
+ *       search, not a tokenized one).
+ *
+ *   *assoc_hits = count of needles[i] whose code AND whose city both
+ *       appear as substrings of the SAME LINE of gen (gen is split on
+ *       '\n'; a trailing '\r' on a line is trimmed so CRLF input still
+ *       associates correctly). This is stricter than retrieval: a code
+ *       attached to the wrong city on its line does not count, even
+ *       though it still counts toward retrieval_hits.
+ *
+ * gen is read-only throughout (line splitting is done by tracking
+ * offsets, not by copying or writing a NUL into gen -- no strtok, no
+ * mutation of the input). *retrieval_hits and *assoc_hits are set to 0
+ * first and left at 0 if gen/needles is NULL or n_needles == 0; either
+ * out-param may be NULL to skip that one. A needle with an empty code (or
+ * empty city, for the association half) never matches. */
+void sg_bench_score_niah(const char *gen, const sg_bench_needle *needles, uint32_t n_needles,
+                          uint32_t *retrieval_hits, uint32_t *assoc_hits);
+
 #endif

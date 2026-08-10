@@ -951,3 +951,78 @@ is B5's job) -- pure C, safe to build/test while the GPU is busy.
 
 ### Deviations: none. Implementation follows the task spec verbatim; no correctness or safety
 issues surfaced in self-review.
+
+## Task B4 Results (bench.c: NIAH recall scorer, pure C)
+
+EDIT `src/bench.c` (added `sg_bench_extract_needles`, `bench_mem_find` (static helper),
+`sg_bench_score_niah`) + `sg_bench_needle` struct and decls in `surge.h`; NEW
+`tests/test_bench_score.c`. No Metal/GPU import -- pure C, safe to build/test while the GPU is
+busy.
+
+### What it does
+- `sg_bench_extract_needles(prompt, out, cap, n_out)`: scans `prompt` at runtime for every
+  occurrence of the literal anchor `"IMPORTANT RECORD: the secret access code for "`, then
+  requires the full shape right after it: an uppercase-first word (the city, letters only, no
+  spaces), literal `" is "`, 8+ digits (the code), then a literal `.` immediately after the last
+  digit. Anything short of that exact shape (missing `.`, no anchor prefix, lowercase-first
+  "city", a <8-digit run, an empty city) is silently skipped, not counted -- this is what keeps
+  the prompt's trailing question line (city names with no codes) and any filler digit run from
+  ever becoming a false needle. Writes up to `cap` pairs into `out` (`SG_BENCH_MAX_NEEDLES` == 16
+  is the project's standing cap); stops and logs a notice if more matches exist past `cap`.
+- `sg_bench_score_niah(gen, needles, n_needles, retrieval_hits, assoc_hits)`: `retrieval_hits` =
+  count of needle codes appearing anywhere in `gen` (plain substring match, so adjacent
+  punctuation like `(13072624).` doesn't block it). `assoc_hits` = count of needles whose code
+  AND city both appear on the SAME line of `gen` (gen split on `\n`, trailing `\r` trimmed for
+  CRLF input). Line splitting tracks `[line_start, j)` offsets over the original buffer -- no
+  `strtok`, no copy, no mutation of `gen`; a bounded `bench_mem_find` (like `strstr` but
+  respects an explicit length instead of relying on a NUL at the slice boundary) does the
+  substring checks per line.
+
+### Gate: PASSED. make check + make debug (ASan/UBSan, SURGE_NO_METAL) both exit 0.
+- Extractor pulls exactly the 8 known pairs (Reykjavik 13072624, Ouagadougou 28450913,
+  Valparaiso 70915533, Nakhodka 48221067, Timbuktu 95513380, Kirkwall 36628401, Ushuaia
+  81190244, Yakutsk 55372918) from BOTH the real `/Users/macmini/models/niah_256k_prompt.txt`
+  (confirmed present, read at test time) and a synthetic haystack built in the test, including a
+  filler 8-digit number and the trailing question line -- neither produces a false needle.
+- Golden 8-line "City: code" answer -> retrieval 8/8, assoc 8/8.
+- Codes-right-cities-shuffled (rotate city assignment by 1) -> retrieval 8/8, assoc 0/8.
+- 3-of-8 partial answer -> retrieval 3/8 (assoc 3/8 too, since the 3 present are correctly
+  paired -- extra signal beyond the gate's literal requirement).
+- A filler 8-digit number that is not any needle's code does not inflate retrieval (4 real pairs
+  + 1 filler -> retrieval stays 4).
+- Codes with adjacent punctuation (`(13072624).`, `28450913,`) still match, for both retrieval
+  and association.
+- Also covers (surfaced during self-review + codex gpt-5.5 review, see Deviations below): a
+  fixed-cap array truncates cleanly at a small cap; NULL/invalid arguments on both functions
+  fail/no-op cleanly, never crash; an overlapping-anchor regression case; a needle-set
+  substring-collision guard.
+- 191 checks, 0 failures in test_bench_score.bin; all suites `0 failures` under both `make check`
+  and `make debug`, no ASan/UBSan diagnostics.
+- `-Wall -Wextra -Werror` clean.
+
+### Deviations / fixes from codex gpt-5.5 review (applied before commit):
+- **Overlapping-anchor skip bug (major, fixed):** the first draft advanced the scan pointer past
+  whatever a failed (or successful) candidate consumed. A malformed anchor occurrence directly
+  abutting a well-formed one (no separating text) could have its bogus "city" scan swallow the
+  literal `IMPORTANT` of the following, well-formed occurrence, causing that real needle to be
+  missed entirely. Fixed by always resuming the next `strstr` search exactly one byte past where
+  the CURRENT anchor attempt started, regardless of outcome. New regression test
+  `test_extract_overlapping_anchor_not_skipped` pins this.
+  - **Code length not enforced to spec (minor, fixed):** the draft accepted any 1+ digit run
+    after "is "; the task spec says needle codes are "8+ digit runs". Changed the accept
+    condition to `code_len < 8` reject. Real needles (all 8 digits) are unaffected; a malformed
+    short "code" (e.g. `is 42\n`, `is 1234567.`) is now rejected on this basis too, not just on
+    the missing `.`.
+- **City not required to be capitalized (minor, fixed):** the draft accepted any run of letters
+  as a city; the task spec says cities are "single capitalized words". Added an
+  `isupper(city_start[0])` check. Real needles are unaffected; a lowercase-first "city" (e.g.
+  `for boston is 12345678.`) is now rejected.
+- **Test needle-set collision guard (minor, added):** the shuffled/filler tests implicitly
+  assume no two of the 8 real cities/codes are substrings of each other -- true today but not
+  self-evident from the test alone. Added `test_needle_set_has_no_substring_collisions` so a
+  future change to the needle set that broke that assumption would fail loudly instead of
+  silently passing the wrong thing.
+- Not changed: codex's nit on `bench_mem_find`'s loop bound (`i + needle_len <= hay_len`)
+  claiming theoretical unsigned-wrap risk -- both operands are always small (bounded by
+  `SG_BENCH_NEEDLE_CODE_MAX`/`CITY_MAX` and realistic `gen` buffer sizes), no practical
+  overflow path exists; left as the more idiomatic form.

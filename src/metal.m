@@ -160,7 +160,7 @@ struct sg_gpu {
     const sg_model *model;
     sg_cfg cfg;
     uint32_t key_dim, value_dim, conv_dim, q_width, kv_width, attn_width;
-    int mat_kernel;            /* KI_MATVEC_BF16 or KI_MATVEC_F32 */
+    int mat_kernel;            /* KI_MATVEC_BF16, KI_MATVEC_F32 or KI_MATVEC_Q8 */
     sg_gpu_layer *ls;          /* cfg.n_layers */
     void *lm_head;             /* wrapped [vocab, hidden] */
     void *out_norm;            /* owned [hidden] f32, shift applied */
@@ -791,6 +791,49 @@ static float gpu_bf16_to_f32(uint16_t h) {
     return f;
 }
 
+/* IEEE binary16 -> f32, bit-identical to ref.c's f16_to_f32. Used only to
+ * decode a Q8_0 block scale in the host-side embedding lookup, so the
+ * embedding row the Metal path feeds in matches the CPU reference exactly. */
+static float gpu_f16_to_f32(uint16_t h) {
+    uint32_t sign = (uint32_t)(h >> 15) << 31;
+    uint32_t exp_bits = (h >> 10) & 0x1F;
+    uint32_t mant = h & 0x3FF;
+    uint32_t bits;
+    if (exp_bits == 0) {
+        if (mant == 0) {
+            bits = sign; /* +-0 */
+        } else {
+            int shift = 0;
+            while ((mant & 0x400) == 0) { mant <<= 1; shift++; }
+            mant &= 0x3FF;
+            bits = sign | ((uint32_t)(127 - 15 - shift + 1) << 23) | (mant << 13);
+        }
+    } else if (exp_bits == 0x1F) {
+        bits = sign | 0x7F800000u | (mant << 13); /* inf / NaN */
+    } else {
+        bits = sign | ((exp_bits + (127 - 15)) << 23) | (mant << 13);
+    }
+    float f;
+    memcpy(&f, &bits, sizeof f);
+    return f;
+}
+
+/* The matvec kernel for a weight tensor of the given dtype. All of a model's
+ * matmul weights share one dtype: sg_model_from_gguf requires every matmul
+ * tensor -- and output.weight -- to equal token_embd's type, and the
+ * safetensors loader reports a single wtype, so the decode encoder selects the
+ * kernel once from m->wtype rather than per call site (a per-weight lookup
+ * would return this same kernel at every matmul dispatch). This is the
+ * per-tensor dispatch the M3 plan asks for, collapsed to one selection because
+ * the loader guarantees the matmul weights are dtype-uniform. */
+static int matmul_kernel_for(sg_tensor_type t) {
+    switch (t) {
+    case SG_T_Q8_0: return KI_MATVEC_Q8;
+    case SG_T_BF16: return KI_MATVEC_BF16;
+    default:        return KI_MATVEC_F32;   /* SG_T_F32 */
+    }
+}
+
 /* ref.c's wwiden: widen a small (non-matmul) tensor into owned f32 storage,
  * adding the residual-norm shift in f32 AFTER widening. Same order, same
  * roundings, so a norm weight is bit-identical on the two paths. */
@@ -805,13 +848,28 @@ static void gpu_widen(const void *w, sg_tensor_type t, float *out, uint64_t n, f
     }
 }
 
-/* ref.c's wrow for the two dtypes this path accepts. Q8_0 is rejected at
- * load, so there is no dequantizing branch here. */
+/* ref.c's wrow for the three dtypes this path accepts. The Q8_0 branch
+ * mirrors ref.c's wrow exactly (same f16 scale decode, same scale*int8 in
+ * f32), so the embedding row is bit-identical to the CPU reference. */
 static void gpu_embed_row(const void *w, sg_tensor_type t, uint64_t row,
                           uint32_t cols, float *out) {
     if (t == SG_T_BF16) {
         const uint16_t *b = (const uint16_t *)w + row * cols;
         for (uint32_t i = 0; i < cols; i++) out[i] = gpu_bf16_to_f32(b[i]);
+    } else if (t == SG_T_Q8_0) {
+        /* Q8_0 rows are whole 32-element blocks (gpu_check_model rejects a
+         * hidden size that is not a multiple of 32), row `row` starts at byte
+         * row*(cols/32)*34, each block is a little-endian f16 scale then 32
+         * signed int8. */
+        uint64_t blocks = cols / 32u;
+        const uint8_t *p = (const uint8_t *)w + row * blocks * 34u;
+        for (uint64_t b = 0; b < blocks; b++) {
+            const uint8_t *blk = p + b * 34u;
+            uint16_t sbits = (uint16_t)((uint16_t)blk[0] | ((uint16_t)blk[1] << 8));
+            float d = gpu_f16_to_f32(sbits);
+            const int8_t *q = (const int8_t *)(blk + 2);
+            for (uint32_t i = 0; i < 32; i++) out[b * 32 + i] = d * (float)q[i];
+        }
     } else {
         memcpy(out, (const float *)w + row * cols, (size_t)cols * sizeof *out);
     }
@@ -1029,12 +1087,28 @@ static void gpu_unload(sg_gpu *g) {
 }
 
 /* Wrap a matmul weight of `rows x cols` elements in the model's weight
- * dtype. Both extents are bounded by the 1<<24 check in gpu_check_cfg, so
- * the byte count cannot wrap. */
+ * dtype. Both extents are bounded by the 1<<24 check in gpu_check_cfg (and
+ * vocab is a checked uint32), so the byte count cannot wrap. For Q8_0 the
+ * bytes are rows*(cols/32) blocks of 34 (f16 scale + 32 int8), exactly the
+ * row stride sg_ref_matvec_q8 and k_matvec_q8 index; cols is a nonzero
+ * multiple of 32 for every matmul (gpu_check_model enforces it on hidden,
+ * and the derived widths are all multiples of head_dim, itself a multiple of
+ * 32), but reject a stray non-multiple here rather than truncate the block
+ * count and wrap a short buffer. */
 static sg_err gpu_wrap_w(sg_gpu *g, const void *p, uint64_t rows, uint64_t cols,
                          void **out) {
-    uint64_t esz = (g->model->wtype == SG_T_BF16) ? 2 : 4;
-    return sg_gpu_wrap(g, p, rows * cols * esz, out);
+    sg_tensor_type t = g->model->wtype;
+    uint64_t nbytes;
+    if (t == SG_T_Q8_0) {
+        if (cols == 0 || cols % 32u != 0) {
+            return (sg_err){"gpu: a Q8_0 matmul width is not a multiple of 32"};
+        }
+        nbytes = rows * (cols / 32u) * 34u;
+    } else {
+        uint64_t esz = (t == SG_T_BF16) ? 2 : 4;
+        nbytes = rows * cols * esz;
+    }
+    return sg_gpu_wrap(g, p, nbytes, out);
 }
 
 static sg_err gpu_alloc_f32(sg_gpu *g, uint64_t n, void **buf, float **host) {
@@ -1062,9 +1136,16 @@ static sg_err gpu_check_model(const sg_model *m) {
         return (sg_err){"gpu: n_heads is not a multiple of n_kv_heads"};
     }
     if (c->full_attn_interval == 0) return (sg_err){"gpu: full_attn_interval is zero"};
-    if (m->wtype != SG_T_BF16 && m->wtype != SG_T_F32) {
-        return (sg_err){"gpu: the Metal path needs bf16 or f32 matmul weights "
-                        "(Q8_0 arrives with M3)"};
+    if (m->wtype != SG_T_BF16 && m->wtype != SG_T_F32 && m->wtype != SG_T_Q8_0) {
+        return (sg_err){"gpu: the Metal path needs bf16, f32 or Q8_0 matmul weights"};
+    }
+    /* Q8_0 rows are whole 32-element blocks, so the contraction width of every
+     * matmul (hidden, and the head-derived widths) must be a multiple of 32.
+     * hidden is the one that is not already a multiple of head_dim; check it
+     * up front so a bad checkpoint fails here with a clear message rather than
+     * inside gpu_wrap_w. */
+    if (m->wtype == SG_T_Q8_0 && c->hidden % 32 != 0) {
+        return (sg_err){"gpu: Q8_0 weights need a hidden size that is a multiple of 32"};
     }
     if ((m->dense_type != SG_T_BF16 && m->dense_type != SG_T_F32)
         || (m->ssm_a_type != SG_T_BF16 && m->ssm_a_type != SG_T_F32)
@@ -1151,7 +1232,7 @@ sg_err sg_gpu_load_model(sg_gpu *g, const sg_model *m) {
     g->attn_width = c->n_heads * c->head_dim;
     g->q_width = 2 * g->attn_width;
     g->kv_width = c->n_kv_heads * c->head_dim;
-    g->mat_kernel = (m->wtype == SG_T_BF16) ? KI_MATVEC_BF16 : KI_MATVEC_F32;
+    g->mat_kernel = matmul_kernel_for(m->wtype);
 
     g->ls = calloc(c->n_layers, sizeof *g->ls);
     if (!g->ls) { gpu_unload(g); return (sg_err){"gpu: out of memory"}; }

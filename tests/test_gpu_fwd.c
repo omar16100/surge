@@ -215,24 +215,74 @@ static void mini_gguf_matches_ref(void) {
     free(ids);
 }
 
-/* Q8_0 has no Metal matvec yet (it is M3's), and the failure has to be a
- * clear load-time error rather than a wrong answer or a device fault. */
-static void q8_is_rejected(void) {
+/* Q8_0 now loads on the Metal path (M3.2+M3.3). This env-guarded check wants
+ * a real Q8_0 gguf, loads it, and greedily decodes a few tokens, asserting the
+ * outputs are valid (in-vocab, finite logits) and NOT degenerate (not the same
+ * token every step). The rigorous Q8_0-vs-ref numeric gate is M3.4; here the
+ * bar is "loads + coherent", matching the M3.3 gate text. */
+static void q8_loads_and_decodes(void) {
     const char *path = getenv("SURGE_GGUF");
     if (!path) {
         fprintf(stderr, "   SKIP: set SURGE_GGUF to a Q8_0 gguf to check the "
-                        "Metal path rejects it\n");
+                        "Metal Q8_0 load + decode\n");
         return;
     }
     sg_gguf *gg = NULL;
     if (sg_failed(sg_gguf_open(path, &gg))) return;
     sg_model m;
     if (sg_failed(sg_model_from_gguf(gg, &m))) { sg_gguf_close(gg); return; }
-    if (m.wtype == SG_T_Q8_0) {
-        sg_err e = sg_gpu_load_model(g_gpu, &m);
-        tt_assert(sg_failed(e), "sg_gpu_load_model must refuse Q8_0 weights");
-        if (sg_failed(e)) fprintf(stderr, "   (rejected with: %s)\n", e.msg);
+    if (m.wtype != SG_T_Q8_0) {
+        fprintf(stderr, "   SKIP: SURGE_GGUF is not a Q8_0 model (wtype %d)\n",
+                (int)m.wtype);
+        sg_model_free(&m);
+        sg_gguf_close(gg);
+        return;
     }
+
+    sg_err e = sg_gpu_load_model(g_gpu, &m);
+    tt_assert(!sg_failed(e), "sg_gpu_load_model (Q8_0): %s", e.msg ? e.msg : "ok");
+    if (sg_failed(e)) { sg_model_free(&m); sg_gguf_close(gg); return; }
+
+    const uint32_t n_gen = 8;
+    const int32_t prompt = 1;   /* any in-vocab id; we only check coherence */
+    e = sg_gpu_state_new(g_gpu, &m, 1 + n_gen);
+    tt_assert(!sg_failed(e), "sg_gpu_state_new (Q8_0): %s", e.msg ? e.msg : "ok");
+    if (sg_failed(e)) { sg_model_free(&m); sg_gguf_close(gg); return; }
+
+    const float *lg = NULL;
+    e = sg_gpu_forward(g_gpu, &m, prompt, 0, &lg);
+    tt_assert(!sg_failed(e), "sg_gpu_forward[0] (Q8_0): %s", e.msg ? e.msg : "ok");
+    if (sg_failed(e)) { sg_model_free(&m); sg_gguf_close(gg); return; }
+
+    uint32_t vocab = m.cfg.vocab;
+    int32_t gen[8];
+    bool all_finite = true, all_in_range = true;
+    for (uint32_t i = 0; i < n_gen; i++) {
+        for (uint32_t k = 0; k < vocab; k++) if (!isfinite(lg[k])) all_finite = false;
+        uint32_t arg = argmax_f32(lg, vocab);
+        if (arg >= vocab) all_in_range = false;
+        gen[i] = (int32_t)arg;
+        if (i + 1 == n_gen) break;
+        e = sg_gpu_forward(g_gpu, &m, (int32_t)arg, 1 + i, &lg);
+        tt_assert(!sg_failed(e), "sg_gpu_forward[%u] (Q8_0): %s", i + 1, e.msg ? e.msg : "ok");
+        if (sg_failed(e)) break;
+    }
+    tt_assert(all_finite, "Q8_0 decode logits are all finite");
+    tt_assert(all_in_range, "Q8_0 decode argmaxes are in vocab range");
+    /* Degenerate-output guard: a broken dequant/dispatch tends to collapse to
+     * one repeated token. Require at least two distinct tokens over 8 steps. */
+    uint32_t distinct = 1;
+    for (uint32_t i = 1; i < n_gen; i++) {
+        bool seen = false;
+        for (uint32_t j = 0; j < i; j++) if (gen[j] == gen[i]) { seen = true; break; }
+        if (!seen) distinct++;
+    }
+    tt_assert(distinct >= 2, "Q8_0 decode produced %u distinct tokens over %u steps "
+              "(a single repeated token signals a broken Q8_0 path)", distinct, n_gen);
+    fprintf(stderr, "   Q8_0 decode ids:");
+    for (uint32_t i = 0; i < n_gen; i++) fprintf(stderr, " %d", gen[i]);
+    fprintf(stderr, "\n");
+
     sg_model_free(&m);
     sg_gguf_close(gg);
 }
@@ -245,7 +295,7 @@ int main(void) {
     }
     tt_run("mini_st_matches_ref", mini_st_matches_ref);
     tt_run("mini_gguf_matches_ref", mini_gguf_matches_ref);
-    tt_run("q8_is_rejected", q8_is_rejected);
+    tt_run("q8_loads_and_decodes", q8_loads_and_decodes);
     fprintf(stderr, "worst relative logit gap vs ref: %.3e\n", g_worst_rel);
     sg_gpu_free(g_gpu);
     return tt_report();

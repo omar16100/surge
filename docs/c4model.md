@@ -43,7 +43,7 @@ optionally Accelerate for the CPU reference path. No third-party libraries.
 | `src/ref.c` | scalar CPU reference for every op (the correctness oracle), incl. `sg_ref_matvec_q8`, attention, gated-DeltaNet, partial RoPE, and the full forward pass. |
 | `src/kv.c` | (M5.1) fp16 growable KV cache for full-attention layers + fixed-size DeltaNet recurrent state, over opaque GPU-buffer handles; Metal-free (allocation injected). `sg_kv_bytes` = 16 GiB K+V at 262,144. |
 | `src/bench.c` | (B-series) pure-C benchmark math: decode-by-slope, leaderboard-row/JSON formatters, prompt file read, ingestion/truncation guard, NIAH recall scorer. |
-| `src/metal.m` | Metal device init, weight-buffer wrapping (mmap, no-copy), one command buffer per decode token, kernel registration (KI_ enum + SG_KERNELS table + size/param checks), state via `sg_kv`. |
+| `src/metal.m` | Metal device init, weight-buffer wrapping (mmap, no-copy; bf16/f32/Q8_0 sizing), per-weight matvec kernel dispatch (`matmul_kernel_for`), one command buffer per decode token, kernel registration (KI_ enum + SG_KERNELS table + size/param checks), state via `sg_kv`. |
 | `src/kernels.metal` | deterministic Metal kernels (fixed-tree reductions, no atomics/simd_sum): bf16/f32/Q8_0 matvec, attention decode, gated-DeltaNet decode, RoPE, RMSNorm, SwiGLU. Tiled prefill kernels arrive in M5. |
 | `src/cli_*.c` | the four CLI mains. |
 
@@ -66,8 +66,14 @@ optionally Accelerate for the CPU reference path. No third-party libraries.
   M1 gate: 100% top-1 vs mlx-lm on Qwen3.5-2B. M2 gate: byte-exact Metal-vs-ref greedy.
   Decode ~76 tok/s on the 2B bf16; measured at 0.57x of mlx-lm (speed is M4's milestone).
 - **In progress (branch `feat/m3-m5`):**
-  - M3 (Q8_0 weights end-to-end): M3.1 `k_matvec_q8` done; M3.2 kernel twins, M3.3 loader
-    dispatch, M3.4 Q8_0 forward gate pending.
+  - M3 (Q8_0 weights end-to-end): M3.1 `k_matvec_q8` done; M3.2+M3.3 done (merged: the
+    decode encoder selects the matvec kernel from the weight dtype via
+    `matmul_kernel_for`, and `sg_gpu_load_model` wraps Q8_0 tensors no-copy and dequantizes
+    the Q8_0 embedding row on the host; the 27B Q8_0 GGUF now loads and decodes coherently
+    on Metal). The 27B's matmul weights are uniformly Q8_0 (loader-enforced) while its norms
+    and DeltaNet scalars stay F32, so per-tensor dispatch resolves to one kernel per model
+    plus the existing F32 small-tensor path. M3.4 (Q8_0 forward vs CPU ref + llama.cpp)
+    pending.
   - M5 (fp16 KV to 262,144 + tiled prefill): M5.1 `kv.c` done; M5.2-M5.7 pending.
   - Bench harness: B1/B3/B4 (pure C) done; B2/B5/B6 (Metal/CLI) and B7 (gated 256K run)
     pending.

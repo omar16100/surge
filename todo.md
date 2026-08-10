@@ -1026,3 +1026,53 @@ busy.
   claiming theoretical unsigned-wrap risk -- both operands are always small (bounded by
   `SG_BENCH_NEEDLE_CODE_MAX`/`CITY_MAX` and realistic `gen` buffer sizes), no practical
   overflow path exists; left as the more idiomatic form.
+
+## M3.2 + M3.3 (merged): per-tensor Q8_0 matmul dispatch + load the Q8_0 GGUF
+
+**What:** made the Metal DECODE path run Q8_0 weights and load the real
+Qwen3.6-27B-Q8_0.gguf (removed the "Q8_0 arrives with M3" reject). M3.1's
+`k_matvec_q8` kernel is now reachable from the batched decode encoder.
+
+**Investigation finding (drove the merge):** `surge-info` + a tensor dump of the
+27B show the matmul weights are UNIFORMLY Q8_0 (token_embd, output/lm_head,
+every blk.N q/k/v/o + ffn + ssm in/out projection), while the small tensors
+(all norms, ssm_conv1d, ssm_dt.bias, ssm_a, ssm_norm) are F32. So the model IS
+dtype-mixed, but the mix is Q8_0-matmul vs F32-small, and the F32-small side was
+already handled by the existing `dense_type` widen path. `sg_model_from_gguf`
+enforces every matmul weight (and output.weight) to equal token_embd's type, so
+the matmul dtype is uniform by construction: per-tensor dispatch resolves to one
+kernel per model. There are no separate batched matvec variants (the plan's
+"twins"); the whole decode path uses one per-row matvec (SG_K_ROWS), so
+KI_MATVEC_Q8 from M3.1 is the only Q8 kernel needed.
+
+**Changes (src/metal.m):**
+- `matmul_kernel_for(sg_tensor_type)` helper: Q8_0->KI_MATVEC_Q8,
+  BF16->KI_MATVEC_BF16, else KI_MATVEC_F32. `g->mat_kernel` now set through it.
+  bf16/f32 selections are byte-identical to before.
+- `gpu_wrap_w`: Q8_0 byte sizing `rows*(cols/32)*34` (verified: the 27B's
+  token_embd wraps to exactly 1350860800 bytes, matching the GGUF directory),
+  with a cols%32 guard; bf16/f32 sizing unchanged.
+- `gpu_embed_row`: Q8_0 branch mirroring ref.c's `wrow` (same f16 scale decode,
+  same scale*int8 in f32) so the host embedding row is bit-identical to the CPU
+  reference; added `gpu_f16_to_f32` (bit-identical to ref.c's f16_to_f32).
+- `gpu_check_model`: accept SG_T_Q8_0 wtype (removed the reject); early
+  hidden%32 guard for a clear message.
+
+**Changes (tests/test_gpu_fwd.c):** replaced `q8_is_rejected` with
+`q8_loads_and_decodes` (env-guarded by SURGE_GGUF): loads the Q8_0 model on
+Metal, decodes 8 tokens, asserts finite logits, in-vocab argmaxes, and >= 2
+distinct tokens (degenerate-output guard).
+
+**Gate results:**
+- 27B Q8_0 loads on Metal; `surge -p "The capital of France is" -n 32` decodes
+  " Paris. ... That is correct. Paris is the capital and most populous city of
+  France. It is located in the north-central part of the" (coherent).
+- make check exit 0 (all suites 0 failures); the M2 mini gate
+  (mini_st bf16 + mini_gguf f32) still byte-exact vs ref, worst rel 1.299e-06
+  (unchanged). make debug (SURGE_NO_METAL, ASan/UBSan) exit 0, no diagnostics.
+- SURGE_GGUF=<27B> test_gpu_fwd.bin: q8_loads_and_decodes passes, 88 checks 0
+  failures, ids 5328 3300 264 15352 11 2923 13909 28253.
+
+**Not done (out of scope):** M3.4 rigorous numeric gate (Q8_0 forward vs CPU
+ref byte-exact + vs llama.cpp top-1). M5.2 fp16-KV refit is untouched (decode
+still uses the M2 inline f32 KV; Q8_0 is orthogonal to KV dtype).

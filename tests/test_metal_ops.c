@@ -94,6 +94,19 @@ static gbuf gb_from_u16(const uint16_t *src, uint64_t n) {
     return r;
 }
 
+/* Raw bytes (a Q8_0 tensor) into a device buffer. gbuf.n is a FLOAT count
+ * (gb_poison is its only reader), so round the byte count up to a float count,
+ * the same way gb_from_u16 does for uint16 weights. */
+static gbuf gb_from_u8(const void *src, uint64_t nbytes) {
+    gbuf r = {NULL, NULL, (nbytes + 3) / 4};
+    void *host = NULL;
+    sg_err e = sg_gpu_alloc(g_gpu, nbytes, &r.b, &host);
+    if (sg_failed(e)) { fprintf(stderr, "FATAL: %s\n", e.msg); exit(2); }
+    r.h = (float *)host;
+    memcpy(host, src, (size_t)nbytes);
+    return r;
+}
+
 static void gb_free(gbuf *b) { sg_gpu_buf_free(b->b); b->b = NULL; b->h = NULL; }
 
 /* Fill an output buffer with a pattern no kernel would produce, so a
@@ -170,6 +183,35 @@ static uint16_t f32_to_bf16(float f) {
     uint32_t lsb = (b >> 16) & 1u;
     b += 0x7FFFu + lsb;
     return (uint16_t)(b >> 16);
+}
+
+/* Raw uint32 from the same LCG lcg_next draws from, for building byte
+ * patterns (Q8_0 blocks) directly. Shares g_lcg, so it advances the same
+ * stream. */
+static uint32_t lcg_u32(void) {
+    g_lcg = g_lcg * 1664525u + 1013904223u;
+    return g_lcg;
+}
+
+/* Build a synthetic Q8_0 tensor of rows x cols (cols a multiple of 32) into
+ * dst, which must hold rows*(cols/32)*34 bytes. Each block is a 2-byte f16
+ * scale (little-endian) then 32 int8. The scale bit-patterns are positive
+ * finite normals in ~[2^-4, 2^3] (exponent field 11..18, never inf/NaN); the
+ * int8 are any bit pattern. ref.c and the kernel decode these bytes
+ * identically (bytewise f16 -> f32, scale*int8), so this is a valid oracle
+ * for either side. The fixtures top out at 64 columns, so this is the only
+ * way to exercise the reduction tree past its 256-wide first stride. */
+static void build_q8(uint8_t *dst, uint32_t rows, uint32_t cols) {
+    uint32_t blocks = cols / 32u;
+    for (uint32_t r = 0; r < rows; r++) {
+        for (uint32_t b = 0; b < blocks; b++) {
+            uint8_t *blk = dst + ((size_t)r * blocks + b) * 34u;
+            uint16_t sbits = (uint16_t)(0x2C00u + (uint16_t)((lcg_u32() >> 11) & 0x1FFFu));
+            blk[0] = (uint8_t)(sbits & 0xFFu);
+            blk[1] = (uint8_t)(sbits >> 8);
+            for (uint32_t i = 0; i < 32u; i++) blk[2u + i] = (uint8_t)(lcg_u32() >> 24);
+        }
+    }
 }
 
 /* --------------------------------------------------------------------
@@ -365,6 +407,53 @@ static void metal_matvec_matches_ref(void) {
     if (gpu_run("k_matvec_f32", &a3, &b3, &o3, p3)) check_rel("matvec_f32 (q_proj 256x48)", o3.h, wantf, qrows);
     gb_free(&a3); gb_free(&b3); gb_free(&o3);
     free(wantf);
+}
+
+static void metal_matvec_q8_matches_ref(void) {
+    /* Q8_0 from ops.bin: the SAME 8x64 fixture test_ref_ops.c pins against
+     * numpy. 8 rows, 64 cols = 2 blocks per row, 34 bytes each. The oracle is
+     * sg_ref_matvec_q8 over the identical raw bytes, so any divergence is the
+     * GPU dequant/reduction, nothing else. */
+    uint64_t cols = 0, rows64 = 0;
+    const float *x = fx_f32(&g_ops, "matvec_q8.x", 0, &cols);
+    (void)fx_f32(&g_ops, "matvec_q8.out", 0, &rows64);   /* rows from the ref output */
+    uint32_t rows = (uint32_t)rows64;
+    tt_assert(rows == 8 && cols == 64, "matvec_q8 should be 8x64, got %ux%llu",
+              rows, (unsigned long long)cols);
+    uint64_t wbytes = (uint64_t)rows * (cols / 32) * 34;
+    const void *w = fx_u8(&g_ops, "matvec_q8.w", wbytes);
+
+    float *want = xmalloc(rows * sizeof *want);
+    sg_ref_matvec_q8(w, x, want, rows, (uint32_t)cols);
+
+    gbuf a = gb_from_u8(w, wbytes), b = gb_from(x, cols), o = gb_new(rows);
+    uint32_t p[8] = {rows, (uint32_t)cols, 0, 0, 0, 0, 0, 0};
+    gb_poison(&o);
+    if (gpu_run("k_matvec_q8", &a, &b, &o, p)) check_rel("matvec_q8 (8x64)", o.h, want, rows);
+    gb_free(&a); gb_free(&b); gb_free(&o);
+    free(want);
+
+    /* A larger Q8_0 case the fixture cannot reach: 40 x 1056, 33 blocks per
+     * row, a column count that is a multiple of 32 but not a power of two, so
+     * the strided partial, the ragged tail and the full tree fold all run.
+     * Synthetic blocks that ref.c and the kernel decode identically. */
+    const uint32_t br = 40, bc = 1056;
+    uint64_t bwbytes = (uint64_t)br * (bc / 32) * 34;
+    uint8_t *bw = xmalloc((size_t)bwbytes);
+    float *bx = xmalloc(bc * sizeof *bx);
+    lcg_seed(0x9E37u);
+    build_q8(bw, br, bc);
+    for (uint32_t i = 0; i < bc; i++) bx[i] = lcg_next() * 2.0f;
+
+    float *wantb = xmalloc(br * sizeof *wantb);
+    sg_ref_matvec_q8(bw, bx, wantb, br, bc);
+
+    gbuf a2 = gb_from_u8(bw, bwbytes), b2 = gb_from(bx, bc), o2 = gb_new(br);
+    uint32_t p2[8] = {br, bc, 0, 0, 0, 0, 0, 0};
+    gb_poison(&o2);
+    if (gpu_run("k_matvec_q8", &a2, &b2, &o2, p2)) check_rel("matvec_q8 (40x1056)", o2.h, wantb, br);
+    gb_free(&a2); gb_free(&b2); gb_free(&o2);
+    free(bw); free(bx); free(wantb);
 }
 
 static void metal_softmax_matches_ref(void) {
@@ -919,6 +1008,23 @@ static void metal_reductions_are_deterministic(void) {
     }
     free(w); free(x);
 
+    /* matvec_q8, same width. The fused dequant does not change the reduction
+     * shape, but it is a distinct kernel and reads a distinct buffer type, so
+     * pin its determinism directly. */
+    {
+        const uint32_t rows = 64, cols = 1024;
+        uint64_t wbytes = (uint64_t)rows * (cols / 32) * 34;
+        uint8_t *qw = xmalloc((size_t)wbytes);
+        float *qx = xmalloc(cols * sizeof *qx);
+        build_q8(qw, rows, cols);
+        for (uint32_t i = 0; i < cols; i++) qx[i] = lcg_next() * 4.0f;
+        gbuf a = gb_from_u8(qw, wbytes), b = gb_from(qx, cols), o = gb_new(rows);
+        uint32_t p[8] = {rows, cols, 0, 0, 0, 0, 0, 0};
+        det_check("k_matvec_q8 (64x1024)", "k_matvec_q8", &a, &b, &o, p, NULL, 0);
+        gb_free(&a); gb_free(&b); gb_free(&o);
+        free(qw); free(qx);
+    }
+
     /* matvec_f32 and rmsnorm fold the same tree, so their determinism is not
      * a separate mechanism, but it is a separate kernel and cheap to pin. */
     {
@@ -1059,6 +1165,13 @@ static void metal_rejects_bad_arguments(void) {
     e = sg_gpu_run_op(g_gpu, "k_attn_decode", a.b, b.b, o.b, bad_voff);
     tt_assert(sg_failed(e), "a v_cache offset past the end of b should be rejected");
 
+    /* Q8_0 rows are whole 32-element blocks, so a cols that is not a multiple
+     * of 32 has no valid byte layout; it must be rejected before the size
+     * rule truncates the block count. */
+    uint32_t q8_odd[8] = {8, 40, 0, 0, 0, 0, 0, 0};
+    e = sg_gpu_run_op(g_gpu, "k_matvec_q8", a.b, b.b, o.b, q8_odd);
+    tt_assert(sg_failed(e), "k_matvec_q8 cols not a multiple of 32 should be rejected");
+
     gb_free(&a); gb_free(&b); gb_free(&o);
 
     /* sg_gpu_wrap must refuse a pointer it cannot bind: setBuffer:offset:
@@ -1132,6 +1245,7 @@ int main(void) {
     tt_run("metal_rmsnorm_matches_ref", metal_rmsnorm_matches_ref);
     tt_run("metal_rope_matches_ref", metal_rope_matches_ref);
     tt_run("metal_matvec_matches_ref", metal_matvec_matches_ref);
+    tt_run("metal_matvec_q8_matches_ref", metal_matvec_q8_matches_ref);
     tt_run("metal_softmax_matches_ref", metal_softmax_matches_ref);
     tt_run("metal_elementwise_match_ref", metal_elementwise_match_ref);
     tt_run("metal_conv1d_step_matches_ref", metal_conv1d_step_matches_ref);

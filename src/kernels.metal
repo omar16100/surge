@@ -223,6 +223,52 @@ kernel void k_matvec_f32(device const float *w [[buffer(0)]],
     if (lid == 0u) y[row] = s;
 }
 
+/* Q8_0 dequant fused into the matvec. The weight buffer is the RAW Q8_0
+ * tensor bytes: row R begins at byte R * (cols/32) * 34, and each 34-byte
+ * block is an f16 scale (little-endian) followed by 32 int8, so the
+ * dequantized weight for column c is scale(block c/32) * int8[c mod 32].
+ * This is exactly ref.c's sg_ref_matvec_q8 layout.
+ *
+ * Same shape as k_matvec_bf16 -- one threadgroup per output row, thread `lid`
+ * strides c = lid, lid+256, ... into a private f32 accumulator, then the 256
+ * partials fold through the fixed tg_sum tree -- so its parity (~1e-7 vs the
+ * double-accumulating ref) and its determinism (no atomics, no simd_sum)
+ * carry over unchanged. The one addition is the dequant: the scale's two
+ * bytes are read individually (no alignment assumption on the buffer) and
+ * bit-cast through `half`, which is the same IEEE binary16->binary32 widening
+ * ref.c's f16_to_f32 performs, so the decoded scale is bit-identical on both
+ * sides; the int8 is read as a signed `char`.
+ *
+ * NOTE the accumulation is per-ELEMENT (scale*int8*x summed straight into
+ * acc), where ref.c sub-accumulates one block's int8*x before multiplying by
+ * the scale. The two differ only in f32-vs-f64 rounding order, the same
+ * ~n*2^-24 relative gap every reduction kernel in this file has against ref;
+ * it is far inside the Q8_0 matvec's 2e-2 tolerance. */
+kernel void k_matvec_q8(device const uchar *w  [[buffer(0)]],
+                        device const float *x  [[buffer(1)]],
+                        device float *y        [[buffer(2)]],
+                        constant uint *p       [[buffer(3)]],
+                        uint row [[threadgroup_position_in_grid]],
+                        uint lid [[thread_position_in_threadgroup]])
+{
+    uint rows = p[0], cols = p[1];
+    if (row >= rows) return;
+
+    threadgroup float red[SG_TG];
+    uint blocks = cols / 32u;
+    device const uchar *wr = w + (size_t)row * blocks * 34u;
+    float acc = 0.0f;
+    for (uint c = lid; c < cols; c += SG_TG) {
+        device const uchar *blk = wr + (size_t)(c >> 5) * 34u;   /* block c / 32 */
+        ushort sbits = (ushort)blk[0] | ((ushort)blk[1] << 8);   /* f16, little-endian */
+        float scale = float(as_type<half>(sbits));
+        char q = as_type<char>(blk[2u + (c & 31u)]);             /* signed int8 */
+        acc += scale * (float)q * x[c];
+    }
+    float s = tg_sum(red, lid, acc);
+    if (lid == 0u) y[row] = s;
+}
+
 /* =====================================================================
  * Softmax, single threadgroup, tree max then tree sum
  * ===================================================================== */

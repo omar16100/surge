@@ -73,15 +73,15 @@ typedef struct {
 
 /* sg_gpu.pipes is indexed by position here, so the enum and the table must
  * stay in lockstep; the static assert below is what enforces that. The first
- * twelve are Task 9's per-op kernels, reachable through sg_gpu_run_op; the
- * rest are Task 10's fused/strided variants, which take buffer layouts
- * sg_gpu_run_op has no size rule for and are therefore encoded only by
- * sg_gpu_forward. */
+ * thirteen are Task 9 / M3.1's per-op kernels, reachable through
+ * sg_gpu_run_op; the rest are Task 10's fused/strided variants, which take
+ * buffer layouts sg_gpu_run_op has no size rule for and are therefore encoded
+ * only by sg_gpu_forward. */
 enum {
     KI_RMSNORM = 0, KI_RMSNORM_GATED, KI_ROPE, KI_MATVEC_BF16, KI_MATVEC_F32,
-    KI_SOFTMAX, KI_SWIGLU, KI_SILU, KI_GATE_SIGMOID, KI_ATTN, KI_CONV1D,
-    KI_DELTA, KI_RMSNORM_HEADS, KI_ROPE_HEADS, KI_GATE_STRIDED, KI_SCALE,
-    KI_ADD, KI_DELTA_GATES, KI_DELTA_MULTI, KI_COUNT
+    KI_MATVEC_Q8, KI_SOFTMAX, KI_SWIGLU, KI_SILU, KI_GATE_SIGMOID, KI_ATTN,
+    KI_CONV1D, KI_DELTA, KI_RMSNORM_HEADS, KI_ROPE_HEADS, KI_GATE_STRIDED,
+    KI_SCALE, KI_ADD, KI_DELTA_GATES, KI_DELTA_MULTI, KI_COUNT
 };
 
 static const sg_kernel_desc SG_KERNELS[] = {
@@ -90,6 +90,7 @@ static const sg_kernel_desc SG_KERNELS[] = {
     { "k_rope",                SG_K_ELEM    },
     { "k_matvec_bf16",         SG_K_ROWS    },
     { "k_matvec_f32",          SG_K_ROWS    },
+    { "k_matvec_q8",           SG_K_ROWS    },
     { "k_softmax",             SG_K_TG1     },
     { "k_swiglu",              SG_K_ELEM    },
     { "k_silu",                SG_K_ELEM    },
@@ -517,6 +518,13 @@ static sg_err check_sizes(const char *kernel, const sg_gpu_buf *a, const sg_gpu_
     } else if (strcmp(kernel, "k_matvec_f32") == 0) {
         ok = mul_ck(p[0], p[1], &t0) && mul_ck(t0, f, &need_a) &&
              mul_ck(p[1], f, &need_b) && mul_ck(p[0], f, &need_o);
+    } else if (strcmp(kernel, "k_matvec_q8") == 0) {
+        /* Weight is rows * (cols/32) Q8_0 blocks of 34 bytes each; x is cols
+         * floats, y is rows floats. cols is a nonzero multiple of 32, which
+         * check_params enforces before this runs, so p[1]/32 is the exact
+         * block count and does not truncate. */
+        ok = mul_ck(p[0], p[1] / 32u, &t0) && mul_ck(t0, 34, &need_a) &&
+             mul_ck(p[1], f, &need_b) && mul_ck(p[0], f, &need_o);
     } else if (strcmp(kernel, "k_softmax") == 0 || strcmp(kernel, "k_silu") == 0) {
         ok = mul_ck(p[0], f, &need_a);
         need_o = need_a;
@@ -566,7 +574,15 @@ static sg_err check_sizes(const char *kernel, const sg_gpu_buf *a, const sg_gpu_
 
 /* Per-kernel preconditions that are not about buffer sizes. */
 static sg_err check_params(const char *kernel, const uint32_t *p) {
-    if (strcmp(kernel, "k_rope") == 0) {
+    if (strcmp(kernel, "k_matvec_q8") == 0) {
+        /* Q8_0 rows are whole 32-element blocks, so a cols that is not a
+         * multiple of 32 has no valid byte layout; ref.c returns without
+         * touching y in that case, and the kernel would index a truncated
+         * block count. Reject it loudly instead. */
+        if (p[1] == 0 || p[1] % 32 != 0) {
+            return gpu_errf("gpu: k_matvec_q8 cols %u must be a nonzero multiple of 32", p[1]);
+        }
+    } else if (strcmp(kernel, "k_rope") == 0) {
         if (p[1] < 2 || p[1] > p[0] || p[1] % 2 != 0) {
             return gpu_errf("gpu: k_rope rope_dim %u must be even and in [2, head_dim %u]",
                             p[1], p[0]);

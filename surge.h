@@ -616,4 +616,97 @@ void sg_gpu_state_reset(sg_gpu *g);
 sg_err sg_gpu_forward(sg_gpu *g, const sg_model *m, int32_t token, uint32_t pos,
                       const float **logits);
 
+/* ---------------------------------------------------------------------
+ * Standalone KV-cache + DeltaNet-state module (Task M5.1, src/kv.c)
+ * ---------------------------------------------------------------------
+ *
+ * The per-layer decode state of the hybrid model, pulled out of metal.m into
+ * a module that imports NO Metal or Foundation, so it links into pure-C test
+ * binaries (it lives in LIB_SRC). It operates on opaque GPU buffer handles
+ * (the same void* handles sg_gpu_alloc returns) and never dereferences them
+ * itself; it only sizes, allocates, zeroes and hands them out.
+ *
+ * LAYOUT (per the M5 plan and the verified 27B config):
+ *   full-attention layer  ((L+1) % full_attn_interval == 0):
+ *       SEPARATE K and V buffers, each [cap, n_kv_heads, head_dim],
+ *       head-interleaved (position-major, then kv_head, then dim),
+ *       dtype = kv_dtype (SG_T_F16 or SG_T_F32). These GROW with context.
+ *   gated-DeltaNet layer (every other layer):
+ *       conv tail [conv_kernel-1, conv_dim] f32  (conv_dim derived, see below)
+ *       state S   [n_v_heads, head_v_dim, head_k_dim] f32
+ *       Both are FIXED size, independent of context length.
+ *
+ * conv_dim is not an sg_cfg field: it is derived exactly as ref.c/metal.m do,
+ * conv_dim = 2*(n_k_heads*head_k_dim) + (n_v_heads*head_v_dim).
+ *
+ * The layer kind is decided by the config rule (L+1) % full_attn_interval == 0,
+ * which is the cross-check sg_ref_state_new / sg_gpu_state_new use; sg_kv is
+ * built from an sg_cfg alone (no weight pointers) so it must use that rule.
+ *
+ * ALLOCATION IS INJECTED. src/kv.c cannot call sg_gpu_alloc directly without
+ * dragging the Metal symbols into every pure-C test link. Instead metal.m
+ * registers sg_gpu_alloc / sg_gpu_buf_free / sg_gpu_buf_host here at init via
+ * sg_kv_set_backend; a pure-C test registers a malloc-backed backend. The
+ * size math (sg_kv_bytes / sg_kv_state_bytes) and the f16 round-trip helpers
+ * are pure functions that need no backend and allocate nothing, so CI can
+ * assert the 16 GiB size WITHOUT allocating it. */
+
+#define SG_KV_CAP_DEFAULT 131072u  /* used when sg_kv_new is passed cap == 0 */
+#define SG_KV_CAP_MAX     262144u  /* hard reject above this */
+
+typedef struct sg_kv sg_kv;
+
+/* Pure size math, no allocation. sg_kv_bytes is the total bytes of the
+ * GROWABLE K+V attention cache across all full-attention layers at `cap`
+ * positions in `dtype` (SG_T_F16 -> 2 bytes, SG_T_F32 -> 4). Returns 0 on an
+ * invalid dtype, an implausible dimension (> 1<<24, matching ref.c's ceiling)
+ * or a u64 overflow. sg_kv_state_bytes is the total bytes of the FIXED
+ * DeltaNet state (conv tail + S, always f32) across all DeltaNet layers. */
+uint64_t sg_kv_bytes(const sg_cfg *c, uint32_t cap, sg_tensor_type dtype);
+uint64_t sg_kv_state_bytes(const sg_cfg *c);
+
+/* IEEE-754 binary16 round-trip, round-to-nearest-even, matching Metal's
+ * `half` and the compiler's _Float16 cast bit-for-bit on finite values. Pure,
+ * testable with no GPU. sg_f32_to_f16 flushes overflow to +/-Inf and returns
+ * a quiet NaN (0x7E00 | sign) for a NaN input. */
+uint16_t sg_f32_to_f16(float f);
+float    sg_f16_to_f32(uint16_t h);
+
+/* Allocation backend, injected so src/kv.c carries no Metal link dependency.
+ * The signatures match sg_gpu_alloc / sg_gpu_buf_free / sg_gpu_buf_host, which
+ * is what metal.m registers; a pure-C caller registers a malloc-backed one.
+ * The registered alloc must zero-fill (sg_kv_reset relies on it and so does
+ * a freshly created DeltaNet state). */
+typedef sg_err (*sg_kv_alloc_fn)(sg_gpu *g, uint64_t nbytes, void **buf, void **host);
+typedef void   (*sg_kv_free_fn)(void *buf);
+typedef void  *(*sg_kv_host_fn)(void *buf);
+void sg_kv_set_backend(sg_kv_alloc_fn alloc, sg_kv_free_fn free_, sg_kv_host_fn host);
+
+/* Allocates the per-layer buffers through the registered backend. `g` is
+ * passed straight to the backend's alloc (NULL is fine for a malloc backend).
+ * cap == 0 means SG_KV_CAP_DEFAULT; cap > SG_KV_CAP_MAX is hard-rejected.
+ * kv_dtype must be SG_T_F16 or SG_T_F32 (K/V only; the DeltaNet state is
+ * always f32). Logs per-layer and total bytes. */
+sg_err sg_kv_new(sg_gpu *g, const sg_cfg *c, uint32_t cap,
+                 sg_tensor_type kv_dtype, sg_kv **out);
+void sg_kv_free(sg_kv *kv);
+/* Rewinds to position 0: zeroes every conv tail and S (read unconditionally by
+ * the DeltaNet scan) and leaves the K/V caches untouched (nothing reads past
+ * `used`, and they are 16 GiB). */
+void sg_kv_reset(sg_kv *kv);
+/* Moves `used` forward by n positions. Rejects used+n > cap (overflow). The
+ * cache is append-only and this is the only mutator of `used`, so there is no
+ * way to write a position out of order. */
+sg_err sg_kv_advance(sg_kv *kv, uint32_t n);
+uint32_t sg_kv_used(const sg_kv *kv);
+uint32_t sg_kv_cap(const sg_kv *kv);
+
+/* Buffer-handle getters. Return the opaque handle (as from sg_gpu_alloc), or
+ * NULL when the layer is the wrong kind (k/v NULL on a DeltaNet layer,
+ * conv/s NULL on a full-attention layer) or `layer` is out of range. */
+void *sg_kv_k(const sg_kv *kv, uint32_t layer);
+void *sg_kv_v(const sg_kv *kv, uint32_t layer);
+void *sg_kv_conv(const sg_kv *kv, uint32_t layer);
+void *sg_kv_s(const sg_kv *kv, uint32_t layer);
+
 #endif

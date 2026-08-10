@@ -811,3 +811,34 @@ This is expected at M2 (correctness milestone). The speed target is M4 (kernel e
 dispatches/token, weight repack, autotuned threadgroups). Where surge already wins: decode
 is byte-exact deterministic run-to-run (M2 proved it); mlx-lm is not bit-reproducible at
 depth on this model class. Log: ~/bench_logs/surge_vs_mlx_20260810_130910.
+
+## Task M5.1 Results (kv.c: fp16 growable KV + DeltaNet state module, pure C)
+
+NEW `src/kv.c` + `sg_kv` API in `surge.h`; NEW `tests/test_kv.c`. No Metal/Foundation
+import (stays in LIB_SRC, links into pure-C test binaries). Allocation is INJECTED via
+`sg_kv_set_backend` (metal.m will register sg_gpu_alloc/free/host in M5.2; the test
+registers a malloc backend), so the size math and f16 round-trip are testable with zero
+GPU allocation.
+
+### Layout
+- full-attn layer ((L+1)%full_attn_interval==0): SEPARATE K and V buffers, each
+  [cap, n_kv_heads, head_dim], dtype f16|f32. These grow with context.
+- DeltaNet layer: conv tail [conv_kernel-1, conv_dim] f32 + S [n_v_heads, head_v_dim,
+  head_k_dim] f32, fixed size. conv_dim derived = 2*(n_k_heads*head_k_dim)+(n_v_heads*head_v_dim).
+
+### Gate: PASSED. make check + make debug (ASan/UBSan, SURGE_NO_METAL) both exit 0.
+- sg_kv_bytes(27B, 262144, f16) == 17179869184 (16.00 GiB K+V); @131072 == 8589934592.
+- sg_kv_state_bytes(27B) == 156893184 == 48*((4-1)*10240+48*128*128)*4.
+- f16 round-trip: exhaustive (all 65536 halves round-trip exact) + 400k random samples
+  bit-identical to hardware _Float16 (== Metal `half` RNE).
+- advance rejects used+n>cap (u64 sum, no wrap); reset zeroes conv+S, leaves K/V, used=0.
+- cap>262144 hard-rejected; bad KV dtype rejected; missing backend rejected.
+- CI does NOT allocate 16 GiB (math + tiny malloc buffers only). SURGE_KV_ALLOC=<cap>
+  env path allocates the real 27B shape once on the box (verified: 16.00 GiB reported).
+- 80 checks default / 85 with SURGE_KV_ALLOC, 0 failures.
+
+### Deviation
+- Renamed gguf.c's internal `typedef struct {...} sg_kv` -> `gguf_kv` (name collision with
+  the new public `sg_kv` type). Internal only; all suites still green.
+- sg_kv_bytes returns K+V only (the gate's 17179869184 number); DeltaNet fixed state is
+  sg_kv_state_bytes. sg_kv_new logs both plus the grand total.

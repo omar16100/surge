@@ -48,7 +48,7 @@ typedef struct {
     char *key; /* arena copy, NUL-terminated */
     sg_gguf_kv_type type;
     sg_kv_value v;
-} sg_kv;
+} gguf_kv;
 
 struct sg_gguf {
     void *map;
@@ -56,7 +56,7 @@ struct sg_gguf {
     uint32_t version;
     uint64_t tensor_count;
     uint64_t kv_count;
-    sg_kv *kvs;
+    gguf_kv *kvs;
     sg_tensor *tensors;
     char **arena;
     size_t arena_len;
@@ -281,7 +281,7 @@ static sg_err parse_kv_value(sg_gguf *g, rd_t *r, sg_gguf_kv_type type, sg_kv_va
     return (sg_err){"gguf: invalid kv type"};
 }
 
-static sg_err parse_kv(sg_gguf *g, rd_t *r, sg_kv *kv) {
+static sg_err parse_kv(sg_gguf *g, rd_t *r, gguf_kv *kv) {
     const char *name_ptr;
     uint64_t name_len;
     sg_err e = rd_str_raw(r, &name_ptr, &name_len, "gguf: truncated at kv key length",
@@ -333,7 +333,7 @@ static sg_err parse_tensor_info(sg_gguf *g, rd_t *r, sg_tensor *t, uint64_t *off
     return SG_OK;
 }
 
-static const sg_kv *find_kv(const sg_gguf *g, const char *key) {
+static const gguf_kv *find_kv(const sg_gguf *g, const char *key) {
     if (!g || !key) return NULL;
     for (uint64_t i = 0; i < g->kv_count; i++) {
         if (strcmp(g->kvs[i].key, key) == 0) return &g->kvs[i];
@@ -341,13 +341,13 @@ static const sg_kv *find_kv(const sg_gguf *g, const char *key) {
     return NULL;
 }
 
-/* Same lookup, but through a mutable path: g->kvs is `sg_kv *` (non-const
+/* Same lookup, but through a mutable path: g->kvs is `gguf_kv *` (non-const
  * pointee), so indexing it is legal even when reached via a `const sg_gguf *`
  * (C's const only applies one level deep). Used by sg_gguf_get_arr_str to
  * lazily populate the per-key string-array cache behind the const-correct
  * public API; the underlying sg_gguf is always heap-allocated by
  * sg_gguf_open, never truly const, so this is well-defined. */
-static sg_kv *find_kv_mut(const sg_gguf *g, const char *key) {
+static gguf_kv *find_kv_mut(const sg_gguf *g, const char *key) {
     if (!g || !key) return NULL;
     for (uint64_t i = 0; i < g->kv_count; i++) {
         if (strcmp(g->kvs[i].key, key) == 0) return &g->kvs[i];
@@ -493,21 +493,21 @@ void sg_gguf_close(sg_gguf *g) {
 }
 
 bool sg_gguf_get_u32(const sg_gguf *g, const char *key, uint32_t *out) {
-    const sg_kv *kv = find_kv(g, key);
+    const gguf_kv *kv = find_kv(g, key);
     if (!kv || kv->type != SG_GGUF_U32 || !out) return false;
     *out = kv->v.u32;
     return true;
 }
 
 bool sg_gguf_get_f32(const sg_gguf *g, const char *key, float *out) {
-    const sg_kv *kv = find_kv(g, key);
+    const gguf_kv *kv = find_kv(g, key);
     if (!kv || kv->type != SG_GGUF_F32 || !out) return false;
     *out = kv->v.f32;
     return true;
 }
 
 bool sg_gguf_get_str(const sg_gguf *g, const char *key, const char **out) {
-    const sg_kv *kv = find_kv(g, key);
+    const gguf_kv *kv = find_kv(g, key);
     if (!kv || kv->type != SG_GGUF_STR || !out) return false;
     *out = kv->v.str;
     return true;
@@ -515,7 +515,7 @@ bool sg_gguf_get_str(const sg_gguf *g, const char *key, const char **out) {
 
 bool sg_gguf_get_arr(const sg_gguf *g, const char *key, sg_gguf_kv_type *elem_type,
                      const void **data, uint64_t *count) {
-    const sg_kv *kv = find_kv(g, key);
+    const gguf_kv *kv = find_kv(g, key);
     if (!kv || kv->type != SG_GGUF_ARR) return false;
     if (elem_type) *elem_type = kv->v.arr.elem_type;
     if (data) *data = kv->v.arr.data;
@@ -529,7 +529,7 @@ bool sg_gguf_get_arr(const sg_gguf *g, const char *key, sg_gguf_kv_type *elem_ty
  * revisit if/when model loading or tokenization is ever parallelized. */
 bool sg_gguf_get_arr_str(const sg_gguf *g, const char *key, uint64_t i, const char **out) {
     if (!out) return false;
-    sg_kv *kv = find_kv_mut(g, key);
+    gguf_kv *kv = find_kv_mut(g, key);
     if (!kv || kv->type != SG_GGUF_ARR || kv->v.arr.elem_type != SG_GGUF_STR) return false;
     if (i >= kv->v.arr.count) return false;
 
@@ -594,7 +594,7 @@ bool sg_gguf_kv_at(const sg_gguf *g, uint64_t i, const char **key_out, sg_gguf_k
 bool sg_gguf_kv_scalar_at(const sg_gguf *g, uint64_t i, sg_gguf_kv_type *type_out,
                           int64_t *int_out, double *float_out, bool *bool_out) {
     if (!g || i >= g->kv_count) return false;
-    const sg_kv *kv = &g->kvs[i];
+    const gguf_kv *kv = &g->kvs[i];
     if (type_out) *type_out = kv->type;
 
     switch (kv->type) {

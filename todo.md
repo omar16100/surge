@@ -842,3 +842,74 @@ GPU allocation.
   the new public `sg_kv` type). Internal only; all suites still green.
 - sg_kv_bytes returns K+V only (the gate's 17179869184 number); DeltaNet fixed state is
   sg_kv_state_bytes. sg_kv_new logs both plus the grand total.
+
+## Task B1 Results (bench.c: decode-by-slope + leaderboard-row formatter, pure C)
+
+NEW `src/bench.c` + `sg_bench_row` struct and `sg_bench_*` decls in `surge.h`; NEW
+`tests/test_bench.c`. No Metal/GPU import, links into every pure-C test binary via the
+Makefile's existing `src/*.c` wildcard (verified, no Makefile change needed for that part).
+Added a `surge-bench` Makefile stub target (fails with a clear message pointing at Task B5,
+so `make surge-bench` does not error with "No rule to make target" before B5 exists).
+
+### What it does
+- `sg_bench_slope`: least-squares slope of token index (y) vs cumulative wall time (x) over
+  [warmup, n), tokens/sec. Mean-centered two-pass OLS, not the textbook one-pass
+  normal-equation form (see Deviation below).
+- `sg_bench_avg_tps`: mlx-lm-style average, (n-1-warmup)/(t[n-1]-t[warmup]).
+- `sg_bench_default_warmup`: max(1, round(0.02*n_gen)).
+- `sg_bench_row`: the 17-field leaderboard row struct exactly as specified.
+- `sg_bench_format_md_row`: the 8-column pipe row matching the live doc's header
+  (`/Users/macmini/projects/llm-rnd/docs/256k_comparison.md`): model, engine, prefill_tps
+  ("-" if <0), decode_tps_slope, peak_ram_gib "GiB", recall_hits/recall_total, wall as whole
+  minutes, status.
+- `sg_bench_format_json`: flat JSON object of every field, JSON-escaped strings.
+- `sg_bench_finalize_status`: status="DONE" iff gemm_tflops>20.5 && ingestion_ok, else "VOID".
+
+### Gate: PASSED. make check + make debug (ASan/UBSan, SURGE_NO_METAL) both exit 0.
+- (a) exact-linear 5.0 tok/s series: slope and avg both within 1e-9 relative of 5.0, and of
+  each other.
+- (b) jittered series (+/-15%, n=2000, seeded xorshift64): |slope-avg| < 3%.
+- (c) warmup=1 provably drops index 0: corrupting t[0] leaves slope(warmup=1) bit-identical
+  (it never reads index 0), while slope(warmup=0) on the same corrupted array visibly departs
+  from the true rate, proving the exclusion is real and not a no-op.
+- (d) sg_bench_format_md_row byte-equals two checked-in golden strings (a DONE row and a VOID
+  row, plus the "-" no-prefill case), including a NULL-row and zero-cap safety check.
+- (e) JSON round-trip: every numeric field is parsed back out of the emitted JSON with
+  strtod/strtoull and compared to the source (not just substring-matched); a separate test
+  proves quote/backslash/control-byte escaping keeps the object well-formed.
+- (f) status auto-set: 7 cases incl. the exact-20.5 boundary (VOID, since the rule is
+  strictly ">") and the next float ULP above it (DONE).
+- 65 checks, 0 failures in test_bench.bin; 11/11 suites `0 failures` under `make check`; 9
+  non-Metal-guarded suites `0 failures` under `make debug`, no ASan/UBSan diagnostics.
+- `-Wall -Wextra -Werror` clean on src/bench.c standalone and on the full test link. No em
+  dashes.
+
+### Deviation (codex gpt-5.5 review round, applied before commit)
+- **Numerical fix (major):** the first draft used the textbook one-pass OLS normal-equation
+  form (N*sum(xy)-sum(x)*sum(y)) / (N*sum(x^2)-sum(x)^2). Codex found this catastrophically
+  unstable at realistic epoch-scale timestamps: surge.h documents t_wall_cum as "any epoch",
+  and a caller passing raw seconds-since-1970 (~1.8e9) hit exactly that case -- verified in
+  Python that the one-pass form returns a NEGATIVE slope on an EXACT 5.0 tok/s series at that
+  offset, because sum_xx and sum_x^2 both land within a few ULPs of N*epoch^2 and the
+  subtraction that should recover the tiny O(N) signal instead returns noise. Fixed by
+  switching to a mean-centered two-pass form (subtract the mean from x and y before any
+  squaring), which removes the large common offset before precision loss can happen. New
+  regression test `test_slope_epoch_offset` pins bases {0, 1e6, 1e9, 1.8e9} all within 1e-6
+  relative of the true rate.
+- **Buffer-safety hardening (major):** the formatters passed `sg_bench_row`'s fixed char
+  arrays to `%s` with no bounded precision, so a caller that ever left one un-NUL-terminated
+  could read past the struct. Added `%.63s`/`%.15s` precision bounds matching each array's
+  capacity in `sg_bench_format_md_row`, and documented the NUL-termination contract on
+  `sg_bench_row` in surge.h.
+- **JSON escaping (minor, applied anyway):** string fields were emitted unescaped. Added
+  `bench_json_escape` (quote, backslash, control bytes as \u00XX) so a model name or log_id
+  containing a quote cannot produce invalid JSON. New test `test_format_json_escaping`.
+- **Noted, not changed:** the live doc's CURRENT table has a leading `#` numbering column
+  (`| # | model | engine | ... |`), which is not part of the 8-column header text quoted in
+  the B1 task spec. sg_bench_format_md_row follows the task spec's quoted 8-column header
+  verbatim (model first, no index). Whoever appends a row to the live doc (Task B7) needs to
+  prepend the `#` cell by hand, or B5/B7 needs to decide whether the formatter should grow a
+  9th column -- flagged for that task rather than guessed here.
+- Locale sensitivity (minor, not fixed): `%.2f`/`%.1f`/`%.6g` are locale-dependent if the
+  process ever calls `setlocale`; no `setlocale` exists anywhere in this repo today, so this
+  is a documented risk, not an active bug.

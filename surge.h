@@ -709,4 +709,99 @@ void *sg_kv_v(const sg_kv *kv, uint32_t layer);
 void *sg_kv_conv(const sg_kv *kv, uint32_t layer);
 void *sg_kv_s(const sg_kv *kv, uint32_t layer);
 
+/* ---------------------------------------------------------------------
+ * Bench math (Task B1, src/bench.c)
+ * ---------------------------------------------------------------------
+ *
+ * PURE C, no Metal, no GPU, no Foundation -- safe to build and test while
+ * the GPU is busy running the 256K comparison loop. Two curve-fit helpers
+ * over a per-token cumulative-wall-time series, a leaderboard-row struct,
+ * and formatters matching the live doc's table
+ * (/Users/macmini/projects/llm-rnd/docs/256k_comparison.md): decode t/s
+ * is measured by SLOPE (least-squares fit of token index against wall
+ * time) as the headline number, with the mlx-lm-style endpoint average
+ * also exposed so B6 can cross-check the two against each other.
+ *
+ * t_wall_cum[i] is the WALL-CLOCK TIME (seconds, monotonic, any epoch) at
+ * which token i finished; t_wall_cum[0] is the time of the FIRST
+ * generated token, not zero. `warmup` excludes indices [0, warmup) from
+ * both fits: the first token after prefill carries a one-time
+ * command-buffer/dispatch transient that is not representative of
+ * steady-state decode, so both helpers only look at [warmup, n). */
+
+/* Least-squares slope of token INDEX (y) against cumulative wall time (x)
+ * over i in [warmup, n): fits index = slope*time + b and returns slope, in
+ * tokens/second. Needs at least 2 points after warmup; returns 0.0 if
+ * n <= warmup, n - warmup < 2, t_wall_cum is NULL, or the fit is
+ * degenerate (every remaining timestamp identical). Double accumulators
+ * throughout, mean-centered (not the textbook one-pass normal-equation
+ * form) so the result stays accurate at realistic epoch-scale offsets
+ * (~1e9, e.g. raw gettimeofday() seconds), which the one-pass form loses
+ * to catastrophic cancellation; see the comment in bench.c. */
+double sg_bench_slope(const double *t_wall_cum, uint32_t n, uint32_t warmup);
+
+/* The mlx-lm-style average: (n-1-warmup) tokens divided by the wall time
+ * between t_wall_cum[warmup] and t_wall_cum[n-1], endpoint-to-endpoint, no
+ * fit. Returns 0.0 on the same degenerate inputs as sg_bench_slope
+ * (t_wall_cum NULL, n == 0, warmup >= n-1, or t_wall_cum[n-1] <=
+ * t_wall_cum[warmup]). */
+double sg_bench_avg_tps(const double *t_wall_cum, uint32_t n, uint32_t warmup);
+
+/* Default warmup when the caller has no opinion: max(1, round(0.02*n_gen)).
+ * Always >= 1, so index 0's dispatch-cost transient is never counted. */
+uint32_t sg_bench_default_warmup(uint32_t n_gen);
+
+/* One leaderboard row: everything sg_bench_format_md_row / _json need to
+ * emit a comparable line, and everything B5's CLI measures in one run.
+ * Fixed-size char arrays (no ownership, no free), so a row is copyable and
+ * embeddable in a fixed-size log struct. Every char array MUST be
+ * NUL-terminated by whoever fills the row in (snprintf into it, never a
+ * raw strcpy/memcpy of untrusted length) -- the two formatters defend
+ * against a missing NUL with a bounded %s precision matching each array's
+ * capacity, but that is a second line of defense, not a substitute. */
+typedef struct {
+    char model[64];
+    char engine[64];
+    double prefill_tps;        /* < 0 means "not measured" -> "-" in the md row */
+    double decode_tps_slope;   /* sg_bench_slope's result */
+    double decode_tps_avg;     /* sg_bench_avg_tps's result */
+    double peak_ram_gib;       /* process phys_footprint peak, Task B2 */
+    double gpu_alloc_gib;      /* Metal currentAllocatedSize peak, Task B2 */
+    uint32_t recall_hits;      /* NIAH direct-retrieval hits, Task B4 */
+    uint32_t recall_total;     /* 8 in this project's NIAH needle set */
+    uint32_t assoc_hits;       /* NIAH associative-recall hits, Task B4 */
+    uint64_t n_prompt_tok;     /* tokens actually ingested */
+    uint32_t n_gen;            /* tokens generated */
+    double wall_s;             /* total wall time, prefill+decode, seconds */
+    double gemm_tflops;        /* fresh GEMM gate reading before this run */
+    bool ingestion_ok;         /* Task B3's truncation guard result */
+    char status[16];           /* "DONE" or "VOID"; sg_bench_finalize_status sets it */
+    char log_id[96];           /* e.g. ctx256k_qwen27b_surge_20260811_120000 */
+} sg_bench_row;
+
+/* Formats the 8-column pipe row matching the live doc's header:
+ *   | model | engine | 256K prefill t/s | decode t/s | peak RAM | recall | wall | status |
+ * In that order: model, engine, prefill_tps ("%.0f", or "-" if < 0),
+ * decode_tps_slope ("%.2f"), peak_ram_gib ("%.1f GiB"),
+ * "recall_hits/recall_total", wall_s as whole minutes ("%ld min",
+ * lround(wall_s/60)), status. Writes via snprintf (truncates rather than
+ * overflowing buf); a NULL row or zero cap writes nothing / an empty
+ * string. */
+void sg_bench_format_md_row(const sg_bench_row *row, char *buf, size_t cap);
+
+/* A flat JSON object of every field, key names matching the struct field
+ * names verbatim. Numbers at "%.6g" (round-trips a double to display
+ * precision, not bit-exact); ingestion_ok as a JSON bool; string fields
+ * (model, engine, status, log_id) are JSON-escaped (quote, backslash, and
+ * control bytes as \u00XX) so the output stays valid JSON even if one of
+ * them ever contains a quote. snprintf-truncates into cap like the md
+ * formatter. */
+void sg_bench_format_json(const sg_bench_row *row, char *buf, size_t cap);
+
+/* Applies the leaderboard admission rule in place: status = "DONE" iff
+ * gemm_tflops > 20.5 AND ingestion_ok, else "VOID". This is the ONE place
+ * that rule lives; callers (B5's CLI, B7's recipe) must call this rather
+ * than setting status themselves. */
+void sg_bench_finalize_status(sg_bench_row *row);
+
 #endif

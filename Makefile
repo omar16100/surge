@@ -51,6 +51,16 @@ surge: src/cli_metal.c $(LIB_SRC) src/metal.m $(METALLIB)
 	$(CC) $(CFLAGS) $(METAL_DEFS) -o $@ src/cli_metal.c src/metal.m \
 	  $(LIB_SRC) $(FRAMEWORKS) $(LDLIBS)
 
+# surge-bench CLI stub (Task B1). src/bench.c's math (this task) already
+# links into LIB_SRC via the src/*.c wildcard above and is exercised by
+# tests/test_bench.c; the CLI itself (src/cli_bench.c, wiring B1-B4 plus the
+# forward pass) is Task B5. This placeholder keeps `make surge-bench` from
+# failing with "No rule to make target" in the meantime.
+.PHONY: surge-bench
+surge-bench:
+	@echo "surge-bench: CLI not built yet (Task B5); src/bench.c math is in LIB_SRC now" >&2
+	@exit 1
+
 # `debug` must DELETE the test binaries first. Without that, a preceding
 # `make check` leaves them newer than the sources, make considers them up to
 # date (it does not track CFLAGS), and `make debug` cheerfully re-runs the

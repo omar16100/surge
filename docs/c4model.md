@@ -66,14 +66,18 @@ optionally Accelerate for the CPU reference path. No third-party libraries.
   M1 gate: 100% top-1 vs mlx-lm on Qwen3.5-2B. M2 gate: byte-exact Metal-vs-ref greedy.
   Decode ~76 tok/s on the 2B bf16; measured at 0.57x of mlx-lm (speed is M4's milestone).
 - **In progress (branch `feat/m3-m5`):**
-  - M3 (Q8_0 weights end-to-end): M3.1 `k_matvec_q8` done; M3.2+M3.3 done (merged: the
+  - M3 (Q8_0 weights end-to-end): DONE. M3.1 `k_matvec_q8`; M3.2+M3.3 (merged: the
     decode encoder selects the matvec kernel from the weight dtype via
     `matmul_kernel_for`, and `sg_gpu_load_model` wraps Q8_0 tensors no-copy and dequantizes
     the Q8_0 embedding row on the host; the 27B Q8_0 GGUF now loads and decodes coherently
     on Metal). The 27B's matmul weights are uniformly Q8_0 (loader-enforced) while its norms
     and DeltaNet scalars stay F32, so per-tensor dispatch resolves to one kernel per model
-    plus the existing F32 small-tensor path. M3.4 (Q8_0 forward vs CPU ref + llama.cpp)
-    pending.
+    plus the existing F32 small-tensor path. M3.4 (Q8_0 forward numeric gate) DONE: on the
+    27B Q8_0 GGUF, (A) surge Metal Q8_0 vs surge CPU-ref Q8_0 teacher-forced over 68
+    positions is 100% top-1 (max |logit delta| 1.6e-5, no near-tie flips), and (B) surge
+    greedy is byte-identical to llama.cpp (llama-simple) on 4 prompts with tokenizer parity.
+    Gate is `make gate` (manual, needs the 28 GB GGUF + llama.cpp + one ~11 min CPU forward,
+    never in `make check`); regression fixtures frozen under `tests/fixtures/m3q8/`.
   - M5 (fp16 KV to 262,144 + tiled prefill): M5.1 `kv.c` done; M5.2-M5.7 pending.
   - Bench harness: B1/B3/B4 (pure C) done; B2/B5/B6 (Metal/CLI) and B7 (gated 256K run)
     pending.

@@ -13,6 +13,8 @@ surge
 m2out/
 tests/fixtures/m1/*.full.f32
 tests/fixtures/m1/dumps.json
+# M3.4 gate (A) full logit dumps: ~64 MB per path; only the digest is committed
+tests/fixtures/m3q8/*.full.f32
 # Metal build artifacts (rebuilt from src/kernels.metal by `make`)
 src/kernels.air
 src/kernels.metallib

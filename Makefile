@@ -61,6 +61,25 @@ surge-bench:
 	@echo "surge-bench: CLI not built yet (Task B5); src/bench.c math is in LIB_SRC now" >&2
 	@exit 1
 
+# --- M3.4 Q8_0 forward correctness gate (manual, NOT wired into `make check`)
+#
+# Proves surge's Metal Q8_0 decode of the 27B GGUF is NUMERICALLY correct, not
+# just coherent. Two gates (see tools/gate_q8.sh):
+#   (A) surge Metal Q8_0 vs surge CPU-ref Q8_0, teacher-forced, 100% top-1.
+#   (B) surge greedy vs llama.cpp (llama-simple) greedy, no early divergence.
+# Slow (one scalar-C 27B CPU forward ~10 min) and needs the 28 GB GGUF plus
+# llama.cpp, so it stays a manual/env-gated target -- `make check` never runs
+# it. Override GGUF=/path or PY=/interp; FREEZE=1 re-freezes the digest.
+GGUF ?= /Users/macmini/models/gguf/Qwen3.6-27B-Q8_0.gguf
+PY   ?= /Users/macmini/models/dsv4-venv/bin/python
+.PHONY: gate gate-a gate-b
+gate: surge surge-ref
+	@FREEZE=$(FREEZE) bash tools/gate_q8.sh "$(GGUF)" "$(PY)"
+gate-a: surge surge-ref
+	$(PY) tools/tf_compare_q8.py --gguf "$(GGUF)" $(if $(FREEZE),--freeze,)
+gate-b: surge
+	$(PY) tools/xcheck_llama_q8.py --gguf "$(GGUF)"
+
 # `debug` must DELETE the test binaries first. Without that, a preceding
 # `make check` leaves them newer than the sources, make considers them up to
 # date (it does not track CFLAGS), and `make debug` cheerfully re-runs the

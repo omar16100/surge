@@ -1076,3 +1076,40 @@ distinct tokens (degenerate-output guard).
 **Not done (out of scope):** M3.4 rigorous numeric gate (Q8_0 forward vs CPU
 ref byte-exact + vs llama.cpp top-1). M5.2 fp16-KV refit is untouched (decode
 still uses the M2 inline f32 KV; Q8_0 is orthogonal to KV dtype).
+
+## M3.4: Q8_0 forward NUMERIC correctness gate (M3 DONE)
+
+**What:** two gates on Qwen3.6-27B-Q8_0.gguf proving the Metal Q8_0 decode is
+correct, not just coherent. No C sources changed: `surge` and `surge-ref`
+already carry `--logits` (per-position teacher-forced f32 dumps), so this is
+tooling + fixtures + gate wiring only.
+
+**Gate A (surge Metal Q8_0 vs surge CPU-ref Q8_0, teacher-forced):** ONE
+forward over a fixed 68-token prompt on each path (Metal 7.4 s; scalar CPU
+689 s = 10.1 s/pos, pure-C `sg_ref_matvec_q8` double accumulate, no Accelerate
+needed). Result: 68/68 (100.00%) top-1, max |logit delta| 1.5736e-05, mean
+8.0406e-07, ZERO near-tie disagreements. Min top1-top2 gap over all positions
+1.98e-2 = ~1260x the max logit delta, so no position could flip -> agreement is
+robust, not fragile.
+
+**Gate B (surge greedy vs llama.cpp greedy, same GGUF, -n 32, 4 prompts):**
+4/4 byte-IDENTICAL completions; tokenizer parity (llama-tokenize) OK on all 4
+(no BOS, add_bos_token=false); 0 early divergences. Uses `llama-simple` (all
+65/65 layers on Metal, temp 0), NOT `llama-cli` (b10200 llama-cli defaults to
+an interactive jinja/thinking UI, unusable for a raw-prompt A/B). llama exposes
+no gen-token-id stream, so B compares completion TEXT; tokenizer parity +
+shared vocab => identical text == identical ids.
+
+**New files:** tools/tf_compare_q8.py (A), tools/xcheck_llama_q8.py (B),
+tools/gate_q8.sh (driver, refuses if a GPU bench is running), Makefile
+`gate`/`gate-a`/`gate-b` (GGUF/PY overridable; FREEZE=1; NOT in `make check`),
+tests/fixtures/m3q8/ (metal_digest.f32 = Metal per-position digest, deterministic
+regression anchor, M1 layout; ids.txt self-describing; result.json; xcheck.json),
+.gitignore excludes tests/fixtures/m3q8/*.full.f32 (~64 MB dumps), docs/
+11082026_m34_q8_gate.md + docs/index.md row + c4model.md status.
+
+**Re-run:** `make gate` (regression vs frozen digest + gate B),
+`make gate FREEZE=1` (re-freeze), `make gate-b` (fast cross-check only).
+
+**Green build:** make check 13 suites 0 failures + make debug 51 checks 0
+sanitizer diagnostics, both exit 0 (unchanged; no C sources touched).

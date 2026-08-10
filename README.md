@@ -18,8 +18,11 @@ even try](https://omarshabab.com/mac-studio-firmware-gpu-limiter/), and the
 benchmark harness at
 [llm-benchmark](https://github.com/omar16100/llm-benchmark).
 
-Status: design phase. First target: Qwen3.6-27B dense at 8-bit, with the
-stated bar of beating mlx-lm single-stream decode on the same quant on this
-hardware. Design spec: `docs/superpowers/specs/2026-08-08-surge-design.md`.
+Status: M0-M2 complete (loads hybrid qwen3_5 GGUF+safetensors, CPU reference
+passes M1 vs mlx-lm, Metal decode passes M2 byte-exact; ~76 tok/s decode on
+Qwen3.5-2B). First target: Qwen3.6-27B hybrid (full-attention + gated
+DeltaNet) at 8-bit, with the stated bar of beating mlx-lm single-stream
+decode on the same quant on this hardware. Design spec:
+`docs/superpowers/specs/2026-08-08-surge-design.md`.
 
 License: MIT.

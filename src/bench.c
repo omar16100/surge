@@ -9,8 +9,12 @@
  */
 
 #include "surge.h"
+#include <fcntl.h>
 #include <math.h>
 #include <stdio.h>
+#include <stdlib.h>
+#include <sys/stat.h>
+#include <unistd.h>
 
 double sg_bench_slope(const double *t_wall_cum, uint32_t n, uint32_t warmup) {
     if (!t_wall_cum || warmup >= n) return 0.0;
@@ -154,4 +158,73 @@ void sg_bench_format_json(const sg_bench_row *row, char *buf, size_t cap) {
         (unsigned long long)row->n_prompt_tok, row->n_gen, row->wall_s,
         row->gemm_tflops, row->ingestion_ok ? "true" : "false",
         status_esc, log_esc);
+}
+
+/* --------------------------------------------------------------------
+ * Task B3: prompt ingestion + truncation guard.
+ * -------------------------------------------------------------------- */
+
+sg_err sg_bench_read_file(const char *path, char **out, size_t *len) {
+    if (out) *out = NULL;
+    if (len) *len = 0;
+    if (!path || !out || !len) return (sg_err){"bench: read_file: invalid arguments"};
+
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) return (sg_err){"bench: read_file: failed to open file"};
+
+    struct stat st;
+    if (fstat(fd, &st) != 0) {
+        close(fd);
+        return (sg_err){"bench: read_file: fstat failed"};
+    }
+    if (st.st_size <= 0) {
+        close(fd);
+        return (sg_err){"bench: read_file: empty file"};
+    }
+    uint64_t size = (uint64_t)st.st_size;
+    if (size > SG_BENCH_MAX_FILE_BYTES) {
+        close(fd);
+        return (sg_err){"bench: read_file: file exceeds 3 GiB limit"};
+    }
+
+    char *buf = malloc((size_t)size + 1);
+    if (!buf) {
+        close(fd);
+        return (sg_err){"bench: read_file: out of memory"};
+    }
+
+    size_t total = 0;
+    while (total < (size_t)size) {
+        ssize_t n = read(fd, buf + total, (size_t)size - total);
+        if (n < 0) {
+            close(fd);
+            free(buf);
+            return (sg_err){"bench: read_file: read failed"};
+        }
+        if (n == 0) break;   /* file shrank under us -- treat as short read */
+        total += (size_t)n;
+    }
+    close(fd);
+    if (total != (size_t)size) {
+        free(buf);
+        return (sg_err){"bench: read_file: short read"};
+    }
+    buf[size] = '\0';
+
+    *out = buf;
+    *len = (size_t)size;
+    fprintf(stderr, "bench: read_file: %s (%zu bytes)\n", path, (size_t)size);
+    return SG_OK;
+}
+
+void sg_bench_check_ingestion(uint64_t n_ids, uint32_t max_ctx, uint64_t expect_min,
+                              uint64_t expect_max, bool *ok) {
+    if (!ok) return;
+    bool within_ctx = n_ids <= (uint64_t)max_ctx;
+    bool within_expect = n_ids >= expect_min && n_ids <= expect_max;
+    *ok = within_ctx && within_expect;
+    fprintf(stderr,
+            "bench: check_ingestion: n_ids=%llu max_ctx=%u expect=[%llu,%llu] ok=%s\n",
+            (unsigned long long)n_ids, max_ctx, (unsigned long long)expect_min,
+            (unsigned long long)expect_max, *ok ? "true" : "false");
 }

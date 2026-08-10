@@ -804,4 +804,42 @@ void sg_bench_format_json(const sg_bench_row *row, char *buf, size_t cap);
  * than setting status themselves. */
 void sg_bench_finalize_status(sg_bench_row *row);
 
+/* ---------------------------------------------------------------------
+ * Prompt ingestion + truncation guard (Task B3, src/bench.c)
+ * ---------------------------------------------------------------------
+ *
+ * PURE C, no Metal, no GPU, no Foundation -- same safety property as the
+ * rest of bench.c. Two pieces: a whole-file reader for prompt files (e.g.
+ * /Users/macmini/models/niah_256k_prompt.txt), and the VOID/PASS guard
+ * that mirrors bench_niah_mlx.py's prompt_tokens==n_built check -- B5's
+ * CLI runs this after tokenizing a prompt file and refuses to emit a
+ * non-VOID row unless it passes. Tokenizer/GGUF logic (turning bytes into
+ * token ids) is out of scope here; that is B5's job. */
+
+#define SG_BENCH_MAX_FILE_BYTES ((uint64_t)3 * 1024 * 1024 * 1024)  /* 3 GiB */
+
+/* Reads path fully into a malloc'd buffer, NUL-terminated one byte past the
+ * last file byte (so the result is usable as a C string without an extra
+ * copy). *out and *len are only set on success; the caller owns *out and
+ * must free() it. Rejects (returns a failed sg_err, *out left NULL) an
+ * empty file, a file whose size exceeds SG_BENCH_MAX_FILE_BYTES, or any
+ * open/stat/read failure. *len is the byte length actually read, NOT
+ * counting the added NUL. */
+sg_err sg_bench_read_file(const char *path, char **out, size_t *len);
+
+/* The ingestion/truncation guard: *ok is set true iff BOTH
+ *   (n_ids <= max_ctx)                         -- the prompt was not
+ *                                                  truncated to fit the
+ *                                                  model's context cap, and
+ *   (expect_min <= n_ids <= expect_max)         -- the tokenizer produced a
+ *                                                  count in the expected
+ *                                                  range for this prompt
+ *                                                  (catches a silently wrong
+ *                                                  tokenizer/BOS setting),
+ * else *ok is set false. A row built from a run where *ok is false is VOID
+ * regardless of any other measurement (see sg_bench_finalize_status). A
+ * NULL ok is a no-op (nothing is written, nothing crashes). */
+void sg_bench_check_ingestion(uint64_t n_ids, uint32_t max_ctx, uint64_t expect_min,
+                              uint64_t expect_max, bool *ok);
+
 #endif

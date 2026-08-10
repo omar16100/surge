@@ -913,3 +913,41 @@ so `make surge-bench` does not error with "No rule to make target" before B5 exi
 - Locale sensitivity (minor, not fixed): `%.2f`/`%.1f`/`%.6g` are locale-dependent if the
   process ever calls `setlocale`; no `setlocale` exists anywhere in this repo today, so this
   is a documented risk, not an active bug.
+
+## Task B3 Results (bench.c: prompt ingestion + truncation guard, pure C)
+
+EDIT `src/bench.c` (added `sg_bench_read_file`, `sg_bench_check_ingestion`) + decls in
+`surge.h`; NEW `tests/test_bench_ingest.c`. No Metal/GPU import, no tokenizer/GGUF logic (that
+is B5's job) -- pure C, safe to build/test while the GPU is busy.
+
+### What it does
+- `sg_bench_read_file(path, out, len)`: whole-file read into a malloc'd NUL-terminated buffer
+  (`open`/`fstat`/`read` loop, size checked via `fstat` BEFORE any read). Rejects an empty file
+  and a file over `SG_BENCH_MAX_FILE_BYTES` (3 GiB, `size > 3*1024^3`, so exactly 3 GiB is
+  allowed) with a failed `sg_err` and `*out` left NULL. `*len` is the byte length read, not
+  counting the added NUL. Caller frees `*out`.
+- `sg_bench_check_ingestion(n_ids, max_ctx, expect_min, expect_max, ok)`: `*ok = (n_ids <=
+  max_ctx) && (expect_min <= n_ids <= expect_max)`, mirroring bench_niah_mlx.py's
+  prompt_tokens==n_built check. A row built from a run where this is false is VOID regardless
+  of any other measurement (enforced by `sg_bench_finalize_status`, Task B1).
+
+### Gate: PASSED. make check + make debug (ASan/UBSan, SURGE_NO_METAL) both exit 0.
+- `sg_bench_check_ingestion`: PASS (ok=true) at n_ids==max_ctx; ok=false at n_ids==max_ctx+1;
+  ok=false just below expect_min and just above expect_max (the expect_max case uses a roomy
+  max_ctx so it isolates that check from the max_ctx check); inclusive boundaries at exactly
+  expect_min/expect_max PASS; NULL ok is a no-op.
+- `sg_bench_read_file`: rejects an empty temp file created in the test; round-trips a
+  known-content temp file byte-for-byte with the exact length and a NUL at `buf[len]`; rejects
+  a sparse file sized `3 GiB + 1` (via `ftruncate`, so the test stays fast -- size is checked
+  before any read); NULL path/out/len and a missing path fail cleanly, no crash.
+- Real-file assertion: `/Users/macmini/models/niah_256k_prompt.txt` exists on disk (verified),
+  `sg_bench_read_file` returns `len == 1462729` exactly. The other unit tests run unconditional
+  of this file's presence; had it been absent, only this one assertion would print a NOTICE and
+  skip.
+- 30 checks, 0 failures in test_bench_ingest.bin; all suites `0 failures` under both `make
+  check` and `make debug`, no ASan/UBSan diagnostics, no leaked buffers (every successful read
+  in the tests is freed) and no leftover /tmp temp files after the run.
+- `-Wall -Wextra -Werror` clean.
+
+### Deviations: none. Implementation follows the task spec verbatim; no correctness or safety
+issues surfaced in self-review.

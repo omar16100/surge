@@ -63,9 +63,14 @@ static sg_gpu *g_gpu;
 #define GEMM_Q8_TOL 2e-2
 
 /* Worst error seen across every op, printed at the end so the task report
- * can quote one number without grepping. */
+ * can quote one number without grepping. Owned storage, not a `const char *`
+ * that just remembers the winning check_rel_tol call's `label` argument:
+ * several call sites (rope_case, attn_case, the M5.3 GEMM cases below) build
+ * that label in a stack buffer with snprintf and it does not outlive the
+ * function that built it, so latching the raw pointer would leave this
+ * dangling by the time main() prints it. */
 static double g_worst_rel = 0.0;
-static const char *g_worst_label = "(none)";
+static char g_worst_label[64] = "(none)";
 
 /* --------------------------------------------------------------------
  * GPU buffer helpers
@@ -182,7 +187,10 @@ static double check_rel_tol(const char *label, const float *got, const float *wa
               (unsigned long long)at, (double)got[at], (double)want[at]);
     if (rel < tol) {
         fprintf(stderr, "   %-46s rel %.3e  abs %.3e\n", label, rel, worst);
-        if (rel > g_worst_rel) { g_worst_rel = rel; g_worst_label = label; }
+        if (rel > g_worst_rel) {
+            g_worst_rel = rel;
+            snprintf(g_worst_label, sizeof g_worst_label, "%s", label);
+        }
     }
     return rel;
 }

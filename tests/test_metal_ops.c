@@ -199,6 +199,34 @@ static double check_rel(const char *label, const float *got, const float *want, 
     return check_rel_tol(label, got, want, n, TOL_REL);
 }
 
+/* Bit-exact equality, element by element (memcmp per float so a NaN compares by
+ * its bit pattern rather than as unequal-to-itself). The M5.5 chunk kernels are
+ * a literal sequential replay of the per-token decode ops, so their equivalence
+ * to those ops is BIT-IDENTICAL by construction, not merely within tolerance;
+ * assert exactly that. Also reports the worst abs difference on failure. */
+static void check_bit_identical(const char *label, const float *got, const float *want,
+                                uint64_t n) {
+    uint64_t mism = 0, at = 0;
+    double worst = 0.0;
+    for (uint64_t i = 0; i < n; i++) {
+        if (memcmp(&got[i], &want[i], sizeof(float)) != 0) {
+            if (mism == 0) at = i;
+            mism++;
+            double d = fabs((double)got[i] - (double)want[i]);
+            if (d > worst) worst = d;
+        }
+    }
+    tt_assert(mism == 0,
+              "%s: %llu/%llu elements differ (first at %llu: got %.9g want %.9g, worst abs %.3e)",
+              label, (unsigned long long)mism, (unsigned long long)n,
+              (unsigned long long)at, mism ? (double)got[at] : 0.0,
+              mism ? (double)want[at] : 0.0, worst);
+    if (mism == 0) {
+        fprintf(stderr, "   %-52s bit-identical (%llu elems)\n", label,
+                (unsigned long long)n);
+    }
+}
+
 /* --------------------------------------------------------------------
  * Deterministic synthetic inputs, for the sizes the committed fixtures are
  * too small to reach (the fixtures top out at 64 columns; the reduction
@@ -1672,6 +1700,479 @@ static void metal_attn_prefill_matches_decode(void) {
 }
 
 /* --------------------------------------------------------------------
+ * M5.5: gated-DeltaNet chunked-scan prefill kernels
+ *
+ * Each chunk kernel is a sequential replay of a per-token decode op with the
+ * recurrent state threaded, so its output is BIT-IDENTICAL to that op looped
+ * over the chunk. The oracle is therefore the GPU decode kernel itself (run
+ * per token), not the CPU reference: comparing GPU-to-GPU makes the gap exactly
+ * zero, which is what these tests assert (check_bit_identical, not check_rel).
+ * -------------------------------------------------------------------- */
+
+/* Gate 1 + gate 2 (conv) + gate 5 (conv): k_conv1d_chunk == k_conv1d_step
+ * looped with the conv tail threaded, split-chunk == whole-chunk for both output
+ * and tail, and 100-rerun byte determinism. conv width 384 (> 256, so the
+ * per-channel grid runs past one threadgroup) and ksize 4 (tail 3, the 27B
+ * conv_kernel). */
+static void metal_conv1d_chunk_matches_step(void) {
+    const uint32_t channels = 384, ksize = 4, keep = ksize - 1;
+    const uint32_t ns[4] = {1, 2, 7, 64};
+    lcg_seed(0x5C0FFEEu);
+    float *w = xmalloc((size_t)channels * ksize * sizeof *w);
+    for (uint32_t i = 0; i < channels * ksize; i++) w[i] = lcg_next();
+    gbuf wb = gb_from(w, (uint64_t)channels * ksize);
+
+    /* Gate 1: chunk == step looped, N in {1,2,7,64}. */
+    for (int ni = 0; ni < 4; ni++) {
+        uint32_t N = ns[ni];
+        float *x = xmalloc((size_t)N * channels * sizeof *x);
+        for (uint32_t i = 0; i < N * channels; i++) x[i] = lcg_next() * 2.0f;
+
+        /* Oracle: k_conv1d_step over the N tokens, tail carried in stepbuf's
+         * state half (out[channels..]), which gb_new left zeroed. */
+        gbuf stepbuf = gb_new((uint64_t)ksize * channels);
+        float *ref = xmalloc((size_t)N * channels * sizeof *ref);
+        uint32_t ps[8] = {channels, ksize, 0, 0, 0, 0, 0, 0};
+        bool ok = true;
+        for (uint32_t t = 0; t < N && ok; t++) {
+            gbuf xt = gb_from(x + (size_t)t * channels, channels);
+            memset(stepbuf.h, 0xA5, channels * sizeof(float));   /* poison out half only */
+            ok = gpu_run("k_conv1d_step", &xt, &wb, &stepbuf, ps);
+            if (ok) memcpy(ref + (size_t)t * channels, stepbuf.h, channels * sizeof(float));
+            gb_free(&xt);
+        }
+
+        gbuf xall = gb_from(x, (uint64_t)N * channels);
+        gbuf outc = gb_new((uint64_t)N * channels);
+        gbuf statec = gb_new((uint64_t)keep * channels);   /* zeroed initial tail */
+        gb_poison(&outc);
+        uint32_t pc[8] = {channels, ksize, N, 0, 0, 0, 0, 0};
+        sg_err e = sg_gpu_run_conv1d_chunk(g_gpu, xall.b, wb.b, outc.b, statec.b, pc);
+        tt_assert(!sg_failed(e), "conv1d_chunk N=%u: %s", N, e.msg ? e.msg : "ok");
+        if (ok && !sg_failed(e)) {
+            char lbl[80];
+            snprintf(lbl, sizeof lbl, "k_conv1d_chunk==step looped N=%u", N);
+            check_bit_identical(lbl, outc.h, ref, (uint64_t)N * channels);
+            snprintf(lbl, sizeof lbl, "k_conv1d_chunk tail N=%u", N);
+            check_bit_identical(lbl, statec.h, stepbuf.h + channels, (uint64_t)keep * channels);
+        }
+        gb_free(&stepbuf); gb_free(&xall); gb_free(&outc); gb_free(&statec);
+        free(x); free(ref);
+    }
+
+    /* Gate 2 (conv): chunk(N) then chunk(M) sharing one tail == chunk(N+M). */
+    {
+        const uint32_t N = 7, M = 13, T = N + M;
+        float *x = xmalloc((size_t)T * channels * sizeof *x);
+        for (uint32_t i = 0; i < T * channels; i++) x[i] = lcg_next() * 2.0f;
+
+        gbuf xw = gb_from(x, (uint64_t)T * channels);
+        gbuf outw = gb_new((uint64_t)T * channels), statew = gb_new((uint64_t)keep * channels);
+        gb_poison(&outw);
+        uint32_t pw[8] = {channels, ksize, T, 0, 0, 0, 0, 0};
+        sg_err e = sg_gpu_run_conv1d_chunk(g_gpu, xw.b, wb.b, outw.b, statew.b, pw);
+
+        gbuf x1 = gb_from(x, (uint64_t)N * channels);
+        gbuf x2 = gb_from(x + (size_t)N * channels, (uint64_t)M * channels);
+        gbuf o1 = gb_new((uint64_t)N * channels), o2 = gb_new((uint64_t)M * channels);
+        gbuf st = gb_new((uint64_t)keep * channels);   /* shared, threaded */
+        gb_poison(&o1); gb_poison(&o2);
+        uint32_t p1[8] = {channels, ksize, N, 0, 0, 0, 0, 0};
+        uint32_t p2[8] = {channels, ksize, M, 0, 0, 0, 0, 0};
+        sg_err e1 = sg_gpu_run_conv1d_chunk(g_gpu, x1.b, wb.b, o1.b, st.b, p1);
+        sg_err e2 = sg_gpu_run_conv1d_chunk(g_gpu, x2.b, wb.b, o2.b, st.b, p2);
+        tt_assert(!sg_failed(e) && !sg_failed(e1) && !sg_failed(e2),
+                  "conv1d_chunk split/whole dispatch failed");
+        if (!sg_failed(e) && !sg_failed(e1) && !sg_failed(e2)) {
+            check_bit_identical("k_conv1d_chunk split==whole out[0:N]", o1.h, outw.h,
+                                (uint64_t)N * channels);
+            check_bit_identical("k_conv1d_chunk split==whole out[N:N+M]", o2.h,
+                                outw.h + (size_t)N * channels, (uint64_t)M * channels);
+            check_bit_identical("k_conv1d_chunk split==whole tail", st.h, statew.h,
+                                (uint64_t)keep * channels);
+        }
+        gb_free(&xw); gb_free(&outw); gb_free(&statew);
+        gb_free(&x1); gb_free(&x2); gb_free(&o1); gb_free(&o2); gb_free(&st);
+        free(x);
+    }
+
+    /* Gate 5 (conv): 100 reruns byte-identical, output poisoned and the initial
+     * tail restored to zero before each. */
+    {
+        const uint32_t N = 17;
+        float *x = xmalloc((size_t)N * channels * sizeof *x);
+        for (uint32_t i = 0; i < N * channels; i++) x[i] = lcg_next() * 2.0f;
+        gbuf xall = gb_from(x, (uint64_t)N * channels);
+        gbuf outc = gb_new((uint64_t)N * channels), statec = gb_new((uint64_t)keep * channels);
+        uint32_t pc[8] = {channels, ksize, N, 0, 0, 0, 0, 0};
+        float *first = xmalloc((size_t)N * channels * sizeof *first);
+        float *stf = xmalloc((size_t)keep * channels * sizeof *stf);
+        uint64_t mism = 0;
+        for (int rep = 0; rep < 100; rep++) {
+            memset(statec.h, 0, (size_t)keep * channels * sizeof(float));
+            gb_poison(&outc);
+            sg_err e = sg_gpu_run_conv1d_chunk(g_gpu, xall.b, wb.b, outc.b, statec.b, pc);
+            tt_assert(!sg_failed(e), "conv1d_chunk det rep %d: %s", rep, e.msg ? e.msg : "ok");
+            if (sg_failed(e)) break;
+            if (rep == 0) {
+                memcpy(first, outc.h, (size_t)N * channels * sizeof(float));
+                memcpy(stf, statec.h, (size_t)keep * channels * sizeof(float));
+            } else {
+                if (memcmp(first, outc.h, (size_t)N * channels * sizeof(float)) != 0) mism++;
+                if (memcmp(stf, statec.h, (size_t)keep * channels * sizeof(float)) != 0) mism++;
+            }
+        }
+        tt_assert(mism == 0, "k_conv1d_chunk: %llu byte mismatches over 100 reruns",
+                  (unsigned long long)mism);
+        if (mism == 0) fprintf(stderr, "   k_conv1d_chunk (17 tok): byte-identical over 100 reruns\n");
+        gb_free(&xall); gb_free(&outc); gb_free(&statec);
+        free(x); free(first); free(stf);
+    }
+    gb_free(&wb); free(w);
+}
+
+/* k_delta_gates_chunk == k_delta_gates looped, N in {1,2,7,64}, both ssm_a
+ * forms (A_log and -exp), plus 100-rerun determinism. */
+static void metal_delta_gates_chunk_matches(void) {
+    const uint32_t n = 40;
+    const uint32_t ns[4] = {1, 2, 7, 64};
+    lcg_seed(0xDEADBEEFu);
+    float *adt = xmalloc((size_t)2 * n * sizeof *adt);   /* ssm_a[n] then dt_bias[n] */
+    for (uint32_t i = 0; i < 2 * n; i++) adt[i] = lcg_next();
+    gbuf adtb = gb_from(adt, 2ull * n);
+
+    for (int ne = 0; ne < 2; ne++) {
+        uint32_t neg_exp = (uint32_t)ne;
+        for (int ni = 0; ni < 4; ni++) {
+            uint32_t N = ns[ni];
+            float *a = xmalloc((size_t)N * n * sizeof *a), *b = xmalloc((size_t)N * n * sizeof *b);
+            for (uint32_t i = 0; i < N * n; i++) { a[i] = lcg_next() * 2.0f; b[i] = lcg_next() * 2.0f; }
+            gbuf ab = gb_from(a, (uint64_t)N * n), bb = gb_from(b, (uint64_t)N * n);
+            gbuf gc = gb_new(2ull * N * n);
+            gb_poison(&gc);
+            uint32_t pg[8] = {n, neg_exp, N, 0, 0, 0, 0, 0};
+            sg_err e = sg_gpu_run_delta_gates_chunk(g_gpu, ab.b, bb.b, gc.b, adtb.b, pg);
+            tt_assert(!sg_failed(e), "delta_gates_chunk N=%u ne=%u: %s", N, neg_exp,
+                      e.msg ? e.msg : "ok");
+
+            /* Oracle: k_delta_gates per token over ab_t = [a_t(n), b_t(n)]. */
+            float *ref = xmalloc((size_t)2 * N * n * sizeof *ref);
+            gbuf abt = gb_new(2ull * n), gt = gb_new(2ull * n);
+            bool ok = true;
+            for (uint32_t t = 0; t < N && ok; t++) {
+                memcpy(abt.h, a + (size_t)t * n, n * sizeof(float));
+                memcpy(abt.h + n, b + (size_t)t * n, n * sizeof(float));
+                gb_poison(&gt);
+                uint32_t pd[8] = {n, neg_exp, 0, 0, 0, 0, 0, 0};
+                ok = gpu_run("k_delta_gates", &abt, &adtb, &gt, pd);
+                if (ok) memcpy(ref + (size_t)t * 2 * n, gt.h, 2 * n * sizeof(float));
+            }
+            if (ok && !sg_failed(e)) {
+                char lbl[80];
+                snprintf(lbl, sizeof lbl, "k_delta_gates_chunk==gates N=%u ne=%u", N, neg_exp);
+                check_bit_identical(lbl, gc.h, ref, 2ull * N * n);
+            }
+            gb_free(&ab); gb_free(&bb); gb_free(&gc); gb_free(&abt); gb_free(&gt);
+            free(a); free(b); free(ref);
+        }
+    }
+
+    /* Gate 5: 100 reruns byte-identical (N=17, -exp form). */
+    {
+        const uint32_t N = 17, neg_exp = 1;
+        float *a = xmalloc((size_t)N * n * sizeof *a), *b = xmalloc((size_t)N * n * sizeof *b);
+        for (uint32_t i = 0; i < N * n; i++) { a[i] = lcg_next() * 2.0f; b[i] = lcg_next() * 2.0f; }
+        gbuf ab = gb_from(a, (uint64_t)N * n), bb = gb_from(b, (uint64_t)N * n), gc = gb_new(2ull * N * n);
+        uint32_t pg[8] = {n, neg_exp, N, 0, 0, 0, 0, 0};
+        float *first = xmalloc((size_t)2 * N * n * sizeof *first);
+        uint64_t mism = 0;
+        for (int rep = 0; rep < 100; rep++) {
+            gb_poison(&gc);
+            sg_err e = sg_gpu_run_delta_gates_chunk(g_gpu, ab.b, bb.b, gc.b, adtb.b, pg);
+            tt_assert(!sg_failed(e), "delta_gates_chunk det rep %d: %s", rep, e.msg ? e.msg : "ok");
+            if (sg_failed(e)) break;
+            if (rep == 0) memcpy(first, gc.h, (size_t)2 * N * n * sizeof(float));
+            else if (memcmp(first, gc.h, (size_t)2 * N * n * sizeof(float)) != 0) mism++;
+        }
+        tt_assert(mism == 0, "k_delta_gates_chunk: %llu mismatches over 100 reruns",
+                  (unsigned long long)mism);
+        if (mism == 0) fprintf(stderr, "   k_delta_gates_chunk (17 tok): byte-identical over 100 reruns\n");
+        gb_free(&ab); gb_free(&bb); gb_free(&gc); free(a); free(b); free(first);
+    }
+    gb_free(&adtb); free(adt);
+}
+
+/* Gate 3: k_delta_chunk == k_delta_multi looped over the chunk with S threaded,
+ * for one head-map (`tiled`) and chunk length N. dk=dv=64, n_k=4, n_v=12 so each
+ * k-head maps to 3 v-heads (the 27B's 48/16 ratio), exercising both the tiled
+ * (h % n_k) and grouped (h / (n_v/n_k)) maps. */
+static void delta_chunk_case(uint32_t dk, uint32_t dv, uint32_t n_v, uint32_t n_k,
+                             uint32_t tiled, uint32_t N, uint32_t seed) {
+    uint32_t key_dim = n_k * dk, value_dim = n_v * dv, conv_dim = 2 * key_dim + value_dim;
+    lcg_seed(seed);
+    float *qkv = xmalloc((size_t)N * conv_dim * sizeof *qkv);
+    for (uint32_t i = 0; i < N * conv_dim; i++) qkv[i] = lcg_next();
+    float *gates = xmalloc((size_t)N * 2 * n_v * sizeof *gates);
+    for (uint32_t t = 0; t < N; t++) {
+        for (uint32_t h = 0; h < n_v; h++) {
+            gates[(size_t)t * 2 * n_v + h]         = 0.5f + 0.4f * lcg_next();   /* beta  */
+            gates[(size_t)t * 2 * n_v + n_v + h]   = 0.9f + 0.05f * lcg_next();  /* decay */
+        }
+    }
+    float *S0 = xmalloc((size_t)n_v * dv * dk * sizeof *S0);
+    for (uint32_t i = 0; i < n_v * dv * dk; i++) S0[i] = lcg_next() * 0.1f;
+
+    /* Oracle: k_delta_multi per token, S carried in place. */
+    gbuf Sm = gb_from(S0, (uint64_t)n_v * dv * dk);
+    gbuf qt = gb_new(conv_dim), gt = gb_new(2ull * n_v), ot = gb_new(value_dim);
+    float *ref = xmalloc((size_t)N * value_dim * sizeof *ref);
+    bool ok = true;
+    uint32_t pm[8] = {dk, dv, n_v, n_k, key_dim, tiled, 0, 0};
+    for (uint32_t t = 0; t < N && ok; t++) {
+        memcpy(qt.h, qkv + (size_t)t * conv_dim, conv_dim * sizeof(float));
+        memcpy(gt.h, gates + (size_t)t * 2 * n_v, 2 * n_v * sizeof(float));
+        gb_poison(&ot);
+        sg_err e = sg_gpu_run_delta_multi(g_gpu, Sm.b, qt.b, ot.b, gt.b, pm);
+        if (sg_failed(e)) { tt_assert(0, "delta_multi t=%u: %s", t, e.msg); ok = false; break; }
+        memcpy(ref + (size_t)t * value_dim, ot.h, value_dim * sizeof(float));
+    }
+
+    gbuf Sc = gb_from(S0, (uint64_t)n_v * dv * dk);
+    gbuf qkvb = gb_from(qkv, (uint64_t)N * conv_dim), gatesb = gb_from(gates, (uint64_t)N * 2 * n_v);
+    gbuf oc = gb_new((uint64_t)N * value_dim);
+    gb_poison(&oc);
+    uint32_t pc[8] = {dk, dv, n_v, n_k, key_dim, tiled, N, conv_dim};
+    sg_err e = sg_gpu_run_delta_chunk(g_gpu, Sc.b, qkvb.b, oc.b, gatesb.b, pc);
+    tt_assert(!sg_failed(e), "delta_chunk N=%u tiled=%u: %s", N, tiled, e.msg ? e.msg : "ok");
+    if (ok && !sg_failed(e)) {
+        char lbl[96];
+        snprintf(lbl, sizeof lbl, "k_delta_chunk==multi looped N=%u tiled=%u", N, tiled);
+        check_bit_identical(lbl, oc.h, ref, (uint64_t)N * value_dim);
+        snprintf(lbl, sizeof lbl, "k_delta_chunk S N=%u tiled=%u", N, tiled);
+        check_bit_identical(lbl, Sc.h, Sm.h, (uint64_t)n_v * dv * dk);
+    }
+    gb_free(&Sm); gb_free(&qt); gb_free(&gt); gb_free(&ot);
+    gb_free(&Sc); gb_free(&qkvb); gb_free(&gatesb); gb_free(&oc);
+    free(qkv); free(gates); free(S0); free(ref);
+}
+
+static void metal_delta_chunk_matches_multi(void) {
+    const uint32_t dk = 64, dv = 64, n_k = 4, n_v = 12;   /* 3 v-heads per k-head */
+    const uint32_t key_dim = n_k * dk, value_dim = n_v * dv, conv_dim = 2 * key_dim + value_dim;
+    const uint32_t ns[4] = {1, 2, 7, 64};
+
+    /* Gate 3: both head maps, all N. */
+    for (int ti = 0; ti < 2; ti++) {
+        for (int ni = 0; ni < 4; ni++) {
+            delta_chunk_case(dk, dv, n_v, n_k, (uint32_t)ti, ns[ni],
+                             0x1234u + (uint32_t)ti * 97u + (uint32_t)ni * 13u);
+        }
+    }
+
+    /* Gate 2 (S): chunk(N) then chunk(M) sharing one S == chunk(N+M), for both
+     * the output and the final S. */
+    {
+        const uint32_t N = 7, M = 13, T = N + M, tiled = 1;
+        lcg_seed(0xB0BAB0Bu);
+        float *qkv = xmalloc((size_t)T * conv_dim * sizeof *qkv);
+        for (uint32_t i = 0; i < T * conv_dim; i++) qkv[i] = lcg_next();
+        float *gates = xmalloc((size_t)T * 2 * n_v * sizeof *gates);
+        for (uint32_t t = 0; t < T; t++) for (uint32_t h = 0; h < n_v; h++) {
+            gates[(size_t)t * 2 * n_v + h] = 0.5f + 0.4f * lcg_next();
+            gates[(size_t)t * 2 * n_v + n_v + h] = 0.9f + 0.05f * lcg_next();
+        }
+        float *S0 = xmalloc((size_t)n_v * dv * dk * sizeof *S0);
+        for (uint32_t i = 0; i < n_v * dv * dk; i++) S0[i] = lcg_next() * 0.1f;
+
+        gbuf Sw = gb_from(S0, (uint64_t)n_v * dv * dk);
+        gbuf qw = gb_from(qkv, (uint64_t)T * conv_dim), gw = gb_from(gates, (uint64_t)T * 2 * n_v);
+        gbuf ow = gb_new((uint64_t)T * value_dim);
+        gb_poison(&ow);
+        uint32_t pwh[8] = {dk, dv, n_v, n_k, key_dim, tiled, T, conv_dim};
+        sg_err e = sg_gpu_run_delta_chunk(g_gpu, Sw.b, qw.b, ow.b, gw.b, pwh);
+
+        gbuf Ss = gb_from(S0, (uint64_t)n_v * dv * dk);   /* shared, threaded */
+        gbuf q1 = gb_from(qkv, (uint64_t)N * conv_dim);
+        gbuf q2 = gb_from(qkv + (size_t)N * conv_dim, (uint64_t)M * conv_dim);
+        gbuf g1 = gb_from(gates, (uint64_t)N * 2 * n_v);
+        gbuf g2 = gb_from(gates + (size_t)N * 2 * n_v, (uint64_t)M * 2 * n_v);
+        gbuf o1 = gb_new((uint64_t)N * value_dim), o2 = gb_new((uint64_t)M * value_dim);
+        gb_poison(&o1); gb_poison(&o2);
+        uint32_t p1[8] = {dk, dv, n_v, n_k, key_dim, tiled, N, conv_dim};
+        uint32_t p2[8] = {dk, dv, n_v, n_k, key_dim, tiled, M, conv_dim};
+        sg_err e1 = sg_gpu_run_delta_chunk(g_gpu, Ss.b, q1.b, o1.b, g1.b, p1);
+        sg_err e2 = sg_gpu_run_delta_chunk(g_gpu, Ss.b, q2.b, o2.b, g2.b, p2);
+        tt_assert(!sg_failed(e) && !sg_failed(e1) && !sg_failed(e2),
+                  "delta_chunk split/whole dispatch failed");
+        if (!sg_failed(e) && !sg_failed(e1) && !sg_failed(e2)) {
+            check_bit_identical("k_delta_chunk split==whole out[0:N]", o1.h, ow.h,
+                                (uint64_t)N * value_dim);
+            check_bit_identical("k_delta_chunk split==whole out[N:N+M]", o2.h,
+                                ow.h + (size_t)N * value_dim, (uint64_t)M * value_dim);
+            check_bit_identical("k_delta_chunk split==whole S", Ss.h, Sw.h,
+                                (uint64_t)n_v * dv * dk);
+        }
+        gb_free(&Sw); gb_free(&qw); gb_free(&gw); gb_free(&ow);
+        gb_free(&Ss); gb_free(&q1); gb_free(&q2); gb_free(&g1); gb_free(&g2);
+        gb_free(&o1); gb_free(&o2);
+        free(qkv); free(gates); free(S0);
+    }
+
+    /* Gate 5 (delta): 100 reruns byte-identical, S restored before each. */
+    {
+        const uint32_t N = 17, tiled = 1;
+        lcg_seed(0xF00D5EEDu);
+        float *qkv = xmalloc((size_t)N * conv_dim * sizeof *qkv);
+        for (uint32_t i = 0; i < N * conv_dim; i++) qkv[i] = lcg_next();
+        float *gates = xmalloc((size_t)N * 2 * n_v * sizeof *gates);
+        for (uint32_t t = 0; t < N; t++) for (uint32_t h = 0; h < n_v; h++) {
+            gates[(size_t)t * 2 * n_v + h] = 0.5f + 0.4f * lcg_next();
+            gates[(size_t)t * 2 * n_v + n_v + h] = 0.9f + 0.05f * lcg_next();
+        }
+        float *S0 = xmalloc((size_t)n_v * dv * dk * sizeof *S0);
+        for (uint32_t i = 0; i < n_v * dv * dk; i++) S0[i] = lcg_next() * 0.1f;
+
+        gbuf Sc = gb_from(S0, (uint64_t)n_v * dv * dk);
+        gbuf qkvb = gb_from(qkv, (uint64_t)N * conv_dim), gatesb = gb_from(gates, (uint64_t)N * 2 * n_v);
+        gbuf oc = gb_new((uint64_t)N * value_dim);
+        uint32_t pc[8] = {dk, dv, n_v, n_k, key_dim, tiled, N, conv_dim};
+        float *first = xmalloc((size_t)N * value_dim * sizeof *first);
+        float *sfirst = xmalloc((size_t)n_v * dv * dk * sizeof *sfirst);
+        uint64_t mism = 0;
+        for (int rep = 0; rep < 100; rep++) {
+            memcpy(Sc.h, S0, (size_t)n_v * dv * dk * sizeof(float));   /* restore S */
+            gb_poison(&oc);
+            sg_err e = sg_gpu_run_delta_chunk(g_gpu, Sc.b, qkvb.b, oc.b, gatesb.b, pc);
+            tt_assert(!sg_failed(e), "delta_chunk det rep %d: %s", rep, e.msg ? e.msg : "ok");
+            if (sg_failed(e)) break;
+            if (rep == 0) {
+                memcpy(first, oc.h, (size_t)N * value_dim * sizeof(float));
+                memcpy(sfirst, Sc.h, (size_t)n_v * dv * dk * sizeof(float));
+            } else {
+                if (memcmp(first, oc.h, (size_t)N * value_dim * sizeof(float)) != 0) mism++;
+                if (memcmp(sfirst, Sc.h, (size_t)n_v * dv * dk * sizeof(float)) != 0) mism++;
+            }
+        }
+        tt_assert(mism == 0, "k_delta_chunk: %llu byte mismatches over 100 reruns",
+                  (unsigned long long)mism);
+        if (mism == 0) fprintf(stderr, "   k_delta_chunk (17 tok): byte-identical over 100 reruns\n");
+        gb_free(&Sc); gb_free(&qkvb); gb_free(&gatesb); gb_free(&oc);
+        free(qkv); free(gates); free(S0); free(first); free(sfirst);
+    }
+}
+
+/* Gate 4: k_rmsnorm_gated_chunk == k_rmsnorm_gated looped, N in {1,2,7,64},
+ * plus 100-rerun determinism. dv 512 runs the fold tree past its 256 stride. */
+static void metal_rmsnorm_gated_chunk_matches(void) {
+    const uint32_t dv = 512, heads = 8, vd = heads * dv;
+    const uint32_t ns[4] = {1, 2, 7, 64};
+    const float eps = 1e-6f;
+    lcg_seed(0xA11CE5u);
+    float *w = xmalloc((size_t)dv * sizeof *w);
+    for (uint32_t i = 0; i < dv; i++) w[i] = lcg_next();
+    gbuf wb = gb_from(w, dv);
+
+    for (int ni = 0; ni < 4; ni++) {
+        uint32_t N = ns[ni];
+        float *y = xmalloc((size_t)N * vd * sizeof *y), *z = xmalloc((size_t)N * vd * sizeof *z);
+        for (uint32_t i = 0; i < N * vd; i++) { y[i] = lcg_next(); z[i] = lcg_next(); }
+        gbuf yb = gb_from(y, (uint64_t)N * vd), zb = gb_from(z, (uint64_t)N * vd);
+        gbuf ob = gb_new((uint64_t)N * vd);
+        gb_poison(&ob);
+        uint32_t pc[8] = {dv, heads, f32_bits(eps), N, 0, 0, 0, 0};
+        sg_err e = sg_gpu_run_rmsnorm_gated_chunk(g_gpu, yb.b, zb.b, ob.b, wb.b, pc);
+        tt_assert(!sg_failed(e), "rmsnorm_gated_chunk N=%u: %s", N, e.msg ? e.msg : "ok");
+
+        /* Oracle: k_rmsnorm_gated per token, zw_t = [z_t(vd), w(dv)]. */
+        float *ref = xmalloc((size_t)N * vd * sizeof *ref);
+        gbuf yt = gb_new(vd), zwt = gb_new((uint64_t)vd + dv), ot = gb_new(vd);
+        bool ok = true;
+        uint32_t pd[8] = {dv, heads, f32_bits(eps), 0, 0, 0, 0, 0};
+        for (uint32_t t = 0; t < N && ok; t++) {
+            memcpy(yt.h, y + (size_t)t * vd, vd * sizeof(float));
+            memcpy(zwt.h, z + (size_t)t * vd, vd * sizeof(float));
+            memcpy(zwt.h + vd, w, dv * sizeof(float));
+            gb_poison(&ot);
+            ok = gpu_run("k_rmsnorm_gated", &yt, &zwt, &ot, pd);
+            if (ok) memcpy(ref + (size_t)t * vd, ot.h, vd * sizeof(float));
+        }
+        if (ok && !sg_failed(e)) {
+            char lbl[80];
+            snprintf(lbl, sizeof lbl, "k_rmsnorm_gated_chunk==gated N=%u", N);
+            check_bit_identical(lbl, ob.h, ref, (uint64_t)N * vd);
+        }
+        gb_free(&yb); gb_free(&zb); gb_free(&ob); gb_free(&yt); gb_free(&zwt); gb_free(&ot);
+        free(y); free(z); free(ref);
+    }
+
+    /* Gate 5: 100 reruns byte-identical (N=17). */
+    {
+        const uint32_t N = 17;
+        float *y = xmalloc((size_t)N * vd * sizeof *y), *z = xmalloc((size_t)N * vd * sizeof *z);
+        for (uint32_t i = 0; i < N * vd; i++) { y[i] = lcg_next(); z[i] = lcg_next(); }
+        gbuf yb = gb_from(y, (uint64_t)N * vd), zb = gb_from(z, (uint64_t)N * vd), ob = gb_new((uint64_t)N * vd);
+        uint32_t pc[8] = {dv, heads, f32_bits(eps), N, 0, 0, 0, 0};
+        float *first = xmalloc((size_t)N * vd * sizeof *first);
+        uint64_t mism = 0;
+        for (int rep = 0; rep < 100; rep++) {
+            gb_poison(&ob);
+            sg_err e = sg_gpu_run_rmsnorm_gated_chunk(g_gpu, yb.b, zb.b, ob.b, wb.b, pc);
+            tt_assert(!sg_failed(e), "rmsnorm_gated_chunk det rep %d: %s", rep, e.msg ? e.msg : "ok");
+            if (sg_failed(e)) break;
+            if (rep == 0) memcpy(first, ob.h, (size_t)N * vd * sizeof(float));
+            else if (memcmp(first, ob.h, (size_t)N * vd * sizeof(float)) != 0) mism++;
+        }
+        tt_assert(mism == 0, "k_rmsnorm_gated_chunk: %llu mismatches over 100 reruns",
+                  (unsigned long long)mism);
+        if (mism == 0) fprintf(stderr, "   k_rmsnorm_gated_chunk (17 tok): byte-identical over 100 reruns\n");
+        gb_free(&yb); gb_free(&zb); gb_free(&ob); free(y); free(z); free(first);
+    }
+    gb_free(&wb); free(w);
+}
+
+/* The chunk one-shots' argument guards: an inconsistent or aliasing call must be
+ * an error return, not a device-side out-of-bounds read. Buffers are sized so the
+ * size checks pass and the specific guard under test (key_dim, or a destructive
+ * state carrier overlapping a read-only input) is what fires. */
+static void metal_chunk_rejects_bad_arguments(void) {
+    const uint32_t dk = 8, dv = 8, n_k = 2, n_v = 4, key_dim = n_k * dk;
+    const uint32_t value_dim = n_v * dv, conv_dim = 2 * key_dim + value_dim, N = 2;
+    /* S is the largest region (n_v*dv*dk = 256 floats), big enough to double as
+     * qkv/out for the aliasing cases below. */
+    gbuf S = gb_new((uint64_t)n_v * dv * dk);
+    gbuf qkv = gb_new((uint64_t)N * conv_dim), out = gb_new((uint64_t)N * value_dim);
+    gbuf gates = gb_new((uint64_t)N * 2 * n_v);
+
+    uint32_t pv[8] = {dk, dv, n_v, n_k, key_dim, 1, N, conv_dim};
+    sg_err e = sg_gpu_run_delta_chunk(g_gpu, S.b, qkv.b, out.b, gates.b, pv);
+    tt_assert(!sg_failed(e), "delta_chunk valid baseline: %s", e.msg ? e.msg : "ok");
+
+    uint32_t pk[8] = {dk, dv, n_v, n_k, key_dim - 1u, 1, N, conv_dim};
+    e = sg_gpu_run_delta_chunk(g_gpu, S.b, qkv.b, out.b, gates.b, pk);
+    tt_assert(sg_failed(e), "delta_chunk key_dim < n_k*dk should be rejected");
+
+    e = sg_gpu_run_delta_chunk(g_gpu, S.b, S.b, out.b, gates.b, pv);   /* S aliases qkv */
+    tt_assert(sg_failed(e), "delta_chunk S aliasing qkv should be rejected");
+    e = sg_gpu_run_delta_chunk(g_gpu, S.b, qkv.b, S.b, gates.b, pv);   /* out aliases S */
+    tt_assert(sg_failed(e), "delta_chunk out aliasing S should be rejected");
+
+    uint32_t pz[8] = {dk, dv, 0, n_k, key_dim, 1, N, conv_dim};
+    e = sg_gpu_run_delta_chunk(g_gpu, S.b, qkv.b, out.b, gates.b, pz);
+    tt_assert(sg_failed(e), "delta_chunk zero n_v should be rejected");
+    gb_free(&S); gb_free(&qkv); gb_free(&out); gb_free(&gates);
+
+    const uint32_t ch = 32, ks = 4;
+    gbuf w = gb_new((uint64_t)ch * ks), oc = gb_new((uint64_t)N * ch);
+    gbuf st = gb_new((uint64_t)(ks - 1) * ch);   /* 96 floats, big enough to double as x */
+    uint32_t pc[8] = {ch, ks, N, 0, 0, 0, 0, 0};
+    e = sg_gpu_run_conv1d_chunk(g_gpu, st.b, w.b, oc.b, st.b, pc);   /* state aliases x */
+    tt_assert(sg_failed(e), "conv1d_chunk state aliasing x should be rejected");
+    e = sg_gpu_run_conv1d_chunk(g_gpu, oc.b, w.b, oc.b, st.b, pc);   /* out aliases x */
+    tt_assert(sg_failed(e), "conv1d_chunk out aliasing x should be rejected");
+    gb_free(&w); gb_free(&oc); gb_free(&st);
+}
+
+/* --------------------------------------------------------------------
  * sg_gpu_wrap: the no-copy path a checkpoint mmap goes through
  * -------------------------------------------------------------------- */
 
@@ -2080,6 +2581,11 @@ int main(void) {
     tt_run("metal_attn_decode_f16_matches_f32", metal_attn_decode_f16_matches_f32);
     tt_run("metal_rope_chunk_matches_rope_heads", metal_rope_chunk_matches_rope_heads);
     tt_run("metal_attn_prefill_matches_decode", metal_attn_prefill_matches_decode);
+    tt_run("metal_conv1d_chunk_matches_step", metal_conv1d_chunk_matches_step);
+    tt_run("metal_delta_gates_chunk_matches", metal_delta_gates_chunk_matches);
+    tt_run("metal_delta_chunk_matches_multi", metal_delta_chunk_matches_multi);
+    tt_run("metal_rmsnorm_gated_chunk_matches", metal_rmsnorm_gated_chunk_matches);
+    tt_run("metal_chunk_rejects_bad_arguments", metal_chunk_rejects_bad_arguments);
     tt_run("metal_wrap_handles_page_offset", metal_wrap_handles_page_offset);
     tt_run("metal_reductions_are_deterministic", metal_reductions_are_deterministic);
     tt_run("metal_rejects_bad_arguments", metal_rejects_bad_arguments);

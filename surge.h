@@ -602,6 +602,42 @@ sg_err sg_gpu_run_attn_decode_f16(sg_gpu *g, void *q, void *k, void *v, void *ou
 sg_err sg_gpu_run_attn_prefill(sg_gpu *g, void *q, void *k, void *v, void *out,
                                const uint32_t params[8]);
 
+/* One-shot dispatches for the gated-DeltaNet chunked-scan prefill kernels (Task
+ * M5.5), each the same synchronous commit-and-wait contract as the entries
+ * above, extended to the extra device buffer the kernel needs beyond (a, b,
+ * out). The within-chunk scan is SEQUENTIAL, so each kernel is BIT-IDENTICAL to
+ * its per-token decode sibling looped over the chunk with the recurrent state
+ * (conv tail or S) threaded; these entry points are the per-op test's oracles
+ * and enc_gdn_prefill dispatches the same kernels by hand. All buffers f32.
+ *
+ * k_conv1d_chunk: causal depthwise conv over `channels` for a chunk, threading
+ *   the conv tail. x [n_tok, channels], w [channels, ksize], out [n_tok,
+ *   channels], state [ksize-1, channels] (in AND out). params: [0]=channels
+ *   [1]=ksize [2]=n_tok.
+ * k_delta_gates_chunk: the alpha/beta gates for a chunk. a [n_tok, n], b
+ *   [n_tok, n], gates [n_tok, 2n] out ([beta;decay] per token), adt [ssm_a(n),
+ *   dt_bias(n)]. params: [0]=n [1]=neg_exp [2]=n_tok.
+ * k_delta_chunk: the delta rule for a chunk through every value head, threading
+ *   S. S [n_v, dv, dk] (in AND out), qkv [n_tok, conv_dim], out [n_tok,
+ *   value_dim], gates [n_tok, 2*n_v]. params: [0]=dk [1]=dv [2]=n_v [3]=n_k
+ *   [4]=key_dim [5]=tiled [6]=n_tok [7]=conv_dim.
+ * k_delta_multi (single token): the per-op oracle for k_delta_chunk. S
+ *   [n_v, dv, dk] (in AND out), qkv [conv_dim], out [value_dim], gates [2*n_v].
+ *   params: [0]=dk [1]=dv [2]=n_v [3]=n_k [4]=key_dim [5]=tiled.
+ * k_rmsnorm_gated_chunk: gated output RMSNorm for a chunk. y [n_tok, heads*dv],
+ *   z [n_tok, heads*dv], out [n_tok, heads*dv], w [dv] (shared norm weight).
+ *   params: [0]=dv [1]=heads [2]=eps bits [3]=n_tok. */
+sg_err sg_gpu_run_conv1d_chunk(sg_gpu *g, void *x, void *w, void *out, void *state,
+                               const uint32_t params[8]);
+sg_err sg_gpu_run_delta_gates_chunk(sg_gpu *g, void *a, void *b, void *gates, void *adt,
+                                    const uint32_t params[8]);
+sg_err sg_gpu_run_delta_chunk(sg_gpu *g, void *S, void *qkv, void *out, void *gates,
+                              const uint32_t params[8]);
+sg_err sg_gpu_run_delta_multi(sg_gpu *g, void *S, void *qkv, void *out, void *gates,
+                              const uint32_t params[8]);
+sg_err sg_gpu_run_rmsnorm_gated_chunk(sg_gpu *g, void *y, void *z, void *out, void *w,
+                                      const uint32_t params[8]);
+
 /* ---------------------------------------------------------------------
  * The full Metal decode path (Task 10)
  * ---------------------------------------------------------------------

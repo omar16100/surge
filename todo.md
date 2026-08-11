@@ -1310,3 +1310,85 @@ All four gates re-ran green after the fixes.
 ### Not done (out of scope for M5.4)
 `enc_attn_prefill` is not yet driven end-to-end (no chunk-sized buffers exist
 until M5.6's `sg_gpu_prefill`); DeltaNet-layer prefill is M5.5.
+
+## Task M5.5 Results (kernels.metal/metal.m: gated-DeltaNet chunked-scan prefill)
+Four new kernels in `src/kernels.metal`, each pushing a chunk of N tokens
+through one DeltaNet layer via a SEQUENTIAL within-chunk scan (a literal
+per-token loop inside the kernel, threading the recurrent state), so each is
+BIT-IDENTICAL by construction to the matching decode kernel looped over the
+chunk with the state carried:
+- `k_conv1d_chunk`: causal depthwise conv over `channels`, one thread per
+  channel, replaying `k_conv1d_step` per token; conv tail [ksize-1, channels]
+  read from and rewritten to a SEPARATE `state` buffer (the sg_kv conv carrier),
+  no barrier (a channel is closed across the whole chunk).
+- `k_delta_gates_chunk`: the alpha/beta gates for the chunk, one thread per
+  (token, head), replaying `k_delta_gates`; a and b arrive as separate
+  token-major chunks, ssm_a/dt_bias shared, gates out token-major [n,2*n_v]
+  ([beta;decay] per token).
+- `k_delta_chunk`: the delta rule over the chunk through every value head, one
+  threadgroup per value head, replaying `k_delta_multi` per token (decay -> read
+  decayed -> delta -> write -> readout), threading S [n_v,dv,dk] in place. Thread
+  lid owns rows lid, lid+256, ... of the head's S block for the WHOLE chunk, so
+  NO barrier between tokens (rows are thread-private, no cross-thread reads;
+  k_delta_multi has no reduction). Both v-head maps (tiled `h%n_k` and grouped
+  `h/(n_v/n_k)`).
+- `k_rmsnorm_gated_chunk`: gated output RMSNorm over the chunk, one threadgroup
+  per (token, value head), replaying `k_rmsnorm_gated`; takes z and the shared
+  norm weight w as separate buffers (the two chunk buffers come from different
+  producers), same fixed-tree tg_sum / silu / scale.
+
+Host (`src/metal.m`): KI_ enum + SG_KERNELS entries (SG_K_ELEM for the two
+elementwise kernels, SG_K_GROUPS2 / SG_K_GATED for the two threadgroup ones, used
+only by the init width check since all are hand-dispatched); a `k_delta_gates`
+check_sizes rule so it is reachable through `sg_gpu_run_op` as the per-op oracle;
+five public one-shots (`sg_gpu_run_conv1d_chunk` / `_delta_gates_chunk` /
+`_delta_chunk` / `_rmsnorm_gated_chunk`, plus `sg_gpu_run_delta_multi` as the
+oracle for k_delta_chunk), each with u64-guarded size checks, u32 grid-range
+guards, and out-vs-input overlap checks; and `enc_gdn_prefill` (external, uncalled
+here, wired by M5.6), the chunked twin of `enc_gdn`: tiled-GEMM in_proj (qkv, a,
+b), `k_conv1d_chunk` in place on b_qkv + SiLU, per-token qk RMSNorm-heads + scale
+over the chunk (the q|k slices of a token are contiguous within its conv_dim row
+but split from the next token's by the v half, so a single strided
+`k_rmsnorm_heads` cannot span the chunk), `k_delta_gates_chunk`, `k_delta_chunk`
+(S threaded via sg_kv), z=w_z@h into the freed b_qkv scratch, `k_rmsnorm_gated_chunk`
+in place on b_y (w from L->zw+value_dim), o_proj.
+
+### Gate: PASSED, all 6 items (live Metal, GPU idle)
+1. `k_conv1d_chunk` == `k_conv1d_step` looped, N in {1,2,7,64}, tail threaded:
+   0 differing bytes (output and carried tail).
+2. State threading: chunk(N)+chunk(M) == chunk(N+M) BIT-IDENTICAL for BOTH the
+   conv tail (`k_conv1d_chunk`) AND the S state (`k_delta_chunk`), output and
+   final state.
+3. `k_delta_chunk` == `k_delta_multi` looped, N in {1,2,7,64}, both v-head maps
+   (tiled + grouped): BIT-IDENTICAL (0 differing bytes for output and S).
+4. `k_rmsnorm_gated_chunk` == `k_rmsnorm_gated` looped: BIT-IDENTICAL.
+   (`k_delta_gates_chunk` == `k_delta_gates` looped also BIT-IDENTICAL, both
+   ssm_a forms.)
+5. Determinism: 100 reruns of each chunk kernel byte-identical, output poisoned
+   (and S / conv tail restored) before each run.
+6. `make check` (live Metal) + `make debug` (SURGE_NO_METAL, ASan/UBSan) both
+   exit 0, no sanitizer diagnostics. 865 checks, 0 failures in test_metal_ops.
+
+### Review round (codex gpt-5.5)
+Confirmed no arithmetic/order bug in the four chunk kernels (conv tail shift,
+gate indexing, delta decay->read->delta->write->readout order, head map, gated
+RMSNorm weight offset all match decode). Three param-hardening findings on the
+new public one-shots, all fixed + a new `metal_chunk_rejects_bad_arguments`
+subtest, all gates re-ran green:
+- [High] `gpu_run_delta_common` now rejects `key_dim < n_k*dk` (else the k slice
+  `qkv+key_dim+hk*dk` could index past what the conv_dim size rule guards).
+- [Medium] every product in `gpu_run_delta_common` now routes through `mul_ck`
+  (`2ull*n_tok*n_v` / `n_tok*value_dim` could wrap u64 before the check).
+- [Medium] overlap guards now reject a destructive state carrier overlapping a
+  read-only input (`k_conv1d_chunk` state vs x/w; `k_delta_chunk` S vs qkv/gates).
+
+### Not done (out of scope for M5.5) + M5.6 hand-off
+`enc_gdn_prefill` is not driven end-to-end (its chunk-sized working buffers are
+allocated by M5.6's `sg_gpu_prefill`), mirroring M5.4's `enc_attn_prefill`
+deferral; M5.6 gates the whole prefill numerically (prefill-then-decode ==
+feed-one-at-a-time). The parallel WY/UT chunked DeltaNet form is M4.
+M5.6 must also: (a) zero the sg_kv conv/S state at prefill start (`sg_kv_reset`)
+and bridge post-prefill sg_kv DeltaNet state into decode (decode still reads the
+ad hoc `L->conv_buf`/`L->ssm`), and (b) allocate `g->kv` whenever the model has
+DeltaNet layers, since state_new currently allocates it only for
+`kv_dtype==f16 && n_attn>0` and `enc_gdn_prefill` needs its conv/S buffers.

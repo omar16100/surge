@@ -1107,3 +1107,200 @@ kernel void k_attn_prefill(device const float *q  [[buffer(0)]],
         oh[i] = acc;
     }
 }
+
+/* =====================================================================
+ * Task M5.5: gated-DeltaNet TILED PREFILL (state threaded across chunks)
+ * =====================================================================
+ *
+ * The four kernels below push a CHUNK of N tokens through the per-token
+ * DeltaNet ops above, threading the recurrent state (the conv tail and the S
+ * matrix) from token to token INSIDE the kernel. The within-chunk scan is
+ * SEQUENTIAL by design (a literal loop over the N tokens), so each is
+ * BIT-IDENTICAL to its per-token decode sibling looped over the chunk with the
+ * state threaded -- no reassociation, no atomics, no simd_sum, byte-identical
+ * run to run. The parallel WY/UT chunked form is an explicit M4 follow-up, not
+ * this task. The cross-chunk state carriers are sg_kv's per-layer conv tail and
+ * S buffers; at chunk 0 the caller has them zeroed (sg_kv_reset), and each chunk
+ * reads the incoming state and writes the outgoing state back in place.
+ */
+
+/* Causal depthwise 1D conv over `channels` for a chunk of `n_tok` tokens, one
+ * thread per channel, replaying k_conv1d_step per token with the conv tail
+ * threaded. The tail lives in a SEPARATE `state` buffer [ksize-1, channels]
+ * (the sg_kv conv carrier), read at entry and rewritten in place -- thread c
+ * touches only column c of x, out and state, so the per-token shift needs no
+ * synchronization and no barrier between tokens (a channel is a closed
+ * computation across the whole chunk). Statement for statement this is
+ * k_conv1d_step's body wrapped in a token loop, so looping k_conv1d_step over
+ * the N tokens with the tail carried produces byte-identical output and tail.
+ *
+ * params: [0]=channels [1]=ksize [2]=n_tok. Buffers: x [n_tok, channels] in,
+ * w [channels, ksize], out [n_tok, channels], state [ksize-1, channels] in+out. */
+kernel void k_conv1d_chunk(device const float *x     [[buffer(0)]],
+                           device const float *w     [[buffer(1)]],
+                           device float *out         [[buffer(2)]],
+                           constant uint *p          [[buffer(3)]],
+                           device float *state       [[buffer(4)]],
+                           uint c [[thread_position_in_grid]])
+{
+    uint channels = p[0], ksize = p[1], n_tok = p[2];
+    if (c >= channels || ksize == 0u || n_tok == 0u) return;
+    uint keep = ksize - 1u;
+
+    device const float *wc = w + (size_t)c * ksize;
+    for (uint t = 0u; t < n_tok; t++) {
+        float tok = x[(size_t)t * channels + c];
+
+        /* Taps 0..keep-1 read the carried tail oldest-first; tap `keep` is this
+         * token. */
+        float acc = 0.0f;
+        for (uint j = 0u; j < keep; j++) acc += wc[j] * state[(size_t)j * channels + c];
+        acc += wc[keep] * tok;
+
+        /* Shift the tail one step older and append this token; row j+1 read
+         * before row j is written, j increasing, so nothing is clobbered early. */
+        for (uint j = 0u; j + 1u < keep; j++) {
+            state[(size_t)j * channels + c] = state[(size_t)(j + 1u) * channels + c];
+        }
+        if (keep > 0u) state[(size_t)(keep - 1u) * channels + c] = tok;
+
+        out[(size_t)t * channels + c] = acc;
+    }
+}
+
+/* The two DeltaNet per-head gates for a chunk of `n_tok` tokens, one thread per
+ * (token, head), replaying k_delta_gates per token. a and b arrive as SEPARATE
+ * token-major chunks [n_tok, n] (the two in_proj GEMM outputs), ssm_a and
+ * dt_bias are per-head and shared across the chunk (adt = [ssm_a(n), dt_bias(n)],
+ * exactly k_delta_gates' second buffer). The output gates are token-major
+ * [n_tok, 2n], row t = [beta(n), decay(n)], the same per-token [beta;decay]
+ * layout k_delta_gates emits, stacked over tokens. Same sg_softplus /
+ * sg_sigmoid / precise::exp and the same A_log vs -exp form as k_delta_gates,
+ * so per token it is bit-identical to k_delta_gates over that token's [a;b].
+ *
+ * params: [0]=n [1]=neg_exp (1 = ssm_a already -exp(A_log)) [2]=n_tok. */
+kernel void k_delta_gates_chunk(device const float *a   [[buffer(0)]],
+                                device const float *b   [[buffer(1)]],
+                                device float *gates     [[buffer(2)]],
+                                constant uint *p        [[buffer(3)]],
+                                device const float *adt [[buffer(4)]],
+                                uint g [[thread_position_in_grid]])
+{
+    uint n = p[0];
+    bool neg_exp = p[1] != 0u;
+    uint n_tok = p[2];
+    if (n == 0u || n_tok == 0u || g >= n_tok * n) return;
+    uint t = g / n, h = g % n;
+
+    float sp = sg_softplus(a[(size_t)t * n + h] + adt[n + h]);
+    float av = adt[h];
+    gates[(size_t)t * 2u * n + h] = sg_sigmoid(b[(size_t)t * n + h]);
+    gates[(size_t)t * 2u * n + n + h] = neg_exp ? precise::exp(av * sp)
+                                                : precise::exp(-(precise::exp(av) * sp));
+}
+
+/* The gated delta rule for a chunk of `n_tok` tokens through EVERY value head,
+ * one threadgroup per value head, replaying k_delta_multi per token with the S
+ * matrix threaded. Thread `lid` owns rows lid, lid+256, ... of this head's S
+ * block for the WHOLE chunk: a row is a closed computation owned by exactly one
+ * thread and touched by no other, so threading it across tokens needs no
+ * barrier between tokens and no cross-thread reduction (there is none in
+ * k_delta_multi either). Per token the value-head to key-head map
+ * (sg_ssm_k_head, both checkpoint conventions) and the decay -> read -> delta
+ * -> write -> readout statement order are k_delta_multi's verbatim, so this is
+ * bit-identical to looping k_delta_multi over the N tokens with S carried.
+ *
+ * S [n_v, dv, dk] is read AND written in place (the sg_kv S carrier). qkv is
+ * token-major [n_tok, conv_dim] (conv_dim = 2*key_dim + value_dim, the per-token
+ * q|k|v working area, row stride passed as a param); out is token-major
+ * [n_tok, value_dim]; gates is token-major [n_tok, 2*n_v] ([beta;decay] per
+ * token). params: [0]=dk [1]=dv [2]=n_v [3]=n_k [4]=key_dim [5]=tiled
+ * [6]=n_tok [7]=conv_dim (qkv row stride). */
+kernel void k_delta_chunk(device float *S           [[buffer(0)]],
+                          device const float *qkv   [[buffer(1)]],
+                          device float *out         [[buffer(2)]],
+                          constant uint *p          [[buffer(3)]],
+                          device const float *gates [[buffer(4)]],
+                          uint h   [[threadgroup_position_in_grid]],
+                          uint lid [[thread_position_in_threadgroup]])
+{
+    uint dk = p[0], dv = p[1], n_v = p[2], n_k = p[3], key_dim = p[4];
+    bool tiled = p[5] != 0u;
+    uint n_tok = p[6], conv_dim = p[7];
+    if (h >= n_v || dk == 0u || dv == 0u || n_tok == 0u) return;
+
+    uint hk = 0u;
+    if (n_k != 0u && n_v >= n_k) hk = tiled ? (h % n_k) : (h / (n_v / n_k));
+    uint value_dim = n_v * dv;
+    device float *Sh = S + (size_t)h * dv * dk;
+
+    for (uint t = 0u; t < n_tok; t++) {
+        device const float *q = qkv + (size_t)t * conv_dim + (size_t)hk * dk;
+        device const float *k = qkv + (size_t)t * conv_dim + key_dim + (size_t)hk * dk;
+        device const float *v = qkv + (size_t)t * conv_dim + 2u * key_dim + (size_t)h * dv;
+        device float *oh = out + (size_t)t * value_dim + (size_t)h * dv;
+        float beta = gates[(size_t)t * 2u * n_v + h];
+        float decay = gates[(size_t)t * 2u * n_v + n_v + h];
+
+        for (uint j = lid; j < dv; j += SG_TG) {
+            device float *row = Sh + (size_t)j * dk;
+
+            float kv = 0.0f;
+            for (uint i = 0u; i < dk; i++) {
+                float s = row[i] * decay;
+                row[i] = s;
+                kv += s * k[i];
+            }
+            float delta = (v[j] - kv) * beta;
+            float y = 0.0f;
+            for (uint i = 0u; i < dk; i++) {
+                float s = row[i] + k[i] * delta;
+                row[i] = s;
+                y += s * q[i];
+            }
+            oh[j] = y;
+        }
+    }
+}
+
+/* RMSNormGated for a chunk of `n_tok` tokens through every value head, one
+ * threadgroup per (token, value head), replaying k_rmsnorm_gated per token: the
+ * readout y is RMS-normed with the layer's ssm_norm weight and gated by silu of
+ * the UNNORMALIZED z. Unlike k_rmsnorm_gated (which reads z and the norm weight
+ * from one packed `zw` buffer), the chunk kernel takes z as its own token-major
+ * buffer [n_tok, heads*dv] and the shared norm weight w [dv] separately -- the
+ * two chunk buffers come from different producers (a GEMM and a per-layer weight
+ * park), so packing them would force an awkward chunk layout. The values are
+ * identical, and the fixed-tree tg_sum, the silu and the scale are
+ * k_rmsnorm_gated's verbatim, so per token this is bit-identical to it.
+ *
+ * threadgroup `tg` owns slice tg == t*heads + h. params: [0]=dv [1]=heads
+ * [2]=eps bits [3]=n_tok. Buffers: y [n_tok, heads*dv], z [n_tok, heads*dv],
+ * out [n_tok, heads*dv], w [dv]. */
+kernel void k_rmsnorm_gated_chunk(device const float *y  [[buffer(0)]],
+                                  device const float *z  [[buffer(1)]],
+                                  device float *out      [[buffer(2)]],
+                                  constant uint *p       [[buffer(3)]],
+                                  device const float *w  [[buffer(4)]],
+                                  uint tg  [[threadgroup_position_in_grid]],
+                                  uint lid [[thread_position_in_threadgroup]])
+{
+    uint dv = p[0], heads = p[1];
+    float eps = as_type<float>(p[2]);
+    uint n_tok = p[3];
+    if (dv == 0u || heads == 0u || n_tok == 0u || tg >= n_tok * heads) return;
+
+    device const float *yh = y + (size_t)tg * dv;
+    device const float *zh = z + (size_t)tg * dv;
+    device float *oh = out + (size_t)tg * dv;
+
+    threadgroup float red[SG_TG];
+    float acc = 0.0f;
+    for (uint i = lid; i < dv; i += SG_TG) acc += yh[i] * yh[i];
+    float sumsq = tg_sum(red, lid, acc);
+    float scale = 1.0f / precise::sqrt(sumsq / (float)dv + eps);
+
+    for (uint i = lid; i < dv; i += SG_TG) {
+        oh[i] = sg_silu(zh[i]) * (yh[i] * scale * w[i]);
+    }
+}

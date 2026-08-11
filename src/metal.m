@@ -101,7 +101,9 @@ enum {
     KI_SCALE, KI_ADD, KI_DELTA_GATES, KI_DELTA_MULTI,
     KI_KV_STORE_F16, KI_ATTN_F16,
     KI_MATMUL_BF16, KI_MATMUL_F32, KI_MATMUL_Q8,
-    KI_ROPE_CHUNK, KI_ATTN_PREFILL, KI_COUNT
+    KI_ROPE_CHUNK, KI_ATTN_PREFILL,
+    KI_CONV1D_CHUNK, KI_DELTA_GATES_CHUNK, KI_DELTA_CHUNK, KI_RMSNORM_GATED_CHUNK,
+    KI_COUNT
 };
 
 static const sg_kernel_desc SG_KERNELS[] = {
@@ -147,6 +149,22 @@ static const sg_kernel_desc SG_KERNELS[] = {
      * sg_gpu_init builds its pipeline and checks its threadgroup width. */
     { "k_rope_chunk",          SG_K_ROPE_CHUNK },
     { "k_attn_prefill",        SG_K_ATTN       },
+    /* M5.5: gated-DeltaNet tiled prefill. All four thread the recurrent state
+     * (conv tail + S) across chunks and take an extra device buffer (the state
+     * carrier or the shared weight) beyond sg_gpu_run_op's (a, b, out) shape,
+     * so each is dispatched by hand -- through a dedicated public one-shot for
+     * the per-op tests, and inside enc_gdn_prefill for the batched path -- and
+     * is listed here only so sg_gpu_init builds its pipeline and (for the two
+     * reduction/threadgroup kernels) checks its threadgroup width. The `kind`
+     * column is the closest existing grid class and is used ONLY by that init
+     * width check; the actual grids are computed in the dispatchers.
+     * k_conv1d_chunk / k_delta_gates_chunk are one-thread-per-work-item with no
+     * reduction (SG_K_ELEM, exempt from the SG_TG width assertion); k_delta_chunk
+     * / k_rmsnorm_gated_chunk run SG_TG-wide threadgroups. */
+    { "k_conv1d_chunk",        SG_K_ELEM    },
+    { "k_delta_gates_chunk",   SG_K_ELEM    },
+    { "k_delta_chunk",         SG_K_GROUPS2 },
+    { "k_rmsnorm_gated_chunk", SG_K_GATED   },
 };
 #define SG_N_KERNELS ((int)(sizeof SG_KERNELS / sizeof SG_KERNELS[0]))
 _Static_assert(SG_N_KERNELS == KI_COUNT, "SG_KERNELS and the KI_ enum disagree");
@@ -624,6 +642,13 @@ static sg_err check_sizes(const char *kernel, const sg_gpu_buf *a, const sg_gpu_
         ok = mul_ck((uint64_t)p[0] * p[1], f, &need_a) &&
              add_ck(2ull * p[0], p[1], &t0) && mul_ck(t0, f, &need_b) &&
              mul_ck(p[1], f, &need_o);
+    } else if (strcmp(kernel, "k_delta_gates") == 0) {
+        /* ab = [a(n), b(n)], adt = [ssm_a(n), dt_bias(n)], gates = [beta(n),
+         * decay(n)]; each is 2*n floats. p[0]=n. Made reachable through
+         * sg_gpu_run_op so the M5.5 per-op test can use k_delta_gates as the
+         * bit-identical oracle for k_delta_gates_chunk. */
+        ok = mul_ck(2ull * p[0], f, &need_a);
+        need_b = need_o = need_a;
     } else if (strcmp(kernel, "k_kv_store_f16") == 0) {
         /* a is p[0] f32 floats in; out is p[0] half (2-byte) elements out. */
         ok = mul_ck(p[0], f, &need_a) && mul_ck(p[0], 2, &need_o);
@@ -1142,6 +1167,326 @@ sg_err sg_gpu_run_attn_prefill(sg_gpu *g, void *q, void *k, void *v, void *out,
 }
 
 /* =====================================================================
+ * M5.5: gated-DeltaNet chunked-scan prefill one-shots
+ * =====================================================================
+ *
+ * One synchronous commit-and-wait per call, the same contract as
+ * sg_gpu_run_attn_prefill, extended to the extra device buffer each M5.5 kernel
+ * needs (the state carrier, or the shared weight). These are the per-op test's
+ * entry points; enc_gdn_prefill dispatches the same kernels by hand inside one
+ * open command buffer. Every byte count is u64-guarded (mul_ck/add_ck): the
+ * sizes are products of up to three caller u32s and a wrapped-small `need` would
+ * let an undersized buffer through to a device-side out-of-bounds read. */
+
+/* One dispatch of an elementwise (no-reduction) kernel over `elems` threads,
+ * threadgroup width clamped to the pipeline max, SG_TG and `elems`. */
+static NSUInteger gpu_elem_width(sg_gpu *g, int ki, uint64_t elems) {
+    NSUInteger w = [g->pipes[ki] maxTotalThreadsPerThreadgroup];
+    if (w > SG_TG) w = SG_TG;
+    if (w > elems) w = (NSUInteger)elems;
+    return w;
+}
+
+/* k_conv1d_chunk: x [n_tok, channels] f32, w [channels, ksize] f32,
+ * out [n_tok, channels] f32, state [ksize-1, channels] f32 (in AND out, the
+ * conv tail). params: [0]=channels [1]=ksize [2]=n_tok. */
+sg_err sg_gpu_run_conv1d_chunk(sg_gpu *g, void *x, void *w, void *out, void *state,
+                               const uint32_t params[8]) {
+    if (!g || !x || !w || !out || !state || !params) {
+        return (sg_err){"gpu: sg_gpu_run_conv1d_chunk got a NULL argument"};
+    }
+    uint32_t channels = params[0], ksize = params[1], n_tok = params[2];
+    if (channels == 0 || ksize == 0 || n_tok == 0) {
+        return (sg_err){"gpu: k_conv1d_chunk dispatched with a zero dimension"};
+    }
+
+    sg_gpu_buf *xb = (sg_gpu_buf *)x, *wb = (sg_gpu_buf *)w, *ob = (sg_gpu_buf *)out,
+               *sb = (sg_gpu_buf *)state;
+    uint64_t f = 4, need_x = 0, need_w = 0, need_s = 0;
+    bool ok = mul_ck((uint64_t)n_tok * channels, f, &need_x)
+           && mul_ck((uint64_t)channels * ksize, f, &need_w)
+           && mul_ck((uint64_t)(ksize - 1u) * channels, f, &need_s);
+    if (!ok) return (sg_err){"gpu: k_conv1d_chunk params describe a region that overflows 64 bits"};
+    uint64_t need_o = need_x;
+    if (!buf_big_enough(xb, need_x)) return gpu_errf("gpu: k_conv1d_chunk x is %llu bytes, needs %llu",
+        (unsigned long long)(xb ? xb->nbytes : 0), (unsigned long long)need_x);
+    if (!buf_big_enough(wb, need_w)) return gpu_errf("gpu: k_conv1d_chunk w is %llu bytes, needs %llu",
+        (unsigned long long)(wb ? wb->nbytes : 0), (unsigned long long)need_w);
+    if (!buf_big_enough(ob, need_o)) return gpu_errf("gpu: k_conv1d_chunk out is %llu bytes, needs %llu",
+        (unsigned long long)(ob ? ob->nbytes : 0), (unsigned long long)need_o);
+    if (need_s > 0 && !buf_big_enough(sb, need_s)) return gpu_errf("gpu: k_conv1d_chunk state is %llu bytes, needs %llu",
+        (unsigned long long)(sb ? sb->nbytes : 0), (unsigned long long)need_s);
+    /* out must not alias any input; state is written in place (thread c owns
+     * column c of it), so it must not overlap out NOR either read-only input --
+     * a thread rewriting the tail could otherwise clobber an x or w value
+     * another thread or a later token still has to read. */
+    if (bufs_overlap(ob, xb) || bufs_overlap(ob, wb) || bufs_overlap(ob, sb)
+        || bufs_overlap(sb, xb) || bufs_overlap(sb, wb)) {
+        return (sg_err){"gpu: k_conv1d_chunk output or state overlaps another buffer"};
+    }
+
+    __block sg_err rc = SG_OK;
+    @autoreleasepool {
+        id<MTLCommandBuffer> cb = [g->queue commandBuffer];
+        id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+        if (!cb || !enc) { rc = (sg_err){"gpu: could not open a compute encoder"}; }
+        else {
+            [enc setComputePipelineState:g->pipes[KI_CONV1D_CHUNK]];
+            [enc setBuffer:xb->buf offset:(NSUInteger)xb->offset atIndex:0];
+            [enc setBuffer:wb->buf offset:(NSUInteger)wb->offset atIndex:1];
+            [enc setBuffer:ob->buf offset:(NSUInteger)ob->offset atIndex:2];
+            [enc setBytes:params length:8 * sizeof(uint32_t) atIndex:3];
+            [enc setBuffer:sb->buf offset:(NSUInteger)sb->offset atIndex:4];
+            NSUInteger wdt = gpu_elem_width(g, KI_CONV1D_CHUNK, channels);
+            [enc dispatchThreads:MTLSizeMake(channels, 1, 1)
+            threadsPerThreadgroup:MTLSizeMake(wdt, 1, 1)];
+            [enc endEncoding];
+            [cb commit];
+            [cb waitUntilCompleted];
+            if ([cb error]) rc = gpu_errf("gpu: k_conv1d_chunk failed: %s",
+                                          [[[cb error] localizedDescription] UTF8String]);
+        }
+    }
+    return rc;
+}
+
+/* k_delta_gates_chunk: a [n_tok, n] f32, b [n_tok, n] f32, gates [n_tok, 2n] f32
+ * out, adt [ssm_a(n), dt_bias(n)] f32. params: [0]=n [1]=neg_exp [2]=n_tok. */
+sg_err sg_gpu_run_delta_gates_chunk(sg_gpu *g, void *a, void *b, void *gates, void *adt,
+                                    const uint32_t params[8]) {
+    if (!g || !a || !b || !gates || !adt || !params) {
+        return (sg_err){"gpu: sg_gpu_run_delta_gates_chunk got a NULL argument"};
+    }
+    uint32_t n = params[0], n_tok = params[2];
+    if (n == 0 || n_tok == 0) {
+        return (sg_err){"gpu: k_delta_gates_chunk dispatched with a zero dimension"};
+    }
+    /* The grid is one thread per (token, head), and the kernel carries n_tok*n
+     * in a 32-bit thread index; reject rather than truncate. */
+    if ((uint64_t)n_tok * n > UINT32_MAX) {
+        return (sg_err){"gpu: k_delta_gates_chunk n_tok*n exceeds the 32-bit grid range"};
+    }
+
+    sg_gpu_buf *ab = (sg_gpu_buf *)a, *bb = (sg_gpu_buf *)b, *gb = (sg_gpu_buf *)gates,
+               *db = (sg_gpu_buf *)adt;
+    uint64_t f = 4, need_ab = 0, need_g = 0, need_adt = 0;
+    bool ok = mul_ck((uint64_t)n_tok * n, f, &need_ab)
+           && mul_ck(2ull * (uint64_t)n_tok * n, f, &need_g)
+           && mul_ck(2ull * n, f, &need_adt);
+    if (!ok) return (sg_err){"gpu: k_delta_gates_chunk params describe a region that overflows 64 bits"};
+    if (!buf_big_enough(ab, need_ab)) return gpu_errf("gpu: k_delta_gates_chunk a is %llu bytes, needs %llu",
+        (unsigned long long)(ab ? ab->nbytes : 0), (unsigned long long)need_ab);
+    if (!buf_big_enough(bb, need_ab)) return gpu_errf("gpu: k_delta_gates_chunk b is %llu bytes, needs %llu",
+        (unsigned long long)(bb ? bb->nbytes : 0), (unsigned long long)need_ab);
+    if (!buf_big_enough(gb, need_g)) return gpu_errf("gpu: k_delta_gates_chunk gates is %llu bytes, needs %llu",
+        (unsigned long long)(gb ? gb->nbytes : 0), (unsigned long long)need_g);
+    if (!buf_big_enough(db, need_adt)) return gpu_errf("gpu: k_delta_gates_chunk adt is %llu bytes, needs %llu",
+        (unsigned long long)(db ? db->nbytes : 0), (unsigned long long)need_adt);
+    if (bufs_overlap(gb, ab) || bufs_overlap(gb, bb) || bufs_overlap(gb, db)) {
+        return (sg_err){"gpu: k_delta_gates_chunk output overlaps an input buffer"};
+    }
+
+    __block sg_err rc = SG_OK;
+    @autoreleasepool {
+        id<MTLCommandBuffer> cb = [g->queue commandBuffer];
+        id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+        if (!cb || !enc) { rc = (sg_err){"gpu: could not open a compute encoder"}; }
+        else {
+            uint64_t elems = (uint64_t)n_tok * n;
+            [enc setComputePipelineState:g->pipes[KI_DELTA_GATES_CHUNK]];
+            [enc setBuffer:ab->buf offset:(NSUInteger)ab->offset atIndex:0];
+            [enc setBuffer:bb->buf offset:(NSUInteger)bb->offset atIndex:1];
+            [enc setBuffer:gb->buf offset:(NSUInteger)gb->offset atIndex:2];
+            [enc setBytes:params length:8 * sizeof(uint32_t) atIndex:3];
+            [enc setBuffer:db->buf offset:(NSUInteger)db->offset atIndex:4];
+            NSUInteger wdt = gpu_elem_width(g, KI_DELTA_GATES_CHUNK, elems);
+            [enc dispatchThreads:MTLSizeMake((NSUInteger)elems, 1, 1)
+            threadsPerThreadgroup:MTLSizeMake(wdt, 1, 1)];
+            [enc endEncoding];
+            [cb commit];
+            [cb waitUntilCompleted];
+            if ([cb error]) rc = gpu_errf("gpu: k_delta_gates_chunk failed: %s",
+                                          [[[cb error] localizedDescription] UTF8String]);
+        }
+    }
+    return rc;
+}
+
+/* Shared validation + dispatch for the two SG_TG-wide DeltaNet chunk kernels
+ * that read a qkv chunk and a gates chunk and update S in place: k_delta_chunk
+ * (n_tok in params[6], conv_dim in params[7]) and k_delta_multi (single token,
+ * params[6]/params[7] unused). `n_tok_eff` folds the two: k_delta_multi is the
+ * n_tok == 1 case with per-token stride conv_dim = 2*key_dim + value_dim. */
+static sg_err gpu_run_delta_common(sg_gpu *g, int ki, void *S, void *qkv, void *out,
+                                   void *gates, uint32_t dk, uint32_t dv, uint32_t n_v,
+                                   uint32_t n_k, uint32_t key_dim, uint32_t n_tok,
+                                   uint32_t conv_dim, const uint32_t params[8]) {
+    if (dk == 0 || dv == 0 || n_v == 0 || n_tok == 0) {
+        return (sg_err){"gpu: k_delta_* dispatched with a zero dimension"};
+    }
+    if (n_k == 0 || n_v % n_k != 0) {
+        return gpu_errf("gpu: k_delta_* n_v %u is not a multiple of n_k %u", n_v, n_k);
+    }
+    /* The kernel reads q at qkv+hk*dk and k at qkv+key_dim+hk*dk with hk < n_k,
+     * so the q/k regions run up to n_k*dk and key_dim+n_k*dk; key_dim must be at
+     * least n_k*dk or an inconsistent public param would index a k slice past
+     * the region the conv_dim size rule guarantees. */
+    if (key_dim < (uint64_t)n_k * dk) {
+        return gpu_errf("gpu: k_delta_* key_dim %u is smaller than n_k*dk %llu",
+                        key_dim, (unsigned long long)((uint64_t)n_k * dk));
+    }
+    uint64_t value_dim = (uint64_t)n_v * dv;
+    if (conv_dim < 2ull * key_dim + value_dim) {
+        return gpu_errf("gpu: k_delta_* conv_dim %u is smaller than 2*key_dim + value_dim %llu",
+                        conv_dim, (unsigned long long)(2ull * key_dim + value_dim));
+    }
+
+    sg_gpu_buf *Sb = (sg_gpu_buf *)S, *qb = (sg_gpu_buf *)qkv, *ob = (sg_gpu_buf *)out,
+               *gb = (sg_gpu_buf *)gates;
+    /* Every product goes through mul_ck: n_tok, n_v, dv are caller u32s and a
+     * bare (2*n_tok*n_v) or (n_tok*value_dim) can wrap u64 before the check. */
+    uint64_t f = 4, need_s = 0, need_q = 0, need_o = 0, need_g = 0, t0 = 0;
+    bool ok = mul_ck((uint64_t)n_v * dv, dk, &t0) && mul_ck(t0, f, &need_s)
+           && mul_ck((uint64_t)n_tok, conv_dim, &t0) && mul_ck(t0, f, &need_q)
+           && mul_ck((uint64_t)n_tok, value_dim, &t0) && mul_ck(t0, f, &need_o)
+           && mul_ck((uint64_t)n_tok, n_v, &t0) && mul_ck(t0, 2, &t0) && mul_ck(t0, f, &need_g);
+    if (!ok) return (sg_err){"gpu: k_delta_* params describe a region that overflows 64 bits"};
+    if (!buf_big_enough(Sb, need_s)) return gpu_errf("gpu: k_delta_* S is %llu bytes, needs %llu",
+        (unsigned long long)(Sb ? Sb->nbytes : 0), (unsigned long long)need_s);
+    if (!buf_big_enough(qb, need_q)) return gpu_errf("gpu: k_delta_* qkv is %llu bytes, needs %llu",
+        (unsigned long long)(qb ? qb->nbytes : 0), (unsigned long long)need_q);
+    if (!buf_big_enough(ob, need_o)) return gpu_errf("gpu: k_delta_* out is %llu bytes, needs %llu",
+        (unsigned long long)(ob ? ob->nbytes : 0), (unsigned long long)need_o);
+    if (!buf_big_enough(gb, need_g)) return gpu_errf("gpu: k_delta_* gates is %llu bytes, needs %llu",
+        (unsigned long long)(gb ? gb->nbytes : 0), (unsigned long long)need_g);
+    /* out must not alias any input; S is read+written in place (row-private per
+     * thread), so it must not overlap out NOR the read-only qkv/gates a thread
+     * still reads while updating its rows. */
+    if (bufs_overlap(ob, Sb) || bufs_overlap(ob, qb) || bufs_overlap(ob, gb)
+        || bufs_overlap(Sb, qb) || bufs_overlap(Sb, gb)) {
+        return (sg_err){"gpu: k_delta_* output or S overlaps another buffer"};
+    }
+
+    __block sg_err rc = SG_OK;
+    @autoreleasepool {
+        id<MTLCommandBuffer> cb = [g->queue commandBuffer];
+        id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+        if (!cb || !enc) { rc = (sg_err){"gpu: could not open a compute encoder"}; }
+        else {
+            [enc setComputePipelineState:g->pipes[ki]];
+            [enc setBuffer:Sb->buf offset:(NSUInteger)Sb->offset atIndex:0];
+            [enc setBuffer:qb->buf offset:(NSUInteger)qb->offset atIndex:1];
+            [enc setBuffer:ob->buf offset:(NSUInteger)ob->offset atIndex:2];
+            [enc setBytes:params length:8 * sizeof(uint32_t) atIndex:3];
+            [enc setBuffer:gb->buf offset:(NSUInteger)gb->offset atIndex:4];
+            [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)n_v, 1, 1)
+                threadsPerThreadgroup:MTLSizeMake(SG_TG, 1, 1)];
+            [enc endEncoding];
+            [cb commit];
+            [cb waitUntilCompleted];
+            if ([cb error]) rc = gpu_errf("gpu: %s failed: %s", SG_KERNELS[ki].name,
+                                          [[[cb error] localizedDescription] UTF8String]);
+        }
+    }
+    return rc;
+}
+
+/* k_delta_chunk: S [n_v, dv, dk] f32 (in+out), qkv [n_tok, conv_dim] f32,
+ * out [n_tok, value_dim] f32, gates [n_tok, 2*n_v] f32. params: [0]=dk [1]=dv
+ * [2]=n_v [3]=n_k [4]=key_dim [5]=tiled [6]=n_tok [7]=conv_dim. */
+sg_err sg_gpu_run_delta_chunk(sg_gpu *g, void *S, void *qkv, void *out, void *gates,
+                              const uint32_t params[8]) {
+    if (!g || !S || !qkv || !out || !gates || !params) {
+        return (sg_err){"gpu: sg_gpu_run_delta_chunk got a NULL argument"};
+    }
+    return gpu_run_delta_common(g, KI_DELTA_CHUNK, S, qkv, out, gates,
+                                params[0], params[1], params[2], params[3],
+                                params[4], params[6], params[7], params);
+}
+
+/* k_delta_multi (single token), the per-op oracle for k_delta_chunk. S
+ * [n_v, dv, dk] f32 (in+out), qkv [conv_dim] f32 (conv_dim = 2*key_dim +
+ * value_dim), out [value_dim] f32, gates [2*n_v] f32. params: [0]=dk [1]=dv
+ * [2]=n_v [3]=n_k [4]=key_dim [5]=tiled. */
+sg_err sg_gpu_run_delta_multi(sg_gpu *g, void *S, void *qkv, void *out, void *gates,
+                              const uint32_t params[8]) {
+    if (!g || !S || !qkv || !out || !gates || !params) {
+        return (sg_err){"gpu: sg_gpu_run_delta_multi got a NULL argument"};
+    }
+    uint32_t key_dim = params[4];
+    uint64_t conv_dim = 2ull * key_dim + (uint64_t)params[2] * params[1];
+    if (conv_dim > UINT32_MAX) {
+        return (sg_err){"gpu: k_delta_multi conv_dim exceeds the 32-bit range"};
+    }
+    return gpu_run_delta_common(g, KI_DELTA_MULTI, S, qkv, out, gates,
+                                params[0], params[1], params[2], params[3],
+                                key_dim, 1u, (uint32_t)conv_dim, params);
+}
+
+/* k_rmsnorm_gated_chunk: y [n_tok, heads*dv] f32, z [n_tok, heads*dv] f32,
+ * out [n_tok, heads*dv] f32, w [dv] f32 (shared norm weight). params: [0]=dv
+ * [1]=heads [2]=eps bits [3]=n_tok. */
+sg_err sg_gpu_run_rmsnorm_gated_chunk(sg_gpu *g, void *y, void *z, void *out, void *w,
+                                      const uint32_t params[8]) {
+    if (!g || !y || !z || !out || !w || !params) {
+        return (sg_err){"gpu: sg_gpu_run_rmsnorm_gated_chunk got a NULL argument"};
+    }
+    uint32_t dv = params[0], heads = params[1], n_tok = params[3];
+    if (dv == 0 || heads == 0 || n_tok == 0) {
+        return (sg_err){"gpu: k_rmsnorm_gated_chunk dispatched with a zero dimension"};
+    }
+    /* One threadgroup per (token, head); tg is a 32-bit threadgroup index. */
+    if ((uint64_t)n_tok * heads > UINT32_MAX) {
+        return (sg_err){"gpu: k_rmsnorm_gated_chunk n_tok*heads exceeds the 32-bit range"};
+    }
+
+    sg_gpu_buf *yb = (sg_gpu_buf *)y, *zb = (sg_gpu_buf *)z, *ob = (sg_gpu_buf *)out,
+               *wb = (sg_gpu_buf *)w;
+    uint64_t f = 4, need_yzo = 0, need_w = 0, t0 = 0;
+    bool ok = mul_ck((uint64_t)n_tok * heads, dv, &t0) && mul_ck(t0, f, &need_yzo)
+           && mul_ck((uint64_t)dv, f, &need_w);
+    if (!ok) return (sg_err){"gpu: k_rmsnorm_gated_chunk params describe a region that overflows 64 bits"};
+    if (!buf_big_enough(yb, need_yzo)) return gpu_errf("gpu: k_rmsnorm_gated_chunk y is %llu bytes, needs %llu",
+        (unsigned long long)(yb ? yb->nbytes : 0), (unsigned long long)need_yzo);
+    if (!buf_big_enough(zb, need_yzo)) return gpu_errf("gpu: k_rmsnorm_gated_chunk z is %llu bytes, needs %llu",
+        (unsigned long long)(zb ? zb->nbytes : 0), (unsigned long long)need_yzo);
+    if (!buf_big_enough(ob, need_yzo)) return gpu_errf("gpu: k_rmsnorm_gated_chunk out is %llu bytes, needs %llu",
+        (unsigned long long)(ob ? ob->nbytes : 0), (unsigned long long)need_yzo);
+    if (!buf_big_enough(wb, need_w)) return gpu_errf("gpu: k_rmsnorm_gated_chunk w is %llu bytes, needs %llu",
+        (unsigned long long)(wb ? wb->nbytes : 0), (unsigned long long)need_w);
+    /* out may alias y (each thread rewrites only the elements it read, after
+     * tg_sum's trailing barrier), exactly as k_rmsnorm_gated is used in place in
+     * enc_gdn; it must not alias z or w. */
+    if (bufs_overlap(ob, zb) || bufs_overlap(ob, wb)) {
+        return (sg_err){"gpu: k_rmsnorm_gated_chunk output overlaps z or w"};
+    }
+
+    __block sg_err rc = SG_OK;
+    @autoreleasepool {
+        id<MTLCommandBuffer> cb = [g->queue commandBuffer];
+        id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+        if (!cb || !enc) { rc = (sg_err){"gpu: could not open a compute encoder"}; }
+        else {
+            uint64_t groups = (uint64_t)n_tok * heads;
+            [enc setComputePipelineState:g->pipes[KI_RMSNORM_GATED_CHUNK]];
+            [enc setBuffer:yb->buf offset:(NSUInteger)yb->offset atIndex:0];
+            [enc setBuffer:zb->buf offset:(NSUInteger)zb->offset atIndex:1];
+            [enc setBuffer:ob->buf offset:(NSUInteger)ob->offset atIndex:2];
+            [enc setBytes:params length:8 * sizeof(uint32_t) atIndex:3];
+            [enc setBuffer:wb->buf offset:(NSUInteger)wb->offset atIndex:4];
+            [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)groups, 1, 1)
+                threadsPerThreadgroup:MTLSizeMake(SG_TG, 1, 1)];
+            [enc endEncoding];
+            [cb commit];
+            [cb waitUntilCompleted];
+            if ([cb error]) rc = gpu_errf("gpu: k_rmsnorm_gated_chunk failed: %s",
+                                          [[[cb error] localizedDescription] UTF8String]);
+        }
+    }
+    return rc;
+}
+
+/* =====================================================================
  * The full hybrid decode path (Task 10)
  * =====================================================================
  *
@@ -1595,6 +1940,148 @@ void enc_attn_prefill(sg_enc *E, sg_gpu_layer *L, uint32_t layer_idx,
     enc_op(E, KI_GATE_STRIDED, g->b_ctx, 0, g->b_qg, 0, g->b_ctx, 0, nil, 0,
            PARAMS(hd, n * c->n_heads, 2 * hd, hd));
     enc_matmul(E, gemm, g->b_ctx, 0, L->w_o, g->b_r, 0, n, c->hidden, g->attn_width);
+}
+
+/* GatedDeltaNet for a CHUNK of `n` tokens, the chunked twin of enc_gdn (Task
+ * M5.5). It is the single-DeltaNet-layer prefill encoder; the whole-prompt,
+ * all-layers prefill orchestration that drives it (and sizes the chunk buffers
+ * it reuses) is Task M5.6. External linkage on purpose: nothing in this build
+ * calls it yet, and a static uncalled function would trip -Werror's
+ * -Wunused-function; M5.6's sg_gpu_prefill will call it. Its four DeltaNet
+ * chunk kernels are each gated in isolation by the per-op test through their
+ * public one-shots above.
+ *
+ * STATE THREADING is the point of the task: the recurrent state (the conv tail
+ * and the S matrix) is carried across chunks in sg_kv's per-layer conv/S
+ * buffers, NOT in the ad hoc L->conv_buf / L->ssm the decode path uses. Both are
+ * read at chunk entry and rewritten in place by the sequential within-chunk
+ * scan, so feeding chunk k+1 the state chunk k left behind reproduces the
+ * one-token-at-a-time decode exactly. `base` is unused: unlike full attention,
+ * DeltaNet has no position-indexed cache and no RoPE, so a chunk depends on the
+ * prior context ONLY through the carried state.
+ *
+ * BUFFER SIZING (the caller's contract, since this reuses the decode field
+ * names sized for one token; M5.6 sizes them for the chunk): g->b_h holds the
+ * chunk's post-ln1 hidden [n, hidden] on entry; g->b_qkv [n, conv_dim] is the
+ * qkv projection, then the conv output IN PLACE (safe: k_conv1d_chunk reads and
+ * writes each channel-position exactly once, own thread, read before write),
+ * then the q|k|v working area, then (after the delta scan consumes it) reused as
+ * the z scratch [n, value_dim]; g->b_ab [2*n*n_v] holds the a-chunk then the
+ * b-chunk; g->b_gates [n, 2*n_v] the per-token [beta;decay]; g->b_y [n,
+ * value_dim] the delta readout then the gated-norm output in place; g->b_r [n,
+ * hidden] the layer's residual contribution on exit (the handle enc_gdn writes).
+ * L->zw still parks this layer's ssm_norm weight at element offset value_dim,
+ * bound to k_rmsnorm_gated_chunk as its separate w buffer. */
+void enc_gdn_prefill(sg_enc *E, sg_gpu_layer *L, uint32_t layer_idx,
+                     uint32_t base, uint32_t n) {
+    sg_gpu *g = E->g;
+    const sg_cfg *c = &g->cfg;
+    uint32_t dk = c->head_k_dim, dv = c->head_v_dim;
+    uint32_t key_dim = g->key_dim, value_dim = g->value_dim, conv_dim = g->conv_dim;
+    double inv = 1.0 / sqrt((double)dk);
+    uint32_t eps6 = fbits(1e-6f);
+    uint32_t neg_exp = (g->model->ssm_a_form == SG_SSM_A_NEG_EXP) ? 1u : 0u;
+    uint32_t tiled = g->model->v_heads_tiled ? 1u : 0u;
+    int gemm = gemm_kernel_for(g->model->wtype);
+    id<MTLComputeCommandEncoder> e = E->enc;
+    (void)base;
+
+    /* in_proj: qkv, a and b for the whole chunk (z is computed later, into the
+     * b_qkv scratch the delta scan frees). a-chunk lands in b_ab[0..n*n_v), the
+     * b-chunk in b_ab[n*n_v..2*n*n_v). */
+    enc_matmul(E, gemm, g->b_h, 0, L->w_qkv, g->b_qkv, 0, n, conv_dim, c->hidden);
+    enc_matmul(E, gemm, g->b_h, 0, L->w_a, g->b_ab, 0, n, c->n_v_heads, c->hidden);
+    enc_matmul(E, gemm, g->b_h, 0, L->w_b, g->b_ab, (uint64_t)n * c->n_v_heads,
+               n, c->n_v_heads, c->hidden);
+
+    /* conv1d over the chunk (in place on b_qkv), threading the conv tail via
+     * sg_kv, then SiLU in place. */
+    {
+        void *conv_state = sg_kv_conv(g->kv, layer_idx);
+        const uint32_t pc[8] = { conv_dim, c->conv_kernel, n, 0, 0, 0, 0, 0 };
+        [e setComputePipelineState:g->pipes[KI_CONV1D_CHUNK]];
+        [e setBuffer:bufof(g->b_qkv) offset:(NSUInteger)offof(g->b_qkv) atIndex:0];
+        [e setBuffer:bufof(L->conv_w) offset:(NSUInteger)offof(L->conv_w) atIndex:1];
+        [e setBuffer:bufof(g->b_qkv) offset:(NSUInteger)offof(g->b_qkv) atIndex:2];
+        [e setBytes:pc length:8 * sizeof(uint32_t) atIndex:3];
+        [e setBuffer:bufof(conv_state) offset:(NSUInteger)offof(conv_state) atIndex:4];
+        NSUInteger w = gpu_elem_width(g, KI_CONV1D_CHUNK, conv_dim);
+        [e dispatchThreads:MTLSizeMake(conv_dim, 1, 1)
+        threadsPerThreadgroup:MTLSizeMake(w, 1, 1)];
+    }
+    enc_op(E, KI_SILU, g->b_qkv, 0, NULL, 0, g->b_qkv, 0, nil, 0,
+           PARAMS(n * conv_dim));
+
+    /* q and k RMS-normed per key head (no weight, hardcoded eps 1e-6) then
+     * scaled (q by 1/head_k_dim, k by 1/sqrt(head_k_dim)), exactly enc_gdn's
+     * arithmetic, applied per token: the q|k slices of a token are contiguous
+     * within its conv_dim row but separated by the v half from the next token's,
+     * so a single strided k_rmsnorm_heads cannot span the chunk. */
+    for (uint32_t t = 0; t < n; t++) {
+        uint64_t roff = (uint64_t)t * conv_dim;
+        enc_op(E, KI_RMSNORM_HEADS, g->b_qkv, roff, NULL, 0, g->b_qkv, roff, nil, 0,
+               PARAMS(dk, c->n_k_heads, eps6, 0, dk));
+        enc_op(E, KI_RMSNORM_HEADS, g->b_qkv, roff + key_dim, NULL, 0,
+               g->b_qkv, roff + key_dim, nil, 0,
+               PARAMS(dk, c->n_k_heads, eps6, 0, dk));
+        enc_op(E, KI_SCALE, g->b_qkv, roff, NULL, 0, g->b_qkv, roff, nil, 0,
+               PARAMS(key_dim, fbits((float)(inv * inv))));
+        enc_op(E, KI_SCALE, g->b_qkv, roff + key_dim, NULL, 0,
+               g->b_qkv, roff + key_dim, nil, 0,
+               PARAMS(key_dim, fbits((float)inv)));
+    }
+
+    /* gates for the whole chunk (a = b_ab[0..], b = b_ab[n*n_v..]). */
+    {
+        const uint32_t pg[8] = { c->n_v_heads, neg_exp, n, 0, 0, 0, 0, 0 };
+        [e setComputePipelineState:g->pipes[KI_DELTA_GATES_CHUNK]];
+        [e setBuffer:bufof(g->b_ab) offset:(NSUInteger)offof(g->b_ab) atIndex:0];
+        [e setBuffer:bufof(g->b_ab)
+                offset:(NSUInteger)(offof(g->b_ab) + (uint64_t)n * c->n_v_heads * 4)
+               atIndex:1];
+        [e setBuffer:bufof(g->b_gates) offset:(NSUInteger)offof(g->b_gates) atIndex:2];
+        [e setBytes:pg length:8 * sizeof(uint32_t) atIndex:3];
+        [e setBuffer:bufof(L->a_dt) offset:(NSUInteger)offof(L->a_dt) atIndex:4];
+        uint64_t elems = (uint64_t)n * c->n_v_heads;
+        NSUInteger w = gpu_elem_width(g, KI_DELTA_GATES_CHUNK, elems);
+        [e dispatchThreads:MTLSizeMake((NSUInteger)elems, 1, 1)
+        threadsPerThreadgroup:MTLSizeMake(w, 1, 1)];
+    }
+
+    /* delta recurrence over the chunk, threading S via sg_kv, readout to b_y. */
+    {
+        void *s_state = sg_kv_s(g->kv, layer_idx);
+        const uint32_t pd[8] = { dk, dv, c->n_v_heads, c->n_k_heads, key_dim,
+                                 tiled, n, conv_dim };
+        [e setComputePipelineState:g->pipes[KI_DELTA_CHUNK]];
+        [e setBuffer:bufof(s_state) offset:(NSUInteger)offof(s_state) atIndex:0];
+        [e setBuffer:bufof(g->b_qkv) offset:(NSUInteger)offof(g->b_qkv) atIndex:1];
+        [e setBuffer:bufof(g->b_y) offset:(NSUInteger)offof(g->b_y) atIndex:2];
+        [e setBytes:pd length:8 * sizeof(uint32_t) atIndex:3];
+        [e setBuffer:bufof(g->b_gates) offset:(NSUInteger)offof(g->b_gates) atIndex:4];
+        [e dispatchThreadgroups:MTLSizeMake((NSUInteger)c->n_v_heads, 1, 1)
+            threadsPerThreadgroup:MTLSizeMake(SG_TG, 1, 1)];
+    }
+
+    /* z = w_z @ h into the now-free b_qkv scratch, then RMSNormGated
+     * (silu(z) * rms_norm(y, ssm_norm)) over the chunk, in place on b_y. */
+    enc_matmul(E, gemm, g->b_h, 0, L->w_z, g->b_qkv, 0, n, value_dim, c->hidden);
+    {
+        const uint32_t pn[8] = { dv, c->n_v_heads, fbits(c->rms_eps), n, 0, 0, 0, 0 };
+        [e setComputePipelineState:g->pipes[KI_RMSNORM_GATED_CHUNK]];
+        [e setBuffer:bufof(g->b_y) offset:(NSUInteger)offof(g->b_y) atIndex:0];
+        [e setBuffer:bufof(g->b_qkv) offset:(NSUInteger)offof(g->b_qkv) atIndex:1];
+        [e setBuffer:bufof(g->b_y) offset:(NSUInteger)offof(g->b_y) atIndex:2];
+        [e setBytes:pn length:8 * sizeof(uint32_t) atIndex:3];
+        [e setBuffer:bufof(L->zw)
+                offset:(NSUInteger)(offof(L->zw) + (uint64_t)value_dim * 4)
+               atIndex:4];
+        uint64_t groups = (uint64_t)n * c->n_v_heads;
+        [e dispatchThreadgroups:MTLSizeMake((NSUInteger)groups, 1, 1)
+            threadsPerThreadgroup:MTLSizeMake(SG_TG, 1, 1)];
+    }
+
+    enc_matmul(E, gemm, g->b_y, 0, L->w_out, g->b_r, 0, n, c->hidden, value_dim);
 }
 
 /* GatedDeltaNet for one token, mirroring ref.c's gdn_layer. The conv output

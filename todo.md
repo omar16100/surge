@@ -1188,3 +1188,59 @@ sizes both layer kinds from the config), duplicating the pre-existing ad hoc
 read back through sg_kv's getters. Left as is since DeltaNet decode is out
 of this task's scope; a future task refitting DeltaNet decode onto sg_kv
 should drop the ad hoc allocation instead of keeping both.
+
+## Task M5.3 Results (kernels.metal/metal.m: tiled GEMM bf16/f32/Q8_0)
+
+### What it does
+`k_matmul_bf16`, `k_matmul_f32`, `k_matmul_q8`: `Y[N,M] = X[N,K] @ W[M,K]^T`,
+for the later M5 prefill tasks to project a whole chunk of N tokens through
+one weight matrix in a single dispatch (decode's per-token `k_matvec_*` path
+is untouched). One threadgroup per 16x16 output tile (`SG_GEMM_TM` x
+`SG_GEMM_TN`), one thread owns exactly one output element and runs a private
+serial loop over K -- no cross-thread reduction, no atomics, no simd_sum, no
+threadgroup memory at all. New `SG_K_TILES2D` grid class in `metal.m`
+(`sg_gpu_run_op` computes the 2D tile count by hand, since `gpu_grid`'s
+`(groups, elems)` pair is 1D only); `check_params` rejects N/M/K == 0 and
+(Q8 only) K%32 != 0 before `check_sizes` divides by 32, same ordering
+`k_matvec_q8` relies on. Buffer order is `(X, W, Y)`, the REVERSE of
+`k_matvec_*`'s `(W, X, Y)`, per the task brief's explicit wording.
+
+### Gate: PASSED, all 5 items
+1. bf16/f32 vs a fresh host f64 GEMM reference, across (N,M,K) covering
+   {1,7,32,256,5120} in each dim plus the all-large 32x256x5120 case: worst
+   measured **2.524e-06** relative (gate 1e-5).
+2. Row n of GEMM == matvec on X[n], non-tile-aligned shapes: worst measured
+   ~1e-6 (bf16/f32, gate 1e-5), well under 2e-2 (Q8).
+3. k_matmul_q8 vs `sg_ref_matvec_q8` looped over N rows: worst measured
+   **7.973e-07** (gate 2e-2).
+4. 100 reruns byte-identical, output poisoned before each run, all three
+   kernels: **100/100**.
+5. `make check` (live Metal) + `make debug` (SURGE_NO_METAL, ASan/UBSan)
+   both exit 0, no sanitizer diagnostics.
+
+### Review round (codex gpt-5.5)
+No kernel/dispatch correctness findings; explicitly confirmed buffer order,
+Q8/bf16 dequant, check_params-before-check_sizes ordering, `SG_K_TILES2D`
+dispatch shape, and decode-path isolation all match. One low finding, fixed:
+`g_worst_label` (test-file diagnostic global) latched a `const char *` that,
+for several call sites including the new GEMM ones, pointed at a stack
+buffer that did not outlive the function that built it -- a pre-existing
+pattern in the file, fixed at the shared root (`check_rel_tol`) by copying
+into an owned `char[64]` instead. Committed separately (`62c7646`).
+
+### Deviation: 2D thread/threadgroup position, not a flat SG_TG dispatch
+First compile attempt mixed a `uint2 threadgroup_position_in_grid` with a
+flat `uint thread_position_in_threadgroup`; Metal rejects mixed scalar/
+vector attributed parameters in one function. Fixed by making both `uint2`
+and dispatching `threadsPerThreadgroup: (SG_GEMM_TN, SG_GEMM_TM, 1)` instead
+of the reduction kernels' flat `(SG_TG, 1, 1)`. Total threads per
+threadgroup unchanged (256).
+
+### Files touched
+`src/kernels.metal` (+128), `src/metal.m` (+84/-11), `surge.h` (+13),
+`tests/test_metal_ops.c` (+~400/-8 across two commits: `87f8553`, `62c7646`).
+
+### Not done (explicitly out of scope for M5.3)
+These kernels are not yet wired into `sg_gpu_forward` / the prefill
+orchestration -- that is M5.4+ (full-attn prefill) and M5.5 (DeltaNet
+chunked scan)'s job.

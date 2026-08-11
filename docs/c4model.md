@@ -44,7 +44,7 @@ optionally Accelerate for the CPU reference path. No third-party libraries.
 | `src/kv.c` | (M5.1) fp16 growable KV cache for full-attention layers + fixed-size DeltaNet recurrent state, over opaque GPU-buffer handles; Metal-free (allocation injected). `sg_kv_bytes` = 16 GiB K+V at 262,144. Wired into decode by M5.2 (see below). |
 | `src/bench.c` | (B-series) pure-C benchmark math: decode-by-slope, leaderboard-row/JSON formatters, prompt file read, ingestion/truncation guard, NIAH recall scorer. |
 | `src/metal.m` | Metal device init, weight-buffer wrapping (mmap, no-copy; bf16/f32/Q8_0 sizing), per-weight matvec kernel dispatch (`matmul_kernel_for`), one command buffer per decode token, kernel registration (KI_ enum + SG_KERNELS table + size/param checks). Registers itself as `sg_kv`'s allocation backend at init. Decode state: the DEFAULT full-attention KV cache is fp16, allocated through `sg_kv` as SEPARATE per-layer K/V buffers (M5.2, `SURGE_KV_DTYPE` env toggle); `SURGE_KV_DTYPE=f32` selects the original combined-buffer f32 path unchanged, kept so the M2 gate's oracle never moves. DeltaNet conv/S state stays on its pre-M5.1 ad hoc allocation either way (DeltaNet decode is not yet refit onto `sg_kv`). |
-| `src/kernels.metal` | deterministic Metal kernels (fixed-tree reductions, no atomics/simd_sum): bf16/f32/Q8_0 matvec, attention decode (f32-KV `k_attn_decode` and fp16-KV `k_attn_decode_f16`, M5.2), a decode-step fp16 store (`k_kv_store_f16`, M5.2), gated-DeltaNet decode, RoPE, RMSNorm, SwiGLU. Tiled prefill kernels arrive later in M5. |
+| `src/kernels.metal` | deterministic Metal kernels: decode-step ones fold a fixed reduction tree (no atomics/simd_sum) -- bf16/f32/Q8_0 matvec, attention decode (f32-KV `k_attn_decode` and fp16-KV `k_attn_decode_f16`, M5.2), a decode-step fp16 store (`k_kv_store_f16`, M5.2), gated-DeltaNet decode, RoPE, RMSNorm, SwiGLU. Prefill's tiled GEMM (M5.3, `k_matmul_bf16`/`k_matmul_f32`/`k_matmul_q8`, `Y[N,M]=X[N,K]@W[M,K]^T`) uses a different determinism mechanism: one thread per output element of a 16x16 output tile, a private serial K-loop, no cross-thread reduction at all (nothing to fold). Tiled/flash attention and the DeltaNet chunked scan kernels arrive later in M5. |
 | `src/cli_*.c` | the four CLI mains. |
 
 ## Level 4: Data flows
@@ -86,7 +86,12 @@ optionally Accelerate for the CPU reference path. No third-party libraries.
     the decode path) DONE: default full-attention KV cache is fp16 via `sg_kv` (separate
     K/V buffers), `k_kv_store_f16`/`k_attn_decode_f16` bit-identical to the f32 kernels
     fed pre-rounded inputs (100 reruns), M2 gate re-verified byte-for-bit unchanged on
-    the f32 path (`git stash`-diffed, not just "still passes"). M5.3-M5.7 pending.
+    the f32 path (`git stash`-diffed, not just "still passes"). M5.3 (tiled GEMM kernels)
+    DONE: `k_matmul_bf16`/`k_matmul_f32`/`k_matmul_q8` added (new `SG_K_TILES2D` grid
+    class), not yet wired into `sg_gpu_forward` (that is M5.4+'s job); vs a host f64
+    reference and vs the existing matvec kernels, worst measured 2.5e-6 relative
+    (bf16/f32, gate 1e-5) and 8e-7 (Q8_0, gate 2e-2); 100/100 byte-identical determinism.
+    M5.4-M5.7 pending.
   - Bench harness: B1/B3/B4 (pure C) done; B2/B5/B6 (Metal/CLI) and B7 (gated 256K run)
     pending.
 - **Not built:** M4 (kernel excellence / beat mlx-lm), server mode, non-Metal platforms,

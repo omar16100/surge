@@ -909,6 +909,15 @@ typedef struct {
     double prefill_tps;        /* < 0 means "not measured" -> "-" in the md row */
     double decode_tps_slope;   /* sg_bench_slope's result */
     double decode_tps_avg;     /* sg_bench_avg_tps's result */
+    double prefill_wall_s;     /* prefill-phase wall time, seconds, Task B6:
+                                 * independently timed (not derived from
+                                 * wall_s), so prefill_wall_s + decode_wall_s
+                                 * closing wall_s is a real cross-check, not
+                                 * a tautology. */
+    double decode_wall_s;      /* decode-phase wall time, seconds, Task B6:
+                                 * own now_s()..now_s() span around the
+                                 * decode loop, independent of the per-token
+                                 * t_wall_cum series used for the slope fit. */
     double peak_ram_gib;       /* process phys_footprint peak, Task B2 */
     double gpu_alloc_gib;      /* Metal currentAllocatedSize peak, Task B2 */
     uint32_t recall_hits;      /* NIAH direct-retrieval hits, Task B4 */

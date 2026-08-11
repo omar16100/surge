@@ -1627,3 +1627,60 @@ Metal-only vs pure-C documented on each), `Makefile` (new `METAL_HYBRID_TESTS` r
   + `make debug` (ASan/UBSan, no diagnostics) + `make bench-check` all exit 0. The 27B GPU run
   itself is B7 (not run here). BOS toggle is env-gated (`SURGE_BENCH_TOK_MODEL`) so `make check`
   stays hermetic; demonstrated manually against the 27B GGUF (tokenize-only, VOIDs before GPU load).
+
+## Task B6 Results (offline decode-slope + wall-accounting verification)
+
+- NEW `sg_bench_row.prefill_wall_s` / `.decode_wall_s` (surge.h, additive): independently timed
+  (own `now_s()..now_s()` spans around the prefill and decode phases in `src/cli_bench.c`), not
+  derived from `wall_s` or from `t_wall_cum[]`. `t_decode_phase_start` is captured BEFORE the
+  "after prefill" `sample_mem` call (not after), so that call's cost lands inside `decode_wall_s`
+  rather than an unaccounted gap between the two phase clocks -- `prefill_wall_s + decode_wall_s`
+  closes `wall_s` to exact equality (`rel_gap == 0.0` observed, not just "small"), a real
+  cross-check of two independently-timed phases, not a tautology. Exposed in
+  `sg_bench_format_json`'s output (`src/bench.c`).
+- NEW `tests/test_cli_bench.sh` B6 block (covered by the same "no Metal device" probe skip as the
+  rest of the file, so `make debug` never runs it): drives `surge-bench` on the mini fixture and
+  refits the `--emit-timeseries` file offline in `python3` (`/opt/homebrew/bin/python3`, falling
+  back to `command -v python3`; a genuine SKIP -- distinct label in the final summary, not silently
+  claimed as passed -- if neither is found), mirroring `sg_bench_slope`'s mean-centered OLS and
+  `sg_bench_avg_tps` exactly. Four checks: (1) reported `decode_tps_slope` == offline
+  `[warmup, n)` refit within 0.5% (`CHECK1_TOL`); (2) `|slope - avg| / avg < 3%` (plus a bonus
+  sanity: the reported `decode_tps_avg` itself matches an offline `sg_bench_avg_tps` refit within
+  0.5%, so the check-2 comparison is not between two correlated-wrong numbers); (3)
+  `prefill_wall_s + decode_wall_s` closes `wall_s` within 2%; (4) the reported slope matches the
+  warmup-EXCLUDED refit AND (via 5 independent runs, best-of-5) is decisively far from the naive
+  `[0, n)` refit that still carries token 0's post-prefill transient. Every run (steady + each
+  transient) also asserts `status == "DONE"`, `n_gen == expected_n`, the timeseries row count ==
+  expected_n, and the timeseries index column is exactly `0..expected_n-1`, so a run truncated by
+  early EOS or a timeseries-write bug fails loudly instead of silently refitting a shorter window.
+- Check 4 REDESIGNED after a codex review caught a real gap in the first version: comparing only
+  the two OFFLINE refits (naive vs warmup-excluded) to each other never referenced `reported` at
+  all, so a hypothetical `surge-bench` bug that always computed the naive `[0,n)` fit and ignored
+  `--warmup` could still pass both check 1 (if the natural naive-vs-warmup gap on that run happened
+  to be under check 1's own 0.5%) and the old check 4 (which only needed a >0.01% offline gap) --
+  the two thresholds were not related to each other. FIXED: check 4 now computes
+  `reported_vs_naive_rel_err = |reported - offline_naive_refit| / offline_naive_refit` directly and
+  requires the max across the run pool to exceed `DECISIVE_MARGIN = 0.01` (1%, 2x `CHECK1_TOL`), so
+  the two thresholds cannot both be satisfied by an ambiguous "close" value: if `--warmup` were
+  ignored, `reported` would equal the naive refit to ~1e-6 precision (check 1's own noise floor),
+  not sit >=1% away from it. Verified the fix actually catches the bug class it targets: temporarily
+  hardcoded `warmup = 0` in `cli_bench.c` (simulating a warmup-ignoring bug), rebuilt, and ran the
+  B6 block 8 times -- all 8 correctly FAILED (check 1 caught it directly; check 4's own max
+  `reported_vs_naive_rel_err` was ~2.9e-6, i.e. `reported` really was the naive fit); reverted and
+  confirmed the real build passes again. Second codex pass on the fixed diff found no remaining
+  correctness issues.
+- TWO run shapes, found by extensive empirical measurement (not guesswork): checks 1-3 use one
+  `-n 1024` run (a STEADY, low-relative-noise fit -- the mini fixture's per-token decode is only
+  ~0.6 ms, and empirically running the checks right after this script's own preceding ~10 GPU
+  loads is measurably noisier than a cold process: `-n 192` post-churn hit 3.2%-5.7% failures
+  against the 3% gate in repeated testing; `-n 1024` post-churn stayed <1% over 15 repeats). Check
+  4 uses FIVE independent `-n 12` runs (best-of-5), warmup left at the brief-suggested small value
+  (3) with N shrunk instead of warmup grown, so a fixed 3-token exclusion carries real leverage on
+  a short fit: individual-run miss rate against the 1% decisive margin was empirically ~4% (1/25),
+  so all 5 of 5 missing is ~1e-7.
+- Gates (all green; 8-24 repeated runs each of `make check`, `make bench-check`, and the shell test
+  alone, across two design iterations, to rule out flakiness): `make check`, `make debug`
+  (SURGE_NO_METAL, ASan/UBSan, no diagnostics). Existing B5 gates (gen_ids parity, VOID/exit-3,
+  BOS) unaffected -- no existing check was touched, weakened, or reordered. Full measurements and
+  the two-run-shape / check-4-redesign rationale are in
+  `.superpowers/sdd/2026-08-09-surge-m3-m5/task-B6-report.md`.

@@ -154,8 +154,19 @@ optionally Accelerate for the CPU reference path. No third-party libraries.
     (live GPU, env-gated); the C test SKIPs cleanly without `SURGE_GATE_MODEL`, so
     `make check` stays mini-only and hermetic. Public `sg_gpu_used` added so the gate reads
     the used counter without reaching into the opaque `sg_gpu`. M5 COMPLETE.
-  - Bench harness: B1/B3/B4 (pure C), B2 (peak-memory probe) and B5 (`surge-bench` CLI +
-    shared `sg_argmax_f32`) done; B6 (offline re-fit) and B7 (gated 256K run) pending. B5
+  - Bench harness: B1/B3/B4 (pure C), B2 (peak-memory probe), B5 (`surge-bench` CLI +
+    shared `sg_argmax_f32`), and B6 (offline decode-slope + wall-accounting verification) done;
+    B7 (gated 256K run) pending. B6 adds two additive `sg_bench_row` fields,
+    `prefill_wall_s`/`decode_wall_s` (own `now_s()` spans around the prefill/decode phases in
+    `cli_bench.c`, independent of `wall_s`/the per-token series), plus a `tests/test_cli_bench.sh`
+    block (same Metal-guard as the rest of the file) that drives `surge-bench` on the mini fixture
+    and independently refits `--emit-timeseries` offline in `python3`, checking: reported
+    `decode_tps_slope` matches the offline `[warmup,n)` OLS refit within 0.5%; `|slope-avg|/avg`
+    within 3%; `prefill_wall_s+decode_wall_s` closes `wall_s` within 2% (observed exact, `0.0`
+    gap); and the reported slope is decisively (>1%, over a best-of-5 pool) far from the naive
+    `[0,n)` refit that still carries the post-prefill transient, ruling out a warmup-ignoring bug
+    (verified by deliberately reintroducing that exact bug and confirming the gate catches it 8/8
+    times). Full rationale in `.superpowers/sdd/2026-08-09-surge-m3-m5/task-B6-report.md`. B5
     resolves the B2 peak-RAM question below: it tracks the two signals SEPARATELY across
     the whole run and reports `row.peak_ram_gib` = peak `phys_footprint` (resident,
     comparable to mlx-lm/llama.cpp) and `row.gpu_alloc_gib` = peak `currentAllocatedSize`

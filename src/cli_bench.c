@@ -454,6 +454,19 @@ int main(int argc, char **argv) {
     }
     double t_prefill = now_s() - t0;
     row.prefill_tps = t_prefill > 0.0 ? (double)n_ids / t_prefill : -1.0;
+    row.prefill_wall_s = t_prefill;
+
+    /* Own clock for the decode phase's wall span (Task B6): started here, at
+     * the exact instant prefill_wall_s's own clock stopped -- BEFORE the
+     * "after prefill" sample_mem call below, not after it, so that call's
+     * cost lands inside decode_wall_s (which covers everything up to
+     * wall_s's own end-of-run timestamp) rather than in an unaccounted gap
+     * between the two phase clocks. That makes
+     * prefill_wall_s + decode_wall_s == wall_s to within the cost of the
+     * now_s() calls themselves (nanoseconds), a real cross-check of two
+     * independently-timed phases, not a tautology, and not dependent on how
+     * expensive sample_mem happens to be on a given machine. */
+    double t_decode_phase_start = now_s();
     sample_mem(gpu, &mt_phys, &mt_alloc);      /* after prefill */
 
     /* ---- decode (shared driver: sg_argmax_f32 + sg_gpu_forward) ----
@@ -483,6 +496,7 @@ int main(int argc, char **argv) {
         if (!quiet) fprintf(stderr, "\n");
     }
     row.wall_s = now_s() - t_run_start;
+    row.decode_wall_s = now_s() - t_decode_phase_start;
     row.n_gen = produced;   /* the ACTUAL number generated (EOS may stop early) */
     sample_mem(gpu, &mt_phys, &mt_alloc);      /* after decode */
 

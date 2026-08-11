@@ -1392,3 +1392,63 @@ and bridge post-prefill sg_kv DeltaNet state into decode (decode still reads the
 ad hoc `L->conv_buf`/`L->ssm`), and (b) allocate `g->kv` whenever the model has
 DeltaNet layers, since state_new currently allocates it only for
 `kv_dtype==f16 && n_attn>0` and `enc_gdn_prefill` needs its conv/S buffers.
+
+## Task M5.6 Results (metal.m/cli_metal.c: chunked prefill orchestration sg_gpu_prefill)
+The integration task: `sg_gpu_prefill(g, m, tokens, n_tokens, chunk_size,
+out_last_logits)` (surge.h) ingests a whole prompt in chunks (default
+SG_PREFILL_CHUNK_DEFAULT = 1024), ONE Metal command buffer per chunk, every
+layer encoded into it: full-attention layers via `enc_attn_prefill` (M5.4),
+gated-DeltaNet layers via `enc_gdn_prefill` (M5.5), plus the chunked MLP
+(k_rmsnorm_heads per-token ln1/ln2, tiled-GEMM gate/up/down, k_swiglu). Only the
+FINAL chunk's LAST row runs out_norm + lm_head (matvec, byte-identical to
+decode); returns that position's logits. First end-to-end drive of both prefill
+encoders.
+
+Chunk loop: for base in 0,chunk,2*chunk,...: host embeds the chunk (ref.c wrow)
+into b_x and builds the per-token RoPE cos/sin table (double, uploaded f32,
+byte-identical to sg_gpu_forward's one-token table); scratch_ensure the
+k_attn_prefill score row (n*n_heads*(base+n) floats) before the command buffer
+opens; encode all layers; commit+wait; advance g->used and sg_kv by n.
+
+The prefill encoders read the g->b_* scratch fields, which sg_gpu_state_new
+sizes for ONE token, so sg_gpu_prefill SWAPS chunk-sized buffers into those
+fields (save -> alloc -> run -> free -> restore); b_logits/h_logits are reused
+untouched. Requires the f16 KV path (returns an error on SURGE_KV_DTYPE=f32,
+which has no sg_kv object).
+
+Three carry-forwards CLOSED:
+1. STATE BRIDGING (chosen: option i, copy sg_kv -> decode buffers at the end).
+   Prefill threads DeltaNet state through sg_kv's conv/S carriers during the
+   scan; decode reads L->conv_buf/L->ssm. At prefill start: g->used=0,
+   sg_kv_reset, zero L->conv_buf/L->ssm. After the last chunk: per DeltaNet
+   layer, memcpy sg_kv_conv -> L->conv_buf+conv_dim ([conv_kernel-1, conv_dim]
+   tail, same oldest-first layout) and sg_kv_s -> L->ssm ([n_v,dv,dk], identical
+   layout). Full-attn K/V is already written into g->kv (the buffers decode
+   reads); g->used left at n_tokens and sg_kv advanced to match, so decode
+   continues at pos==n_tokens with no more bridging.
+2. g->kv ALLOCATION widened in sg_gpu_state_new from `kv_dtype==f16 && n_attn>0`
+   to `kv_dtype==f16 && (n_attn>0 || n_gdn>0)`, so a hybrid OR DeltaNet-only
+   model has non-NULL sg_kv conv/S carriers for enc_gdn_prefill.
+3. WIRING gated by tests/test_gpu_prefill.c on the mini hybrid (layer 3
+   full-attn, layers 0-2 DeltaNet: BOTH kinds), both formats.
+
+CLI (cli_metal.c): --chunk N (default 1024), --no-prefill. Prefill is the
+default for -p/--ids on the Metal path; it falls back to the serial one-token
+path for --ref, --no-prefill, and --logits (which needs per-position logits).
+Both paths feed the SAME argmax_f32, so gen_ids are identical either way.
+
+Gates (all pass):
+1. Both mini models (bf16 st + f32 gguf), chunk {1,2,3}: prefill last-argmax ==
+   serial forward last-argmax, worst rel 1.222e-06 (bar 2e-4); both layer kinds
+   asserted present.
+2. prefill+decode gen_ids == serial+decode gen_ids, 16/16 (state bridging).
+3. prefill reruns byte-identical (last logits + 16 decode gen_ids).
+4. CLI prefill vs --no-prefill identical gen_ids (both formats, chunks 1/5/1024,
+   single-token and 24-token/4-chunk prompts).
+5. make check (live Metal) and make debug (SURGE_NO_METAL + ASan/UBSan) exit 0,
+   no sanitizer diagnostics.
+
+The low 1.2e-6 rel gap (vs the 2e-4 bar) is because attn/conv/delta/gates/rmsnorm
+chunk kernels are bit-identical to their per-token siblings; the only
+prefill-vs-decode arithmetic difference is GEMM-vs-matvec reassociation in the
+projections, tiny at these dims.

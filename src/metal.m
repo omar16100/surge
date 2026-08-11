@@ -2534,16 +2534,24 @@ sg_err sg_gpu_state_new(sg_gpu *g, const sg_model *m, uint32_t max_ctx) {
         }
     }
 
-    if (kv_dtype == SG_T_F16 && n_attn > 0) {
+    if (kv_dtype == SG_T_F16 && (n_attn > 0 || n_gdn > 0)) {
         /* sg_kv_new sizes and allocates every full-attention layer's
          * SEPARATE K and V buffer (the M5.1 layout) in one call, through the
          * backend sg_gpu_init registered. It also sizes DeltaNet conv/S
          * state internally (sg_kv models both layer kinds), which duplicates
-         * the ad hoc L->conv_buf/L->ssm allocated just above; that state is
-         * fixed-size and small (kilobytes per layer) and this task does not
-         * read it back through sg_kv's getters, so the duplication costs
-         * memory, not correctness -- DeltaNet decode is not part of M5.2's
-         * scope (see the task brief). */
+         * the ad hoc L->conv_buf/L->ssm allocated just above; on the decode
+         * path that state is untouched (decode reads L->conv_buf/L->ssm), but
+         * M5.6's sg_gpu_prefill DOES thread the DeltaNet scan through sg_kv's
+         * conv/S carriers and then bridges the final state back into
+         * L->conv_buf/L->ssm, so those carriers must exist.
+         *
+         * M5.6 widened this from `n_attn > 0` to also allocate when the model
+         * has ONLY DeltaNet layers: enc_gdn_prefill dereferences
+         * sg_kv_conv/sg_kv_s, so a hybrid OR a DeltaNet-only model must have
+         * g->kv non-NULL or prefill would fault on a NULL carrier. (With
+         * layers > 0, `n_attn > 0 || n_gdn > 0` is always true on the f16
+         * path, so this is effectively "always allocate on f16"; the explicit
+         * disjunction documents WHY.) */
         e = sg_kv_new(g, c, max_ctx, SG_T_F16, &g->kv);
         if (sg_failed(e)) { gpu_free_state(g); return e; }
     }
@@ -2660,4 +2668,311 @@ sg_err sg_gpu_forward(sg_gpu *g, const sg_model *m, int32_t token, uint32_t pos,
     g->used = pos + 1;
     if (logits) *logits = g->h_logits;
     return SG_OK;
+}
+
+/* --------------------------------------------------------------------
+ * Chunked prompt prefill (Task M5.6)
+ * --------------------------------------------------------------------
+ *
+ * sg_gpu_prefill wires the M5.4 full-attention prefill encoder
+ * (enc_attn_prefill) and the M5.5 gated-DeltaNet prefill encoder
+ * (enc_gdn_prefill) across ALL layers, one command buffer per chunk, and
+ * closes the three M5.2/M5.4/M5.5 carry-forwards:
+ *
+ *   1. STATE BRIDGING. enc_gdn_prefill threads the DeltaNet recurrent state
+ *      (conv tail + S) through sg_kv's per-layer conv/S carriers, but decode
+ *      reads that state from the ad hoc L->conv_buf / L->ssm. After the last
+ *      chunk this copies each DeltaNet layer's final conv tail and S out of the
+ *      sg_kv carriers into L->conv_buf / L->ssm -- a small fixed-size per-layer
+ *      host memcpy, safe because every chunk command buffer has been waited on
+ *      and both are shared-storage unified memory. Full-attention KV is written
+ *      straight into g->kv (the same buffers decode reads), and g->used is left
+ *      at n_tokens with sg_kv advanced to match, so decode continues at
+ *      pos == n_tokens with no further bridging.
+ *   2. g->kv ALLOCATION. Fixed in sg_gpu_state_new (allocated for a hybrid OR a
+ *      DeltaNet-only model on the f16 path, not only full-attn f16).
+ *   3. WIRING. This is the first end-to-end drive of enc_attn_prefill /
+ *      enc_gdn_prefill; tests/test_gpu_prefill.c gates it against the serial
+ *      forward on the mini hybrid, which has both a full-attn and DeltaNet layer.
+ *
+ * The prefill encoders read the g->b_* scratch fields, which sg_gpu_state_new
+ * sizes for ONE token. This swaps chunk-sized scratch into those fields for the
+ * duration, then frees it and restores the one-token decode buffers untouched,
+ * so a following sg_gpu_forward finds exactly the state it expects.
+ */
+typedef struct {
+    void *b_x, *b_h, *b_r, *b_qg, *b_ctx, *b_ffg, *b_ffu,
+         *b_qkv, *b_ab, *b_gates, *b_y, *b_cs, *b_k32, *b_v32;
+    float *h_x, *h_cs;
+} sg_prefill_bufs;
+
+static void prefill_save(sg_gpu *g, sg_prefill_bufs *s) {
+    s->b_x = g->b_x; s->b_h = g->b_h; s->b_r = g->b_r; s->b_qg = g->b_qg;
+    s->b_ctx = g->b_ctx; s->b_ffg = g->b_ffg; s->b_ffu = g->b_ffu;
+    s->b_qkv = g->b_qkv; s->b_ab = g->b_ab; s->b_gates = g->b_gates;
+    s->b_y = g->b_y; s->b_cs = g->b_cs; s->b_k32 = g->b_k32; s->b_v32 = g->b_v32;
+    s->h_x = g->h_x; s->h_cs = g->h_cs;
+}
+
+static void prefill_restore(sg_gpu *g, const sg_prefill_bufs *s) {
+    g->b_x = s->b_x; g->b_h = s->b_h; g->b_r = s->b_r; g->b_qg = s->b_qg;
+    g->b_ctx = s->b_ctx; g->b_ffg = s->b_ffg; g->b_ffu = s->b_ffu;
+    g->b_qkv = s->b_qkv; g->b_ab = s->b_ab; g->b_gates = s->b_gates;
+    g->b_y = s->b_y; g->b_cs = s->b_cs; g->b_k32 = s->b_k32; g->b_v32 = s->b_v32;
+    g->h_x = s->h_x; g->h_cs = s->h_cs;
+}
+
+/* Frees whatever chunk buffers are currently in g's b_* fields and NULLs them,
+ * so a partial-allocation failure and the normal teardown share one path. */
+static void prefill_free_chunk(sg_gpu *g) {
+    void *bufs[] = { g->b_x, g->b_h, g->b_r, g->b_qg, g->b_ctx, g->b_ffg,
+                     g->b_ffu, g->b_qkv, g->b_ab, g->b_gates, g->b_y, g->b_cs,
+                     g->b_k32, g->b_v32 };
+    for (size_t i = 0; i < sizeof bufs / sizeof *bufs; i++) sg_gpu_buf_free(bufs[i]);
+    g->b_x = g->b_h = g->b_r = g->b_qg = g->b_ctx = g->b_ffg = g->b_ffu = NULL;
+    g->b_qkv = g->b_ab = g->b_gates = g->b_y = g->b_cs = NULL;
+    g->b_k32 = g->b_v32 = NULL;
+    g->h_x = g->h_cs = NULL;
+}
+
+sg_err sg_gpu_prefill(sg_gpu *g, const sg_model *m, const int32_t *tokens,
+                      uint32_t n_tokens, uint32_t chunk_size,
+                      const float **out_last_logits) {
+    if (!g || !m || !tokens) return (sg_err){"gpu: sg_gpu_prefill got a NULL argument"};
+    if (!g->have_state) return (sg_err){"gpu: call sg_gpu_state_new first"};
+    if (m != g->model) return (sg_err){"gpu: this gpu was loaded with a different sg_model"};
+    const sg_cfg *c = &g->cfg;
+    if (n_tokens == 0) return (sg_err){"gpu: sg_gpu_prefill needs at least one token"};
+    if (n_tokens > g->max_ctx) return (sg_err){"gpu: prompt length exceeds max_ctx"};
+    for (uint32_t t = 0; t < n_tokens; t++) {
+        if (tokens[t] < 0 || (uint32_t)tokens[t] >= c->vocab) {
+            return (sg_err){"gpu: a prompt token id is out of range"};
+        }
+    }
+    /* enc_attn_prefill reads g->kv's fp16 K/V and enc_gdn_prefill reads its
+     * conv/S carriers; the f32 KV path has no sg_kv object at all. */
+    if (g->kv_dtype != SG_T_F16 || !g->kv) {
+        return (sg_err){"gpu: sg_gpu_prefill needs the f16 KV path (SURGE_KV_DTYPE=f16)"};
+    }
+
+    uint32_t chunk = chunk_size ? chunk_size : SG_PREFILL_CHUNK_DEFAULT;
+    uint32_t cn = (chunk < n_tokens) ? chunk : n_tokens;   /* longest chunk used */
+
+    /* Several per-chunk kernel params are a chunk-length-times-width product
+     * passed as a uint32 (KI_ADD's n*hidden, KI_SWIGLU's n*ffn_hidden,
+     * KI_SILU's n*conv_dim in enc_gdn_prefill, and the smaller per-token slice
+     * counts n*n_heads / n*n_kv_heads / n*n_v_heads). Those are formed in 32-bit
+     * C arithmetic, so a chunk wide enough to overflow one would silently wrap
+     * it (a WRONG result, not a device fault) even though every buffer is sized
+     * in u64. n <= cn for every chunk, so bounding cn against the widest such
+     * factor rejects the whole class up front. In practice the f16 path caps
+     * n_tokens at SG_KV_CAP_MAX (262144), so this only bites an absurdly large
+     * --chunk on a very wide model; reject with a clear message rather than
+     * truncate. */
+    {
+        uint64_t widest = c->hidden;
+        if (c->ffn_hidden > widest) widest = c->ffn_hidden;
+        if (g->conv_dim > widest)   widest = g->conv_dim;
+        if (g->value_dim > widest)  widest = g->value_dim;
+        if (g->q_width > widest)    widest = g->q_width;
+        uint64_t prod = 0;
+        if (!mul_ck((uint64_t)cn, widest, &prod) || prod > UINT32_MAX) {
+            return (sg_err){"gpu: chunk size too large for this model's widths "
+                            "(a 32-bit kernel param would overflow); use a smaller --chunk"};
+        }
+    }
+
+    uint32_t n_attn = 0, n_gdn = 0;
+    for (uint32_t i = 0; i < c->n_layers; i++) {
+        if (g->ls[i].is_attn) n_attn++; else n_gdn++;
+    }
+
+    int gemm = gemm_kernel_for(m->wtype);
+    uint32_t eps = fbits(c->rms_eps);
+    uint32_t half = c->rope_dim / 2u;
+
+    /* Swap the one-token decode scratch out and chunk-sized scratch in. */
+    sg_prefill_bufs saved;
+    prefill_save(g, &saved);
+    g->b_x = g->b_h = g->b_r = g->b_qg = g->b_ctx = g->b_ffg = g->b_ffu = NULL;
+    g->b_qkv = g->b_ab = g->b_gates = g->b_y = g->b_cs = NULL;
+    g->b_k32 = g->b_v32 = NULL;
+    g->h_x = g->h_cs = NULL;
+
+    sg_err e = SG_OK;
+#define PF_ALLOC(field, nelem, hostpp) do { \
+        e = gpu_alloc_f32(g, (uint64_t)(nelem), &g->field, (hostpp)); \
+        if (sg_failed(e)) goto cleanup; \
+    } while (0)
+
+    PF_ALLOC(b_x, (uint64_t)cn * c->hidden, &g->h_x);
+    PF_ALLOC(b_h, (uint64_t)cn * c->hidden, NULL);
+    PF_ALLOC(b_r, (uint64_t)cn * c->hidden, NULL);
+    PF_ALLOC(b_ffg, (uint64_t)cn * c->ffn_hidden, NULL);
+    PF_ALLOC(b_ffu, (uint64_t)cn * c->ffn_hidden, NULL);
+    if (n_attn > 0) {
+        PF_ALLOC(b_qg, (uint64_t)cn * g->q_width, NULL);
+        PF_ALLOC(b_ctx, (uint64_t)cn * g->attn_width, NULL);
+        PF_ALLOC(b_k32, (uint64_t)cn * g->kv_width, NULL);
+        PF_ALLOC(b_v32, (uint64_t)cn * g->kv_width, NULL);
+        PF_ALLOC(b_cs, (uint64_t)cn * c->rope_dim, &g->h_cs);
+    }
+    if (n_gdn > 0) {
+        PF_ALLOC(b_qkv, (uint64_t)cn * g->conv_dim, NULL);
+        PF_ALLOC(b_ab, 2ull * cn * c->n_v_heads, NULL);
+        PF_ALLOC(b_gates, 2ull * cn * c->n_v_heads, NULL);
+        PF_ALLOC(b_y, (uint64_t)cn * g->value_dim, NULL);
+    }
+#undef PF_ALLOC
+
+    /* Start clean at position 0: reset used, zero the sg_kv DeltaNet carriers
+     * (read unconditionally by the scan), and zero the ad hoc decode conv/S
+     * (bridged from sg_kv at the very end, but zeroed now so the state is well
+     * defined throughout). K/V caches are append-only and need no clearing. */
+    g->used = 0;
+    sg_kv_reset(g->kv);
+    for (uint32_t i = 0; i < c->n_layers; i++) {
+        sg_gpu_layer *L = &g->ls[i];
+        if (L->is_attn) continue;
+        float *h = (float *)sg_gpu_buf_host(L->conv_buf);
+        if (h) memset(h, 0, (size_t)g->conv_dim * c->conv_kernel * sizeof *h);
+        h = (float *)sg_gpu_buf_host(L->ssm);
+        if (h) {
+            memset(h, 0, (size_t)c->n_v_heads * c->head_v_dim
+                             * c->head_k_dim * sizeof *h);
+        }
+    }
+
+    for (uint32_t base = 0; base < n_tokens; base += chunk) {
+        uint32_t n = n_tokens - base;
+        if (n > chunk) n = chunk;
+        bool last = (base + n == n_tokens);
+
+        /* Host embedding for the chunk (ref.c's wrow, exactly like decode). */
+        for (uint32_t t = 0; t < n; t++) {
+            gpu_embed_row(m->tok_emb, m->wtype, (uint64_t)tokens[base + t],
+                          c->hidden, g->h_x + (size_t)t * c->hidden);
+        }
+        /* Per-token RoPE cos/sin table in double, uploaded f32: one row per
+         * absolute position, [cos(rope_dim/2), sin(rope_dim/2)], byte-identical
+         * to the one-token table sg_gpu_forward builds. */
+        if (n_attn > 0 && g->h_cs) {
+            for (uint32_t t = 0; t < n; t++) {
+                float *row = g->h_cs + (size_t)t * c->rope_dim;
+                uint32_t pos = base + t;
+                for (uint32_t i = 0; i < half; i++) {
+                    double inv_freq = pow((double)c->rope_theta,
+                                          -2.0 * (double)i / (double)c->rope_dim);
+                    double ang = (double)pos * inv_freq;
+                    row[i] = (float)cos(ang);
+                    row[half + i] = (float)sin(ang);
+                }
+            }
+        }
+        /* k_attn_prefill's per-threadgroup private score row is base+n long,
+         * over n*n_heads threadgroups; ensure it before the command buffer
+         * opens (never mid-encode). */
+        if (n_attn > 0) {
+            uint64_t need = 0, t0 = 0;
+            if (!mul_ck((uint64_t)n * c->n_heads, (uint64_t)base + n, &t0)
+                || !mul_ck(t0, 4, &need)) {
+                e = (sg_err){"gpu: prefill score-scratch size overflows 64 bits"};
+                goto cleanup;
+            }
+            e = scratch_ensure(g, need);
+            if (sg_failed(e)) goto cleanup;
+        }
+
+        __block sg_err rc = SG_OK;
+        @autoreleasepool {
+            id<MTLCommandBuffer> cb = [g->queue commandBuffer];
+            id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+            if (!cb || !enc) {
+                rc = (sg_err){"gpu: could not open a compute encoder"};
+            } else {
+                sg_enc E = { g, enc };
+                for (uint32_t i = 0; i < c->n_layers; i++) {
+                    sg_gpu_layer *L = &g->ls[i];
+                    /* ln1 per token: KI_RMSNORM_HEADS with heads=n is the
+                     * per-slice form of decode's k_rmsnorm (identical scale
+                     * formula and tg_sum tree), so ln1/ln2 are bit-identical to
+                     * decode per token and the only prefill-vs-decode numeric
+                     * gap is GEMM-vs-matvec reassociation. */
+                    enc_op(&E, KI_RMSNORM_HEADS, g->b_x, 0, L->ln1, 0, g->b_h, 0,
+                           nil, 0, PARAMS(c->hidden, n, eps, 1, c->hidden));
+                    if (L->is_attn) enc_attn_prefill(&E, L, i, base, n);
+                    else            enc_gdn_prefill(&E, L, i, base, n);
+                    enc_op(&E, KI_ADD, g->b_x, 0, g->b_r, 0, g->b_x, 0, nil, 0,
+                           PARAMS(n * c->hidden));
+
+                    enc_op(&E, KI_RMSNORM_HEADS, g->b_x, 0, L->ln2, 0, g->b_h, 0,
+                           nil, 0, PARAMS(c->hidden, n, eps, 1, c->hidden));
+                    enc_matmul(&E, gemm, g->b_h, 0, L->w_gate, g->b_ffg, 0,
+                               n, c->ffn_hidden, c->hidden);
+                    enc_matmul(&E, gemm, g->b_h, 0, L->w_up, g->b_ffu, 0,
+                               n, c->ffn_hidden, c->hidden);
+                    enc_op(&E, KI_SWIGLU, g->b_ffg, 0, g->b_ffu, 0, g->b_ffg, 0,
+                           nil, 0, PARAMS(n * c->ffn_hidden));
+                    enc_matmul(&E, gemm, g->b_ffg, 0, L->w_down, g->b_r, 0,
+                               n, c->hidden, c->ffn_hidden);
+                    enc_op(&E, KI_ADD, g->b_x, 0, g->b_r, 0, g->b_x, 0, nil, 0,
+                           PARAMS(n * c->hidden));
+                }
+                if (last) {
+                    /* Only the last chunk's LAST row needs logits: out_norm on
+                     * that row (KI_RMSNORM_HEADS, heads=1, reading b_x at the
+                     * last token's offset) then lm_head via the matvec kernel,
+                     * exactly decode's final two ops. */
+                    enc_op(&E, KI_RMSNORM_HEADS, g->b_x,
+                           (uint64_t)(n - 1) * c->hidden, g->out_norm, 0,
+                           g->b_h, 0, nil, 0, PARAMS(c->hidden, 1, eps, 1, c->hidden));
+                    enc_op(&E, g->mat_kernel, g->lm_head, 0, g->b_h, 0,
+                           g->b_logits, 0, nil, 0, PARAMS(c->vocab, c->hidden));
+                }
+                [enc endEncoding];
+                [cb commit];
+                [cb waitUntilCompleted];
+                if ([cb error]) {
+                    rc = gpu_errf("gpu: prefill chunk failed: %s",
+                                  [[[cb error] localizedDescription] UTF8String]);
+                }
+            }
+        }
+        if (sg_failed(rc)) { e = rc; goto cleanup; }
+
+        /* Advance both counters together: decode's position bookkeeping uses
+         * g->used, and sg_kv's own used is kept consistent for its append-only
+         * overflow guard (M5.2 note). */
+        g->used += n;
+        e = sg_kv_advance(g->kv, n);
+        if (sg_failed(e)) goto cleanup;
+    }
+
+    /* Bridge the DeltaNet state from the sg_kv carriers into the decode
+     * buffers. conv tail: sg_kv_conv is [conv_kernel-1, conv_dim] oldest-first;
+     * L->conv_buf is [conv_kernel, conv_dim] (output row then the same tail), so
+     * the tail lands at element offset conv_dim. S: identical [n_v, dv, dk]. */
+    {
+        uint64_t conv_tail = (uint64_t)(c->conv_kernel - 1u) * g->conv_dim;
+        uint64_t s_elems = (uint64_t)c->n_v_heads * c->head_v_dim * c->head_k_dim;
+        for (uint32_t i = 0; i < c->n_layers; i++) {
+            sg_gpu_layer *L = &g->ls[i];
+            if (L->is_attn) continue;
+            float *cs = (float *)sg_gpu_buf_host(sg_kv_conv(g->kv, i));
+            float *cd = (float *)sg_gpu_buf_host(L->conv_buf);
+            if (cs && cd && conv_tail) {
+                memcpy(cd + g->conv_dim, cs, (size_t)conv_tail * sizeof *cd);
+            }
+            float *ss = (float *)sg_gpu_buf_host(sg_kv_s(g->kv, i));
+            float *sd = (float *)sg_gpu_buf_host(L->ssm);
+            if (ss && sd) memcpy(sd, ss, (size_t)s_elems * sizeof *sd);
+        }
+    }
+
+    if (out_last_logits) *out_last_logits = g->h_logits;
+
+cleanup:
+    prefill_free_chunk(g);
+    prefill_restore(g, &saved);
+    return e;
 }

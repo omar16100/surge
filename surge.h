@@ -700,6 +700,41 @@ sg_err sg_gpu_forward(sg_gpu *g, const sg_model *m, int32_t token, uint32_t pos,
                       const float **logits);
 
 /* ---------------------------------------------------------------------
+ * Chunked prompt prefill (Task M5.6)
+ * ---------------------------------------------------------------------
+ *
+ * Ingests a whole prompt (`tokens[0..n_tokens)`, absolute positions
+ * 0..n_tokens-1) in chunks of at most `chunk_size` tokens (0 selects the
+ * SG_PREFILL_CHUNK_DEFAULT of 1024), ONE Metal command buffer per chunk,
+ * every layer of the model encoded into that command buffer: full-attention
+ * layers through the M5.4 tiled prefill kernels, gated-DeltaNet layers through
+ * the M5.5 chunked-scan kernels. Only the FINAL chunk's LAST row runs
+ * out_norm + lm_head; earlier rows and earlier chunks never touch lm_head, so
+ * this returns just the last position's cfg.vocab logits, in host memory owned
+ * by the gpu and valid until the next sg_gpu_forward / sg_gpu_prefill call.
+ *
+ * This is the fast path replacement for feeding the prompt one token at a time
+ * through sg_gpu_forward: after sg_gpu_prefill(g, m, tokens, n, chunk, &lg), a
+ * subsequent sg_gpu_forward(g, m, next, pos=n, ...) continues decoding from the
+ * prefilled state and produces the same tokens as the one-at-a-time path.
+ *
+ * STATE. Prefill starts from a clean state (it resets used to 0, resets the
+ * sg_kv DeltaNet conv/S carriers, and zeroes the ad hoc decode conv/S
+ * buffers), then, at the end, BRIDGES each DeltaNet layer's final conv tail and
+ * S matrix out of the sg_kv carriers into the L->conv_buf / L->ssm the decode
+ * path reads, and leaves g->used == n_tokens with g->kv holding the
+ * full-attention K/V for positions 0..n_tokens-1. So decode picks up exactly
+ * where prefill left off.
+ *
+ * REQUIRES the fp16 KV path (the default; SURGE_KV_DTYPE=f32 has no sg_kv
+ * cache and returns an error here). tokens must all be in [0, vocab) and
+ * n_tokens must be >= 1 and <= max_ctx. */
+#define SG_PREFILL_CHUNK_DEFAULT 1024u
+sg_err sg_gpu_prefill(sg_gpu *g, const sg_model *m, const int32_t *tokens,
+                      uint32_t n_tokens, uint32_t chunk_size,
+                      const float **out_last_logits);
+
+/* ---------------------------------------------------------------------
  * Standalone KV-cache + DeltaNet-state module (Task M5.1, src/kv.c)
  * ---------------------------------------------------------------------
  *

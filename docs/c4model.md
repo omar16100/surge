@@ -43,7 +43,7 @@ optionally Accelerate for the CPU reference path. No third-party libraries.
 | `src/ref.c` | scalar CPU reference for every op (the correctness oracle), incl. `sg_ref_matvec_q8`, attention, gated-DeltaNet, partial RoPE, and the full forward pass. |
 | `src/kv.c` | (M5.1) fp16 growable KV cache for full-attention layers + fixed-size DeltaNet recurrent state, over opaque GPU-buffer handles; Metal-free (allocation injected). `sg_kv_bytes` = 16 GiB K+V at 262,144. Wired into decode by M5.2 (see below). |
 | `src/bench.c` | (B-series) pure-C benchmark math: decode-by-slope, leaderboard-row/JSON formatters, prompt file read, ingestion/truncation guard, NIAH recall scorer. |
-| `src/metal.m` | Metal device init, weight-buffer wrapping (mmap, no-copy; bf16/f32/Q8_0 sizing), per-weight matvec kernel dispatch (`matmul_kernel_for`), one command buffer per decode token, kernel registration (KI_ enum + SG_KERNELS table + size/param checks). Registers itself as `sg_kv`'s allocation backend at init. Decode state: the DEFAULT full-attention KV cache is fp16, allocated through `sg_kv` as SEPARATE per-layer K/V buffers (M5.2, `SURGE_KV_DTYPE` env toggle); `SURGE_KV_DTYPE=f32` selects the original combined-buffer f32 path unchanged, kept so the M2 gate's oracle never moves. DeltaNet conv/S state stays on its pre-M5.1 ad hoc allocation either way (DeltaNet decode is not yet refit onto `sg_kv`). |
+| `src/metal.m` | Metal device init, weight-buffer wrapping (mmap, no-copy; bf16/f32/Q8_0 sizing), per-weight matvec kernel dispatch (`matmul_kernel_for`), one command buffer per decode token, one command buffer per prefill chunk (`sg_gpu_prefill`, M5.6), kernel registration (KI_ enum + SG_KERNELS table + size/param checks). Registers itself as `sg_kv`'s allocation backend at init. Decode state: the DEFAULT full-attention KV cache is fp16, allocated through `sg_kv` as SEPARATE per-layer K/V buffers (M5.2, `SURGE_KV_DTYPE` env toggle); `SURGE_KV_DTYPE=f32` selects the original combined-buffer f32 path unchanged, kept so the M2 gate's oracle never moves. DeltaNet conv/S state stays on its pre-M5.1 ad hoc allocation for decode; prefill (M5.6) threads DeltaNet state through `sg_kv`'s conv/S carriers (so `g->kv` is now allocated for any DeltaNet model on the f16 path) and bridges the final state back into the ad hoc buffers when it finishes. |
 | `src/kernels.metal` | deterministic Metal kernels: decode-step ones fold a fixed reduction tree (no atomics/simd_sum) -- bf16/f32/Q8_0 matvec, attention decode (f32-KV `k_attn_decode` and fp16-KV `k_attn_decode_f16`, M5.2), a decode-step fp16 store (`k_kv_store_f16`, M5.2), gated-DeltaNet decode, RoPE, RMSNorm, SwiGLU. Prefill's tiled GEMM (M5.3, `k_matmul_bf16`/`k_matmul_f32`/`k_matmul_q8`, `Y[N,M]=X[N,K]@W[M,K]^T`) uses a different determinism mechanism: one thread per output element of a 16x16 output tile, a private serial K-loop, no cross-thread reduction at all (nothing to fold). Full-attention prefill (M5.4) adds `k_rope_chunk` (partial RoPE over a whole chunk) and `k_attn_prefill` (causal chunk attention over the fp16 KV cache, one threadgroup per (query token, query head), same fixed-tree softmax as `k_attn_decode_f16`). DeltaNet prefill (M5.5) adds `k_conv1d_chunk` / `k_delta_gates_chunk` / `k_delta_chunk` / `k_rmsnorm_gated_chunk`: a whole chunk of N tokens through one DeltaNet layer via a SEQUENTIAL within-chunk scan (per-token loop inside the kernel, threading the conv tail + S matrix), bit-identical to the matching decode kernel looped over the chunk. |
 | `src/cli_*.c` | the four CLI mains. |
 
@@ -58,11 +58,17 @@ optionally Accelerate for the CPU reference path. No third-party libraries.
   -> logits -> host argmax -> next token. Byte-exact GREEDY TOKENS to the CPU reference at
   temp 0 (M2 gate, oracle is the f32-KV path); fp16 KV adds ~1e-6 logit noise on the
   measured fixture, absorbed by argmax.
-- **Prefill (M5, in progress):** chunk the prompt (default 1024 tokens); per chunk one
-  command buffer runs all layers via tiled GEMM + tiled/flash attention + the DeltaNet
-  chunked scan, advancing `sg_kv` by the chunk size; only the final chunk's last row
-  computes lm_head. Correctness gate is token-level: prefill-then-decode == feed-one-at-
-  a-time.
+- **Prefill (M5.6, shipped):** `sg_gpu_prefill` chunks the prompt (default 1024 tokens);
+  per chunk one command buffer runs all layers via tiled GEMM + `k_attn_prefill`
+  (full-attn) + the DeltaNet chunked scan (`enc_gdn_prefill`), writing full-attn K/V into
+  `g->kv` and threading DeltaNet conv/S through `sg_kv`'s carriers, advancing `g->used` and
+  `sg_kv` by the chunk size; only the final chunk's last row computes out_norm + lm_head.
+  It then BRIDGES each DeltaNet layer's final conv tail + S out of the `sg_kv` carriers
+  into the ad hoc `L->conv_buf`/`L->ssm` decode reads, so a following `sg_gpu_forward` at
+  pos == n_tokens continues from the prefilled state. Requires the fp16 KV path. Uses
+  chunk-sized scratch swapped into the `g->b_*` decode fields for the run's duration.
+  Correctness gate is token-level: prefill-then-decode == feed-one-at-a-time (byte-exact
+  gen_ids), worst last-logit rel gap 1.2e-6 vs the serial forward.
 
 ## Architecture status (built vs planned)
 
@@ -120,9 +126,17 @@ optionally Accelerate for the CPU reference path. No third-party libraries.
     `sg_gpu_run_delta_multi` as the per-op oracle) and the encoder `enc_gdn_prefill`
     (chunked twin of `enc_gdn`: tiled-GEMM in_proj, `k_conv1d_chunk`+SiLU, per-token qk
     RMSNorm-heads + scale over the chunk, `k_delta_gates_chunk`, `k_delta_chunk` with S
-    threaded, gated output norm, o_proj). `enc_gdn_prefill` is built but not yet driven
-    (M5.6's orchestration sizes its chunk buffers and gates the whole prefill numerically
-    prefill-then-decode == feed-one-at-a-time). M5.6-M5.7 pending.
+    threaded, gated output norm, o_proj).
+    M5.6 (chunked prefill orchestration) DONE: `sg_gpu_prefill` drives
+    `enc_attn_prefill` + `enc_gdn_prefill` + the chunked MLP across all layers, one
+    command buffer per chunk, sizing chunk scratch by swapping it into the `g->b_*` decode
+    fields; it closes the three carry-forwards (state bridging sg_kv -> L->conv_buf/L->ssm,
+    `g->kv` allocated for DeltaNet models, first end-to-end wiring). CLI gets `--chunk N`
+    (default 1024) and `--no-prefill`, prefill being the default for -p/--ids on the Metal
+    path. Gated by tests/test_gpu_prefill.c: prefill last-argmax == serial forward
+    last-argmax on both mini formats for chunk {1,2,3} (worst rel 1.2e-6, bar 2e-4),
+    prefill+decode gen_ids == serial+decode (16/16), byte-identical reruns, and the CLI
+    with/without --no-prefill identical. M5.7 pending.
   - Bench harness: B1/B3/B4 (pure C) done; B2/B5/B6 (Metal/CLI) and B7 (gated 256K run)
     pending.
 - **Not built:** M4 (kernel excellence / beat mlx-lm), server mode, non-Metal platforms,

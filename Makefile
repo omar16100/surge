@@ -35,7 +35,7 @@ $(METALLIB): src/kernels.metal
 # explicit rule wins). Under -DSURGE_NO_METAL -- which is how `debug` runs --
 # these sources compile down to a skip notice, so nothing Metal is built or
 # linked and ASan's MallocStackLogging never meets the driver.
-METAL_TESTS = tests/test_metal_ops.bin tests/test_gpu_fwd.bin
+METAL_TESTS = tests/test_metal_ops.bin tests/test_gpu_fwd.bin tests/test_gpu_prefill.bin
 ifeq (,$(findstring SURGE_NO_METAL,$(CFLAGS)))
 $(METAL_TESTS): tests/%.bin: tests/%.c $(LIB_SRC) src/metal.m $(METALLIB)
 	$(CC) $(CFLAGS) $(METAL_DEFS) -o $@ src/metal.m $< \

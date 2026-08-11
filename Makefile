@@ -7,6 +7,14 @@ FRAMEWORKS = -framework Metal -framework Foundation
 TESTS = $(wildcard tests/test_*.c)
 check: $(TESTS:.c=.bin)
 	@set -e; for t in $^; do ./$$t; done
+# Gate 4 (M5.6): the `surge` CLI's prefill (default) vs --no-prefill must emit
+# byte-identical gen_ids. This drives the real binary, so it is skipped under
+# -DSURGE_NO_METAL (how `debug` runs) exactly like the Metal C tests; the ifeq
+# excludes these recipe lines there, so `make debug` never builds or runs surge.
+ifeq (,$(findstring SURGE_NO_METAL,$(CFLAGS)))
+	@$(MAKE) --no-print-directory surge
+	@bash tests/test_cli_prefill.sh ./surge
+endif
 LIB_SRC = $(filter-out src/metal.m $(wildcard src/cli_*.c),$(wildcard src/*.c))
 tests/%.bin: tests/%.c $(LIB_SRC)
 	$(CC) $(CFLAGS) -o $@ $< $(LIB_SRC) $(LDLIBS)

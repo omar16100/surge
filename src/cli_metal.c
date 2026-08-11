@@ -103,15 +103,11 @@ static bool ends_with(const char *s, const char *suffix) {
     return ls >= lx && strcmp(s + ls - lx, suffix) == 0;
 }
 
-/* THE argmax, used by both paths. Lowest index wins an exact tie, which is
- * the same rule surge-ref uses. Written once so the two paths cannot drift. */
-static uint32_t argmax_f32(const float *v, uint32_t n) {
-    uint32_t arg = 0;
-    for (uint32_t i = 1; i < n; i++) if (v[i] > v[arg]) arg = i;
-    return arg;
-}
-
-/* The top-1 minus top-2 gap at this position. Printed under --margins
+/* THE argmax lives in src/greedy.c (sg_argmax_f32) so surge and surge-bench
+ * cannot drift apart on tie-break convention; both call the same symbol. The
+ * ref path (--ref) shares it too, keeping the M2 metal-vs-ref gate honest.
+ *
+ * The top-1 minus top-2 gap at this position. Printed under --margins
  * because it is the number that decides whether a token that DID diverge is
  * a real error or a legitimate near-tie: the two paths differ by ~1e-4 on a
  * 2B, so a gap far above that cannot flip and a gap below it can. */
@@ -333,7 +329,7 @@ int main(int argc, char **argv) {
          * token at position n_ids. Step i emits that token and feeds it back
          * at position n_ids + i. */
         for (uint32_t i = 0; i < n_gen; i++) {
-            uint32_t arg = argmax_f32(lg, m.cfg.vocab);
+            uint32_t arg = sg_argmax_f32(lg, m.cfg.vocab);
             if (margins) {
                 fprintf(stderr, "  margin[%u] tok %u gap %.6e\n", i, arg,
                         (double)top2_gap(lg, m.cfg.vocab, arg));

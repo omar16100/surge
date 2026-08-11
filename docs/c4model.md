@@ -27,8 +27,8 @@ optionally Accelerate for the CPU reference path. No third-party libraries.
   dispatch) plus `src/kernels.metal` (compiled to `kernels.metallib` by `xcrun metal`).
   Only binaries that need the GPU link these.
 - **CLIs**: `surge-info` (GGUF dump), `surge-ref` (CPU-reference forward + `--logits`),
-  `surge` (Metal decode), `surge-bench` (benchmark harness; being built in the bench
-  tasks).
+  `surge` (Metal decode), `surge-bench` (benchmark harness; B5 shipped, wires B1-B4 + the
+  B2 peak-memory probe to M5 prefill + the shared greedy driver, emits one leaderboard row).
 - **Tests**: `tests/test_*.c` under a tinytest harness; Metal tests skip gracefully when
   `sg_gpu_init` fails and are excluded from the ASan build via `SURGE_NO_METAL`.
 
@@ -43,9 +43,10 @@ optionally Accelerate for the CPU reference path. No third-party libraries.
 | `src/ref.c` | scalar CPU reference for every op (the correctness oracle), incl. `sg_ref_matvec_q8`, attention, gated-DeltaNet, partial RoPE, and the full forward pass. |
 | `src/kv.c` | (M5.1) fp16 growable KV cache for full-attention layers + fixed-size DeltaNet recurrent state, over opaque GPU-buffer handles; Metal-free (allocation injected). `sg_kv_bytes` = 16 GiB K+V at 262,144. Wired into decode by M5.2 (see below). |
 | `src/bench.c` | (B-series) pure-C benchmark math: decode-by-slope, leaderboard-row/JSON formatters, prompt file read, ingestion/truncation guard, NIAH recall scorer, process `phys_footprint` probe + the `sg_mem_tracker` peak-max tracker (B2). |
+| `src/greedy.c` | the ONE greedy-decode argmax (`sg_argmax_f32`, lowest index wins an exact tie). Pure C in LIB_SRC; `surge` and `surge-bench` both call it so their gen_ids cannot drift (B5). |
 | `src/metal.m` | Metal device init, weight-buffer wrapping (mmap, no-copy; bf16/f32/Q8_0 sizing), per-weight matvec kernel dispatch (`matmul_kernel_for`), one command buffer per decode token, one command buffer per prefill chunk (`sg_gpu_prefill`, M5.6), kernel registration (KI_ enum + SG_KERNELS table + size/param checks), `sg_gpu_current_alloc_bytes` (B2, `MTLDevice.currentAllocatedSize`). Registers itself as `sg_kv`'s allocation backend at init. Decode state: the DEFAULT full-attention KV cache is fp16, allocated through `sg_kv` as SEPARATE per-layer K/V buffers (M5.2, `SURGE_KV_DTYPE` env toggle); `SURGE_KV_DTYPE=f32` selects the original combined-buffer f32 path unchanged, kept so the M2 gate's oracle never moves. DeltaNet conv/S state stays on its pre-M5.1 ad hoc allocation for decode; prefill (M5.6) threads DeltaNet state through `sg_kv`'s conv/S carriers (so `g->kv` is now allocated for any DeltaNet model on the f16 path) and bridges the final state back into the ad hoc buffers when it finishes. |
 | `src/kernels.metal` | deterministic Metal kernels: decode-step ones fold a fixed reduction tree (no atomics/simd_sum) -- bf16/f32/Q8_0 matvec, attention decode (f32-KV `k_attn_decode` and fp16-KV `k_attn_decode_f16`, M5.2), a decode-step fp16 store (`k_kv_store_f16`, M5.2), gated-DeltaNet decode, RoPE, RMSNorm, SwiGLU. Prefill's tiled GEMM (M5.3, `k_matmul_bf16`/`k_matmul_f32`/`k_matmul_q8`, `Y[N,M]=X[N,K]@W[M,K]^T`) uses a different determinism mechanism: one thread per output element of a 16x16 output tile, a private serial K-loop, no cross-thread reduction at all (nothing to fold). Full-attention prefill (M5.4) adds `k_rope_chunk` (partial RoPE over a whole chunk) and `k_attn_prefill` (causal chunk attention over the fp16 KV cache, one threadgroup per (query token, query head), same fixed-tree softmax as `k_attn_decode_f16`). DeltaNet prefill (M5.5) adds `k_conv1d_chunk` / `k_delta_gates_chunk` / `k_delta_chunk` / `k_rmsnorm_gated_chunk`: a whole chunk of N tokens through one DeltaNet layer via a SEQUENTIAL within-chunk scan (per-token loop inside the kernel, threading the conv tail + S matrix), bit-identical to the matching decode kernel looped over the chunk. |
-| `src/cli_*.c` | the four CLI mains. |
+| `src/cli_*.c` | the four CLI mains (`cli_info`, `cli_ref`, `cli_metal` = `surge`, `cli_bench` = `surge-bench`). `cli_bench` (B5): raw tokenize (no chat template), `--bos`/`--no-bos` (default `tokenizer.ggml.add_bos_token`), M5 tiled prefill (`--chunk`, default 1024) + shared greedy decode, GEMM gate (`--gemm-gate-tflops F`, need F>20.5) + ingestion guard, whole-run peak-mem sampling, NIAH recall (text input only), decode-by-slope (`--warmup`, `--emit-timeseries`), md row to stdout + `--json`. Exit 0 DONE / 3 VOID / other hard error. |
 
 ## Level 4: Data flows
 
@@ -153,8 +154,16 @@ optionally Accelerate for the CPU reference path. No third-party libraries.
     (live GPU, env-gated); the C test SKIPs cleanly without `SURGE_GATE_MODEL`, so
     `make check` stays mini-only and hermetic. Public `sg_gpu_used` added so the gate reads
     the used counter without reaching into the opaque `sg_gpu`. M5 COMPLETE.
-  - Bench harness: B1/B3/B4 (pure C) and B2 (peak-memory probe) done; B5/B6 (Metal/CLI)
-    and B7 (gated 256K run) pending. B2: `sg_gpu_current_alloc_bytes` (Metal-only,
+  - Bench harness: B1/B3/B4 (pure C), B2 (peak-memory probe) and B5 (`surge-bench` CLI +
+    shared `sg_argmax_f32`) done; B6 (offline re-fit) and B7 (gated 256K run) pending. B5
+    resolves the B2 peak-RAM question below: it tracks the two signals SEPARATELY across
+    the whole run and reports `row.peak_ram_gib` = peak `phys_footprint` (resident,
+    comparable to mlx-lm/llama.cpp) and `row.gpu_alloc_gib` = peak `currentAllocatedSize`
+    (allocated upper bound, ~28 GiB of no-copy weight wraps for the 27B), so the two are
+    never conflated. Gated by `tests/test_cli_bench.sh` (`make check` + `make bench-check`):
+    surge-bench gen_ids byte-equal to `surge` on both mini formats, VOID/exit-3 on a
+    failed/missing GEMM gate or out-of-window ingestion, and (env-gated on a real tokenizer)
+    a `--bos`/`--no-bos` +/-1 prompt-token delta. B2: `sg_gpu_current_alloc_bytes` (Metal-only,
     `MTLDevice.currentAllocatedSize`) + `sg_proc_phys_footprint` (pure C, mach
     `task_info`/`TASK_VM_INFO`) feed a pure-C `sg_mem_tracker` (`peak =
     max(peak, max(current_alloc, phys_footprint))`), unit-tested deterministically under

@@ -14,6 +14,8 @@ check: $(TESTS:.c=.bin)
 ifeq (,$(findstring SURGE_NO_METAL,$(CFLAGS)))
 	@$(MAKE) --no-print-directory surge
 	@bash tests/test_cli_prefill.sh ./surge
+	@$(MAKE) --no-print-directory surge-bench
+	@bash tests/test_cli_bench.sh ./surge ./surge-bench
 endif
 LIB_SRC = $(filter-out src/metal.m $(wildcard src/cli_*.c),$(wildcard src/*.c))
 tests/%.bin: tests/%.c $(LIB_SRC)
@@ -70,15 +72,21 @@ surge: src/cli_metal.c $(LIB_SRC) src/metal.m $(METALLIB)
 	$(CC) $(CFLAGS) $(METAL_DEFS) -o $@ src/cli_metal.c src/metal.m \
 	  $(LIB_SRC) $(FRAMEWORKS) $(LDLIBS)
 
-# surge-bench CLI stub (Task B1). src/bench.c's math (this task) already
-# links into LIB_SRC via the src/*.c wildcard above and is exercised by
-# tests/test_bench.c; the CLI itself (src/cli_bench.c, wiring B1-B4 plus the
-# forward pass) is Task B5. This placeholder keeps `make surge-bench` from
-# failing with "No rule to make target" in the meantime.
-.PHONY: surge-bench
-surge-bench:
-	@echo "surge-bench: CLI not built yet (Task B5); src/bench.c math is in LIB_SRC now" >&2
-	@exit 1
+# `surge-bench` (Task B5): the benchmark harness. Wires src/bench.c's B1-B4
+# math + the B2 peak-memory probe to the M5 tiled prefill + the shared greedy
+# driver (src/greedy.c's sg_argmax_f32, the SAME argmax `surge` uses, so their
+# gen_ids cannot drift). Same link shape as `surge`.
+surge-bench: src/cli_bench.c $(LIB_SRC) src/metal.m $(METALLIB)
+	$(CC) $(CFLAGS) $(METAL_DEFS) -o $@ src/cli_bench.c src/metal.m \
+	  $(LIB_SRC) $(FRAMEWORKS) $(LDLIBS)
+
+# `make bench-check` (Task B5 gate, mirrors test_cli_prefill's pattern): builds
+# both binaries and runs the surge-vs-surge-bench gen_ids parity + VOID/exit-3 +
+# BOS-toggle shell test. The test SKIPs cleanly when Metal is unavailable, so
+# this is safe to run anywhere; it is not part of `make debug` (SURGE_NO_METAL).
+.PHONY: bench-check
+bench-check: surge surge-bench
+	@bash tests/test_cli_bench.sh ./surge ./surge-bench
 
 # --- M3.4 Q8_0 forward correctness gate (manual, NOT wired into `make check`)
 #
@@ -113,6 +121,6 @@ debug:
 	@rm -f $(TESTS:.c=.bin)
 	@rm -rf $(TESTS:.c=.bin.dSYM)
 clean:
-	rm -f $(TESTS:.c=.bin) surge-info surge-ref surge $(METALLIB) src/kernels.air
-	rm -rf $(TESTS:.c=.bin.dSYM) surge-info.dSYM surge-ref.dSYM surge.dSYM
+	rm -f $(TESTS:.c=.bin) surge-info surge-ref surge surge-bench $(METALLIB) src/kernels.air
+	rm -rf $(TESTS:.c=.bin.dSYM) surge-info.dSYM surge-ref.dSYM surge.dSYM surge-bench.dSYM
 .PHONY: check debug clean

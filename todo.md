@@ -1596,3 +1596,34 @@ Metal-only vs pure-C documented on each), `Makefile` (new `METAL_HYBRID_TESTS` r
   representative for a real model, since `gpu_alloc` will read close to the full wrapped
   checkpoint size before decode has touched most of it. Sampling across the whole run (prefill +
   decode), not just at load, is what will make the two probes converge on a real peak.
+
+## Task B5 Results (surge-bench CLI + shared greedy driver)
+
+- NEW `src/greedy.c`: `sg_argmax_f32` (lowest index wins an exact tie). Factored out of
+  `cli_metal.c` (was `static argmax_f32`) into LIB_SRC so `surge` AND `surge-bench` call the
+  SAME symbol; their gen_ids cannot drift. `cli_metal.c` now calls it; `surge.h` declares it.
+  Pinned by NEW `tests/test_greedy.c` (tie-break, ends, negatives, NULL/n=0/n=1).
+- NEW `src/cli_bench.c` (`surge-bench`): raw tokenize (no chat template) from `-p` / `--prompt-file`
+  / `--ids`; `--bos`/`--no-bos` (default = model `tokenizer.ggml.add_bos_token`, else off; a BOS
+  prepend adds exactly one token; needs `tokenizer.ggml.bos_token_id` or `--bos` errors); M5 tiled
+  prefill (`sg_gpu_prefill`, `--chunk` default 1024; `--no-prefill` serial fallback) then greedy
+  decode via `sg_argmax_f32` + `sg_gpu_forward`; ingestion guard + GEMM gate (`--gemm-gate-tflops F`,
+  need F>20.5 AND ingestion_ok, else VOID + exit 3 BEFORE any GPU load); whole-run peak-mem
+  sampling; NIAH recall (text input only); decode-by-slope (`--warmup`, `--emit-timeseries PATH`);
+  md row to stdout + `--json PATH`. Exit 0 DONE / 3 VOID / other hard error.
+- PEAK-RAM decision (resolves the B2 concern above): TWO separate running maxes, both via the B2
+  `sg_mem_tracker`. `row.peak_ram_gib` = peak `sg_proc_phys_footprint` (RESIDENT, comparable to
+  mlx-lm/llama.cpp's peak-RAM column). `row.gpu_alloc_gib` = peak `sg_gpu_current_alloc_bytes`
+  (ALLOCATED upper bound: every `newBufferWithBytesNoCopy` weight wrap counts at full declared
+  length from load, ~28 GiB for the 27B Q8_0, regardless of residency). Kept separate so surge's
+  resident peak is never silently mis-compared, and the allocated bound stays visible next to it.
+  Sampled after load, after prefill, every 32 decode tokens, and after decode.
+- Makefile: real `surge-bench` target (same link shape as `surge`) replacing the B1 stub; new
+  `bench-check` target; `tests/test_cli_bench.sh` wired into `make check` (Metal-guarded).
+- Gates (all green): (1) surge-bench gen_ids BYTE-EQUAL to `surge` on the mini gguf + safetensors
+  twin (`30,11,5,23,33,9,5,10*` / `28,11,11,11,12,8,8,8`); (2) below-threshold + missing GEMM gate
+  and out-of-window ingestion each exit 3 with a VOID row; (3) `--bos` vs `--no-bos` on the real
+  27B tokenizer = 11 vs 10 tokens (+1), default follows `add_bos_token=false` = 10; (4) `make check`
+  + `make debug` (ASan/UBSan, no diagnostics) + `make bench-check` all exit 0. The 27B GPU run
+  itself is B7 (not run here). BOS toggle is env-gated (`SURGE_BENCH_TOK_MODEL`) so `make check`
+  stays hermetic; demonstrated manually against the 27B GGUF (tokenize-only, VOIDs before GPU load).

@@ -843,6 +843,17 @@ void *sg_kv_conv(const sg_kv *kv, uint32_t layer);
 void *sg_kv_s(const sg_kv *kv, uint32_t layer);
 
 /* ---------------------------------------------------------------------
+ * Shared greedy decode (src/greedy.c)
+ * ---------------------------------------------------------------------
+ *
+ * The ONE argmax the greedy drivers use. `surge` (cli_metal.c) and
+ * `surge-bench` (cli_bench.c) both call this, so their decoded token ids
+ * cannot drift: lowest index wins an exact tie (strict >, scanning upward
+ * from 0), matching the CPU reference's rule. PURE C, no GPU. Returns 0 for
+ * a NULL v or n == 0. */
+uint32_t sg_argmax_f32(const float *v, uint32_t n);
+
+/* ---------------------------------------------------------------------
  * Bench math (Task B1, src/bench.c)
  * ---------------------------------------------------------------------
  *

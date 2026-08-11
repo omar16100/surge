@@ -162,9 +162,11 @@ optionally Accelerate for the CPU reference path. No third-party libraries.
     block (same Metal-guard as the rest of the file) that drives `surge-bench` on the mini fixture
     and independently refits `--emit-timeseries` offline in `python3`, checking: reported
     `decode_tps_slope` matches the offline `[warmup,n)` OLS refit within 0.5%; `|slope-avg|/avg`
-    within 3%; `prefill_wall_s+decode_wall_s` closes `wall_s` within 2% (observed exact, `0.0`
-    gap); and the reported slope is decisively (>1%, over a best-of-5 pool) far from the naive
-    `[0,n)` refit that still carries the post-prefill transient, ruling out a warmup-ignoring bug
+    within 3%; `prefill_wall_s+decode_wall_s` closes `wall_s` within 2% (observed ~0 to ~2e-6
+    relative over repeated mini runs, i.e. two genuinely independent clocks, not a tautology,
+    far under the 2% gate); and the reported slope is decisively (>1%, over a best-of-5 pool) far
+    from the naive `[0,n)` refit that still carries the post-prefill transient, ruling out a
+    warmup-ignoring bug
     (verified by deliberately reintroducing that exact bug and confirming the gate catches it 8/8
     times). Full rationale in `.superpowers/sdd/2026-08-09-surge-m3-m5/task-B6-report.md`. B5
     resolves the B2 peak-RAM question below: it tracks the two signals SEPARATELY across

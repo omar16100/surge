@@ -461,11 +461,11 @@ int main(int argc, char **argv) {
      * "after prefill" sample_mem call below, not after it, so that call's
      * cost lands inside decode_wall_s (which covers everything up to
      * wall_s's own end-of-run timestamp) rather than in an unaccounted gap
-     * between the two phase clocks. That makes
-     * prefill_wall_s + decode_wall_s == wall_s to within the cost of the
-     * now_s() calls themselves (nanoseconds), a real cross-check of two
-     * independently-timed phases, not a tautology, and not dependent on how
-     * expensive sample_mem happens to be on a given machine. */
+     * between the two phase clocks. That makes prefill_wall_s +
+     * decode_wall_s close wall_s to within a handful of now_s() call
+     * overheads (measured ~0 to ~1e-6 relative on this machine; the two are
+     * still genuinely independent clocks, not a tautology, so the residual
+     * is not exactly zero on every run, just far under the 2% B6 gate). */
     double t_decode_phase_start = now_s();
     sample_mem(gpu, &mt_phys, &mt_alloc);      /* after prefill */
 

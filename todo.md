@@ -1635,9 +1635,10 @@ Metal-only vs pure-C documented on each), `Makefile` (new `METAL_HYBRID_TESTS` r
   derived from `wall_s` or from `t_wall_cum[]`. `t_decode_phase_start` is captured BEFORE the
   "after prefill" `sample_mem` call (not after), so that call's cost lands inside `decode_wall_s`
   rather than an unaccounted gap between the two phase clocks -- `prefill_wall_s + decode_wall_s`
-  closes `wall_s` to exact equality (`rel_gap == 0.0` observed, not just "small"), a real
-  cross-check of two independently-timed phases, not a tautology. Exposed in
-  `sg_bench_format_json`'s output (`src/bench.c`).
+  closes `wall_s` to within ~0 to ~2e-6 relative (sub-microsecond; observed over repeated mini
+  runs, not exactly zero on every run since the two are genuinely independent clock reads), far
+  under the 2% B6 gate, a real cross-check of two independently-timed phases, not a tautology.
+  Exposed in `sg_bench_format_json`'s output (`src/bench.c`).
 - NEW `tests/test_cli_bench.sh` B6 block (covered by the same "no Metal device" probe skip as the
   rest of the file, so `make debug` never runs it): drives `surge-bench` on the mini fixture and
   refits the `--emit-timeseries` file offline in `python3` (`/opt/homebrew/bin/python3`, falling

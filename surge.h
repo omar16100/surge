@@ -499,6 +499,17 @@ void sg_ref_state_reset(sg_ref_state *st);
  * k_delta_step      S[dv*dk] (in AND out) q[dk] | k[dk] | v[dv]      y[dv]
  * k_rmsnorm_gated   y[heads*dv]           z[heads*dv] | w[dv]        silu(z)*rms_norm(y,w)
  *
+ * Task M5.3 adds three tiled GEMM kernels, Y[N,M] = X[N,K] @ W[M,K]^T, for
+ * projecting a whole CHUNK of N tokens through one weight matrix in a single
+ * dispatch (the M5 prefill tasks' job; the decode-step table above is
+ * unchanged and none of it reaches these). Note the buffer order here is
+ * (X, W, Y), the REVERSE of k_matvec_*'s (W, X, Y):
+ *
+ * kernel            a                     b                          out
+ * k_matmul_bf16     X[N*K] f32            W[M*K] (bf16)              Y[N*M] f32
+ * k_matmul_f32      X[N*K] f32            W[M*K] f32                 Y[N*M] f32
+ * k_matmul_q8       X[N*K] f32            W Q8_0, M*(K/32) blocks    Y[N*M] f32
+ *
  * `|` means "concatenated in one buffer". params[] per kernel:
  *
  *   k_rmsnorm        [0]=n [1]=eps bits (f32 bit pattern) [2]=1 if b holds w
@@ -514,6 +525,8 @@ void sg_ref_state_reset(sg_ref_state *st);
  *   k_conv1d_step    [0]=channels [1]=ksize
  *   k_delta_step     [0]=dk [1]=dv [2]=beta bits [3]=decay bits
  *   k_rmsnorm_gated  [0]=dv [1]=n_heads [2]=eps bits
+ *   k_matmul_*       [0]=N [1]=M [2]=K (K must be a nonzero multiple of 32
+ *                    for k_matmul_q8; N and M need not be tile-aligned)
  *
  * Aliasing: `out` must not alias `a` or `b`, with two documented exceptions
  * that mirror the ref ops' own in-place contract: k_conv1d_step's carried

@@ -55,6 +55,13 @@ static sg_gpu *g_gpu;
 /* The plan's per-op bar. Relative to the reference vector's scale. */
 #define TOL_REL 1e-4
 
+/* Task M5.3's own GEMM gates (task-M5.3-brief.md): bf16/f32 vs a host f64
+ * reference, and the GEMM-vs-matvec row-consistency check for bf16/f32, must
+ * be under 1e-5 relative; anything touching Q8_0 (dequant is only 8 bits of
+ * mantissa to begin with) gets sg_ref_matvec_q8's own, looser 2e-2. */
+#define GEMM_TOL    1e-5
+#define GEMM_Q8_TOL 2e-2
+
 /* Worst error seen across every op, printed at the end so the task report
  * can quote one number without grepping. */
 static double g_worst_rel = 0.0;
@@ -142,11 +149,14 @@ static uint32_t f32_bits(float f) { uint32_t u; memcpy(&u, &f, sizeof u); return
  * Comparison
  * -------------------------------------------------------------------- */
 
-/* max |got - want| divided by the reference vector's own scale. Absolute
- * error alone is meaningless across ops whose outputs span 1e-3 to 1e3, and
- * per-element relative error is meaningless wherever `want` crosses zero;
- * this is the measure the plan's "1e-4 relative" is checked in. */
-static double check_rel(const char *label, const float *got, const float *want, uint64_t n) {
+/* max |got - want| divided by the reference vector's own scale, checked
+ * against an explicit tolerance. Absolute error alone is meaningless across
+ * ops whose outputs span 1e-3 to 1e3, and per-element relative error is
+ * meaningless wherever `want` crosses zero; this is the measure the plan's
+ * "relative" bars (1e-4 for the per-op gate below, and M5.3's own 1e-5 /
+ * 2e-2 GEMM gates) are checked in. */
+static double check_rel_tol(const char *label, const float *got, const float *want,
+                            uint64_t n, double tol) {
     if (n == 0) { tt_assert(0, "%s: nothing to compare", label); return 0.0; }
 
     double scale = 0.0;
@@ -165,16 +175,20 @@ static double check_rel(const char *label, const float *got, const float *want, 
     }
     double rel = worst / scale;
 
-    tt_assert(rel < TOL_REL,
+    tt_assert(rel < tol,
               "%s: max |err| %.3e over scale %.3e = %.3e relative, tol %.0e "
               "(worst at %llu: got %.9g, want %.9g)",
-              label, worst, scale, rel, TOL_REL,
+              label, worst, scale, rel, tol,
               (unsigned long long)at, (double)got[at], (double)want[at]);
-    if (rel < TOL_REL) {
+    if (rel < tol) {
         fprintf(stderr, "   %-46s rel %.3e  abs %.3e\n", label, rel, worst);
         if (rel > g_worst_rel) { g_worst_rel = rel; g_worst_label = label; }
     }
     return rel;
+}
+
+static double check_rel(const char *label, const float *got, const float *want, uint64_t n) {
+    return check_rel_tol(label, got, want, n, TOL_REL);
 }
 
 /* --------------------------------------------------------------------
@@ -469,6 +483,306 @@ static void metal_matvec_q8_matches_ref(void) {
     if (gpu_run("k_matvec_q8", &a2, &b2, &o2, p2)) check_rel("matvec_q8 (40x1056)", o2.h, wantb, br);
     gb_free(&a2); gb_free(&b2); gb_free(&o2);
     free(bw); free(bx); free(wantb);
+}
+
+/* ====================================================================
+ * Task M5.3: tiled GEMM, Y[N, M] = X[N, K] @ W[M, K]^T
+ * ==================================================================== */
+
+/* Host f64 GEMM reference, written fresh here rather than reusing
+ * sg_ref_matvec_bf16/f32 (Task 7's own already-gated CPU reference): gate 1
+ * asks whether the KERNEL agrees with plain double-precision math, and
+ * routing that through ref.c's own implementation would make the check
+ * "does the GPU agree with ref.c" twice over instead of once independently.
+ * bf16 -> f32 widening is exact (the bf16 bits ARE the top half of the f32
+ * ones), so doing it in float before promoting to double loses nothing. */
+static void host_gemm_bf16_f64(const uint16_t *w, const float *x, float *y,
+                               uint32_t n, uint32_t m, uint32_t k) {
+    for (uint32_t ni = 0; ni < n; ni++) {
+        const float *xr = x + (size_t)ni * k;
+        for (uint32_t mi = 0; mi < m; mi++) {
+            const uint16_t *wr = w + (size_t)mi * k;
+            double acc = 0.0;
+            for (uint32_t ki = 0; ki < k; ki++) {
+                uint32_t bits = (uint32_t)wr[ki] << 16;
+                float wf;
+                memcpy(&wf, &bits, sizeof wf);
+                acc += (double)wf * (double)xr[ki];
+            }
+            y[(size_t)ni * m + mi] = (float)acc;
+        }
+    }
+}
+
+static void host_gemm_f32_f64(const float *w, const float *x, float *y,
+                              uint32_t n, uint32_t m, uint32_t k) {
+    for (uint32_t ni = 0; ni < n; ni++) {
+        const float *xr = x + (size_t)ni * k;
+        for (uint32_t mi = 0; mi < m; mi++) {
+            const float *wr = w + (size_t)mi * k;
+            double acc = 0.0;
+            for (uint32_t ki = 0; ki < k; ki++) acc += (double)wr[ki] * (double)xr[ki];
+            y[(size_t)ni * m + mi] = (float)acc;
+        }
+    }
+}
+
+typedef struct { uint32_t n, m, k; } gemm_case;
+
+/* Covers every one of the brief's {1, 7, 32, 256, 5120} in each of N, M and
+ * K at least once (see the per-column comment), plus the explicitly
+ * requested all-large case. All-5120-cubed would be ~134 billion FMAs and is
+ * not what the brief asks for; the brief's own example of "all-large" is
+ * 32x256x5120, so that is the one large-K*large-M*large-N case run here. */
+static const gemm_case GEMM_CASES[] = {
+    {1,    1,   1},      /* every dim at its smallest */
+    {7,   32, 256},      /* N=7 */
+    {32, 256,   7},      /* K=7, M=256 x N=32 combo */
+    {256,  7,  32},      /* M=7, N=256 */
+    {5120, 1,   1},      /* N=5120, cheap M/K */
+    {1, 5120,   1},      /* M=5120, cheap N/K */
+    {1,    1,5120},      /* K=5120, cheap N/M */
+    {32, 256,5120},      /* the brief's "at least one all-large case" */
+};
+#define N_GEMM_CASES ((int)(sizeof GEMM_CASES / sizeof GEMM_CASES[0]))
+
+/* Gate 1: k_matmul_bf16 and k_matmul_f32 vs the host f64 reference above,
+ * across every (N, M, K) in GEMM_CASES. */
+static void metal_matmul_matches_host_f64(void) {
+    for (int c = 0; c < N_GEMM_CASES; c++) {
+        uint32_t n = GEMM_CASES[c].n, m = GEMM_CASES[c].m, k = GEMM_CASES[c].k;
+        char lbl[96];
+
+        {
+            uint16_t *w = xmalloc((size_t)m * k * sizeof *w);
+            float *x = xmalloc((size_t)n * k * sizeof *x);
+            lcg_seed(0xB160u + (uint32_t)c);
+            for (uint64_t i = 0; i < (uint64_t)m * k; i++) w[i] = f32_to_bf16(lcg_next());
+            for (uint64_t i = 0; i < (uint64_t)n * k; i++) x[i] = lcg_next() * 2.0f;
+
+            float *want = xmalloc((size_t)n * m * sizeof *want);
+            host_gemm_bf16_f64(w, x, want, n, m, k);
+
+            gbuf a = gb_from(x, (uint64_t)n * k);
+            gbuf b = gb_from_u16(w, (uint64_t)m * k);
+            gbuf o = gb_new((uint64_t)n * m);
+            uint32_t p[8] = {n, m, k, 0, 0, 0, 0, 0};
+            gb_poison(&o);
+            snprintf(lbl, sizeof lbl, "matmul_bf16 vs host f64 (n=%u m=%u k=%u)", n, m, k);
+            if (gpu_run("k_matmul_bf16", &a, &b, &o, p)) {
+                check_rel_tol(lbl, o.h, want, (uint64_t)n * m, GEMM_TOL);
+            }
+            gb_free(&a); gb_free(&b); gb_free(&o);
+            free(w); free(x); free(want);
+        }
+        {
+            float *w = xmalloc((size_t)m * k * sizeof *w);
+            float *x = xmalloc((size_t)n * k * sizeof *x);
+            lcg_seed(0xF320u + (uint32_t)c);
+            for (uint64_t i = 0; i < (uint64_t)m * k; i++) w[i] = lcg_next();
+            for (uint64_t i = 0; i < (uint64_t)n * k; i++) x[i] = lcg_next() * 2.0f;
+
+            float *want = xmalloc((size_t)n * m * sizeof *want);
+            host_gemm_f32_f64(w, x, want, n, m, k);
+
+            gbuf a = gb_from(x, (uint64_t)n * k);
+            gbuf b = gb_from(w, (uint64_t)m * k);
+            gbuf o = gb_new((uint64_t)n * m);
+            uint32_t p[8] = {n, m, k, 0, 0, 0, 0, 0};
+            gb_poison(&o);
+            snprintf(lbl, sizeof lbl, "matmul_f32 vs host f64 (n=%u m=%u k=%u)", n, m, k);
+            if (gpu_run("k_matmul_f32", &a, &b, &o, p)) {
+                check_rel_tol(lbl, o.h, want, (uint64_t)n * m, GEMM_TOL);
+            }
+            gb_free(&a); gb_free(&b); gb_free(&o);
+            free(w); free(x); free(want);
+        }
+    }
+}
+
+/* Gate 2: row n of k_matmul_* == k_matvec_* applied to X[n], same W. Proves
+ * the GEMM agrees with the kernel Task 9's own gate already pins down,
+ * independent of whether the GEMM's tile geometry is right (a tiling bug
+ * that still summed the correct K terms per element would slip past gate 1
+ * only by coincidence; comparing every row against the row kernel is the
+ * check that would catch a tile/row indexing mistake specifically). */
+static void gemm_row_consistency_bf16(uint32_t n, uint32_t m, uint32_t k, uint32_t seed) {
+    uint16_t *w = xmalloc((size_t)m * k * sizeof *w);
+    float *x = xmalloc((size_t)n * k * sizeof *x);
+    lcg_seed(seed);
+    for (uint64_t i = 0; i < (uint64_t)m * k; i++) w[i] = f32_to_bf16(lcg_next());
+    for (uint64_t i = 0; i < (uint64_t)n * k; i++) x[i] = lcg_next() * 2.0f;
+
+    gbuf a = gb_from(x, (uint64_t)n * k);
+    gbuf b = gb_from_u16(w, (uint64_t)m * k);
+    gbuf o = gb_new((uint64_t)n * m);
+    uint32_t p[8] = {n, m, k, 0, 0, 0, 0, 0};
+    gb_poison(&o);
+    if (gpu_run("k_matmul_bf16", &a, &b, &o, p)) {
+        gbuf xb = gb_new(k), yb = gb_new(m);
+        uint32_t pv[8] = {m, k, 0, 0, 0, 0, 0, 0};
+        for (uint32_t r = 0; r < n; r++) {
+            memcpy(xb.h, x + (size_t)r * k, k * sizeof(float));
+            gb_poison(&yb);
+            if (!gpu_run("k_matvec_bf16", &b, &xb, &yb, pv)) break;
+            char lbl[96];
+            snprintf(lbl, sizeof lbl, "matmul_bf16 row %u == matvec_bf16 (n=%u m=%u k=%u)",
+                     r, n, m, k);
+            check_rel_tol(lbl, o.h + (size_t)r * m, yb.h, m, GEMM_TOL);
+        }
+        gb_free(&xb); gb_free(&yb);
+    }
+    gb_free(&a); gb_free(&b); gb_free(&o);
+    free(w); free(x);
+}
+
+static void gemm_row_consistency_f32(uint32_t n, uint32_t m, uint32_t k, uint32_t seed) {
+    float *w = xmalloc((size_t)m * k * sizeof *w);
+    float *x = xmalloc((size_t)n * k * sizeof *x);
+    lcg_seed(seed);
+    for (uint64_t i = 0; i < (uint64_t)m * k; i++) w[i] = lcg_next();
+    for (uint64_t i = 0; i < (uint64_t)n * k; i++) x[i] = lcg_next() * 2.0f;
+
+    gbuf a = gb_from(x, (uint64_t)n * k);
+    gbuf b = gb_from(w, (uint64_t)m * k);
+    gbuf o = gb_new((uint64_t)n * m);
+    uint32_t p[8] = {n, m, k, 0, 0, 0, 0, 0};
+    gb_poison(&o);
+    if (gpu_run("k_matmul_f32", &a, &b, &o, p)) {
+        gbuf xb = gb_new(k), yb = gb_new(m);
+        uint32_t pv[8] = {m, k, 0, 0, 0, 0, 0, 0};
+        for (uint32_t r = 0; r < n; r++) {
+            memcpy(xb.h, x + (size_t)r * k, k * sizeof(float));
+            gb_poison(&yb);
+            if (!gpu_run("k_matvec_f32", &b, &xb, &yb, pv)) break;
+            char lbl[96];
+            snprintf(lbl, sizeof lbl, "matmul_f32 row %u == matvec_f32 (n=%u m=%u k=%u)",
+                     r, n, m, k);
+            check_rel_tol(lbl, o.h + (size_t)r * m, yb.h, m, GEMM_TOL);
+        }
+        gb_free(&xb); gb_free(&yb);
+    }
+    gb_free(&a); gb_free(&b); gb_free(&o);
+    free(w); free(x);
+}
+
+static void gemm_row_consistency_q8(uint32_t n, uint32_t m, uint32_t k, uint32_t seed) {
+    uint64_t wbytes = (uint64_t)m * (k / 32) * 34;
+    uint8_t *w = xmalloc((size_t)wbytes);
+    float *x = xmalloc((size_t)n * k * sizeof *x);
+    lcg_seed(seed);
+    build_q8(w, m, k);
+    for (uint64_t i = 0; i < (uint64_t)n * k; i++) x[i] = lcg_next() * 2.0f;
+
+    gbuf a = gb_from(x, (uint64_t)n * k);
+    gbuf b = gb_from_u8(w, wbytes);
+    gbuf o = gb_new((uint64_t)n * m);
+    uint32_t p[8] = {n, m, k, 0, 0, 0, 0, 0};
+    gb_poison(&o);
+    if (gpu_run("k_matmul_q8", &a, &b, &o, p)) {
+        gbuf xb = gb_new(k), yb = gb_new(m);
+        uint32_t pv[8] = {m, k, 0, 0, 0, 0, 0, 0};
+        for (uint32_t r = 0; r < n; r++) {
+            memcpy(xb.h, x + (size_t)r * k, k * sizeof(float));
+            gb_poison(&yb);
+            if (!gpu_run("k_matvec_q8", &b, &xb, &yb, pv)) break;
+            char lbl[96];
+            snprintf(lbl, sizeof lbl, "matmul_q8 row %u == matvec_q8 (n=%u m=%u k=%u)",
+                     r, n, m, k);
+            check_rel_tol(lbl, o.h + (size_t)r * m, yb.h, m, GEMM_Q8_TOL);
+        }
+        gb_free(&xb); gb_free(&yb);
+    }
+    gb_free(&a); gb_free(&b); gb_free(&o);
+    free(w); free(x);
+}
+
+static void metal_matmul_row_consistency(void) {
+    /* Non-tile-aligned N and M (SG_GEMM_TM/TN are 16x16), so the tile edge
+     * guard (`if (row >= n || col >= m) return`) is exercised, not just the
+     * happy path where N and M are exact multiples of the tile shape. */
+    gemm_row_consistency_bf16(11, 67, 512, 0xB16Cu);
+    gemm_row_consistency_f32(11, 67, 512, 0xF32Cu);
+    gemm_row_consistency_q8(11, 67, 512, 0xA8C0u);
+
+    /* And a second, smaller shape entirely inside one tile. */
+    gemm_row_consistency_bf16(3, 5, 64, 0xB16Du);
+    gemm_row_consistency_f32(3, 5, 64, 0xF32Du);
+    gemm_row_consistency_q8(3, 5, 64, 0xA8C1u);
+}
+
+/* Gate 3: k_matmul_q8 vs sg_ref_matvec_q8 (Task 7's double-accumulating CPU
+ * reference) looped over the N rows, within sg_ref_matvec_q8's own 2e-2
+ * tolerance -- the Q8_0 analog of gate 1, which only covers bf16/f32. */
+static void metal_matmul_q8_matches_ref_looped(void) {
+    const uint32_t n = 6, m = 97, k = 1056;   /* K a multiple of 32; N, M not tile-aligned */
+    uint64_t wbytes = (uint64_t)m * (k / 32) * 34;
+    uint8_t *w = xmalloc((size_t)wbytes);
+    float *x = xmalloc((size_t)n * k * sizeof *x);
+    lcg_seed(0xA80Bu);
+    build_q8(w, m, k);
+    for (uint64_t i = 0; i < (uint64_t)n * k; i++) x[i] = lcg_next() * 2.0f;
+
+    float *want = xmalloc((size_t)n * m * sizeof *want);
+    for (uint32_t r = 0; r < n; r++) {
+        sg_ref_matvec_q8(w, x + (size_t)r * k, want + (size_t)r * m, m, k);
+    }
+
+    gbuf a = gb_from(x, (uint64_t)n * k);
+    gbuf b = gb_from_u8(w, wbytes);
+    gbuf o = gb_new((uint64_t)n * m);
+    uint32_t p[8] = {n, m, k, 0, 0, 0, 0, 0};
+    gb_poison(&o);
+    if (gpu_run("k_matmul_q8", &a, &b, &o, p)) {
+        check_rel_tol("matmul_q8 vs sg_ref_matvec_q8 (looped over N rows)",
+                      o.h, want, (uint64_t)n * m, GEMM_Q8_TOL);
+    }
+    gb_free(&a); gb_free(&b); gb_free(&o);
+    free(w); free(x); free(want);
+}
+
+/* check_params/check_sizes argument checking for the three new kernels,
+ * mirroring metal_rejects_bad_arguments's style below for the existing
+ * kernels. */
+static void metal_matmul_rejects_bad_params(void) {
+    gbuf a = gb_new(4096), b = gb_new(4096), o = gb_new(4096);
+
+    uint32_t zero_n[8] = {0, 4, 8, 0, 0, 0, 0, 0};
+    sg_err e = sg_gpu_run_op(g_gpu, "k_matmul_f32", a.b, b.b, o.b, zero_n);
+    tt_assert(sg_failed(e), "k_matmul_f32 N=0 should be rejected");
+
+    uint32_t zero_m[8] = {4, 0, 8, 0, 0, 0, 0, 0};
+    e = sg_gpu_run_op(g_gpu, "k_matmul_f32", a.b, b.b, o.b, zero_m);
+    tt_assert(sg_failed(e), "k_matmul_f32 M=0 should be rejected");
+
+    uint32_t zero_k[8] = {4, 4, 0, 0, 0, 0, 0, 0};
+    e = sg_gpu_run_op(g_gpu, "k_matmul_bf16", a.b, b.b, o.b, zero_k);
+    tt_assert(sg_failed(e), "k_matmul_bf16 K=0 should be rejected");
+
+    /* Q8_0 rows are whole 32-element blocks; K not a multiple of 32 must be
+     * rejected before check_sizes truncates the block count (the same
+     * ordering k_matvec_q8 relies on, tested above for that kernel). */
+    uint32_t q8_odd_k[8] = {2, 2, 40, 0, 0, 0, 0, 0};
+    e = sg_gpu_run_op(g_gpu, "k_matmul_q8", a.b, b.b, o.b, q8_odd_k);
+    tt_assert(sg_failed(e), "k_matmul_q8 K not a multiple of 32 should be rejected");
+
+    uint32_t zero_k8[8] = {2, 2, 0, 0, 0, 0, 0, 0};
+    e = sg_gpu_run_op(g_gpu, "k_matmul_q8", a.b, b.b, o.b, zero_k8);
+    tt_assert(sg_failed(e), "k_matmul_q8 K=0 should be rejected");
+
+    /* Undersized buffers: N, M, K describe a Y larger than o actually is. */
+    uint32_t too_big[8] = {100, 100, 8, 0, 0, 0, 0, 0};
+    e = sg_gpu_run_op(g_gpu, "k_matmul_f32", a.b, b.b, o.b, too_big);
+    tt_assert(sg_failed(e), "k_matmul_f32 output smaller than N*M should be rejected");
+
+    /* Output overlapping an input: a GEMM tile writing an input another
+     * tile has not read yet would be wrong and nondeterministic, same rule
+     * as every other kernel. */
+    uint32_t alias_p[8] = {4, 4, 4, 0, 0, 0, 0, 0};
+    e = sg_gpu_run_op(g_gpu, "k_matmul_f32", a.b, b.b, a.b, alias_p);
+    tt_assert(sg_failed(e), "k_matmul_f32 out aliasing input a should be rejected");
+
+    gb_free(&a); gb_free(&b); gb_free(&o);
 }
 
 static void metal_softmax_matches_ref(void) {
@@ -1182,6 +1496,56 @@ static void det_check(const char *label, const char *kernel, gbuf *a, gbuf *b, g
     free(state_first);
 }
 
+/* Gate 4 (Task M5.3): 100 reruns of each k_matmul_* kernel, byte-identical,
+ * output poisoned before every run (det_check above, already used for the
+ * reduction kernels below, does exactly that). Shapes span several tiles in
+ * both N and M and are deliberately not tile-aligned. */
+static void metal_matmul_deterministic(void) {
+    {
+        const uint32_t n = 37, m = 91, k = 320;
+        uint16_t *w = xmalloc((size_t)m * k * sizeof *w);
+        float *x = xmalloc((size_t)n * k * sizeof *x);
+        lcg_seed(0xDE70u);
+        for (uint64_t i = 0; i < (uint64_t)m * k; i++) w[i] = f32_to_bf16(lcg_next());
+        for (uint64_t i = 0; i < (uint64_t)n * k; i++) x[i] = lcg_next() * 3.0f;
+        gbuf a = gb_from(x, (uint64_t)n * k), b = gb_from_u16(w, (uint64_t)m * k);
+        gbuf o = gb_new((uint64_t)n * m);
+        uint32_t p[8] = {n, m, k, 0, 0, 0, 0, 0};
+        det_check("k_matmul_bf16 (37x91x320)", "k_matmul_bf16", &a, &b, &o, p, NULL, 0);
+        gb_free(&a); gb_free(&b); gb_free(&o);
+        free(w); free(x);
+    }
+    {
+        const uint32_t n = 20, m = 48, k = 513;
+        float *w = xmalloc((size_t)m * k * sizeof *w);
+        float *x = xmalloc((size_t)n * k * sizeof *x);
+        lcg_seed(0xF32Du);
+        for (uint64_t i = 0; i < (uint64_t)m * k; i++) w[i] = lcg_next();
+        for (uint64_t i = 0; i < (uint64_t)n * k; i++) x[i] = lcg_next() * 2.0f;
+        gbuf a = gb_from(x, (uint64_t)n * k), b = gb_from(w, (uint64_t)m * k);
+        gbuf o = gb_new((uint64_t)n * m);
+        uint32_t p[8] = {n, m, k, 0, 0, 0, 0, 0};
+        det_check("k_matmul_f32 (20x48x513)", "k_matmul_f32", &a, &b, &o, p, NULL, 0);
+        gb_free(&a); gb_free(&b); gb_free(&o);
+        free(w); free(x);
+    }
+    {
+        const uint32_t n = 9, m = 33, k = 1024;
+        uint64_t wbytes = (uint64_t)m * (k / 32) * 34;
+        uint8_t *w = xmalloc((size_t)wbytes);
+        float *x = xmalloc((size_t)n * k * sizeof *x);
+        lcg_seed(0xA8C2u);
+        build_q8(w, m, k);
+        for (uint64_t i = 0; i < (uint64_t)n * k; i++) x[i] = lcg_next() * 2.0f;
+        gbuf a = gb_from(x, (uint64_t)n * k), b = gb_from_u8(w, wbytes);
+        gbuf o = gb_new((uint64_t)n * m);
+        uint32_t p[8] = {n, m, k, 0, 0, 0, 0, 0};
+        det_check("k_matmul_q8 (9x33x1024)", "k_matmul_q8", &a, &b, &o, p, NULL, 0);
+        gb_free(&a); gb_free(&b); gb_free(&o);
+        free(w); free(x);
+    }
+}
+
 static void metal_reductions_are_deterministic(void) {
     /* matvec_bf16, at a width where the fold tree runs all 8 levels. */
     const uint32_t rows = 64, cols = 1024;
@@ -1436,6 +1800,11 @@ int main(void) {
     tt_run("metal_rope_matches_ref", metal_rope_matches_ref);
     tt_run("metal_matvec_matches_ref", metal_matvec_matches_ref);
     tt_run("metal_matvec_q8_matches_ref", metal_matvec_q8_matches_ref);
+    tt_run("metal_matmul_matches_host_f64", metal_matmul_matches_host_f64);
+    tt_run("metal_matmul_row_consistency", metal_matmul_row_consistency);
+    tt_run("metal_matmul_q8_matches_ref_looped", metal_matmul_q8_matches_ref_looped);
+    tt_run("metal_matmul_deterministic", metal_matmul_deterministic);
+    tt_run("metal_matmul_rejects_bad_params", metal_matmul_rejects_bad_params);
     tt_run("metal_softmax_matches_ref", metal_softmax_matches_ref);
     tt_run("metal_elementwise_match_ref", metal_elementwise_match_ref);
     tt_run("metal_conv1d_step_matches_ref", metal_conv1d_step_matches_ref);

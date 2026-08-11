@@ -48,6 +48,14 @@ using namespace metal;
  * power of two, so the fold tree is exactly log2(SG_TG) levels. */
 constant uint SG_TG = 256u;
 
+/* The tiled-GEMM output tile shape (Task M5.3): SG_GEMM_TM rows (tokens) by
+ * SG_GEMM_TN columns (weight rows) per threadgroup, one thread per tile
+ * element, so SG_GEMM_TM * SG_GEMM_TN must equal SG_TG. Mirrored in metal.m
+ * as compile-time #defines of the same value, exactly the way SG_TG itself
+ * is mirrored there; keep all three in sync. */
+constant uint SG_GEMM_TM = 16u;
+constant uint SG_GEMM_TN = 16u;
+
 /* bf16 -> f32: the bf16 bit pattern IS the top half of the f32 one, which
  * makes this exact and identical to ref.c's bf16_to_f32. */
 static inline float bf16_to_f32(ushort h) {
@@ -822,4 +830,124 @@ kernel void k_delta_multi(device float *S           [[buffer(0)]],
         }
         oh[j] = y;
     }
+}
+
+/* =====================================================================
+ * Task M5.3: tiled GEMM, Y[N, M] = X[N, K] @ W[M, K]^T
+ * =====================================================================
+ *
+ * The decode-step kernels above process one token (one row) at a time; the
+ * M5 prefill tasks need to project a whole CHUNK of N tokens through the
+ * same weight matrix in one dispatch. These three kernels are that: one
+ * threadgroup per (SG_GEMM_TM x SG_GEMM_TN) tile of the output, one thread
+ * per output element, a full serial loop over K. There is no cross-thread
+ * reduction at all -- unlike k_matvec_*'s row-per-threadgroup fold, each
+ * output element here is owned by exactly one thread from the moment it
+ * starts accumulating to the moment it writes y[row][col], so there is
+ * nothing to fold and nothing that could race: no atomics, no simd_sum, no
+ * threadgroup memory, no barrier. "Blocked" refers to the OUTPUT space: it
+ * is cut into SG_GEMM_TM x SG_GEMM_TN tiles, one per threadgroup, visited in
+ * the fixed order metal.m's SG_K_TILES2D grid class dispatches threadgroups
+ * in, which is itself fixed and data-independent (it depends only on N, M,
+ * K, never on the tensor contents). A thread whose (row, col) falls past the
+ * requested N or M returns immediately; nothing after it in the function
+ * touches threadgroup state, so an uneven early return cannot strand a
+ * sibling thread the way it would next to a tg_sum barrier.
+ *
+ * SG_GEMM_TM * SG_GEMM_TN == SG_TG (256): one thread per tile element,
+ * dispatched as a 2D (SG_GEMM_TN, SG_GEMM_TM) threadgroup -- [[thread_position
+ * _in_threadgroup]] has to be the same vector width as [[threadgroup_position
+ * _in_grid]] (Metal rejects a mix of scalar and vector attributed
+ * parameters), and the grid position is inherently 2D here (one component
+ * per output axis), so the in-threadgroup position is uint2 too rather than
+ * a flat index the kernel would otherwise have to div/mod out of a scalar
+ * lid. Total threads per threadgroup is still SG_TG (256), so sg_gpu_init's
+ * "this pipeline supports >= SG_TG threads per threadgroup" assertion covers
+ * these kernels without a special case; only the SHAPE of the dispatch
+ * differs from the reduction kernels' flat one.
+ *
+ * PRECISION. A single thread's serial K-loop is a plain left-to-right f32
+ * sum, not a tree fold, so its rounding error grows with K rather than with
+ * log2(K) the way tg_sum's does. Measured against a host double-accumulating
+ * reference this stays comfortably under the task's 1e-5 relative gate
+ * through K = 5120 (the widest weight the task brief lists) on the random
+ * test data the per-op test drives it with; a shared-memory K-blocked design
+ * that trades some of that margin back for bandwidth is M4's autotuning
+ * pass, not this one (M5.3 is a correctness-and-determinism task).
+ *
+ * Dequant is bit-for-bit k_matvec_bf16 / k_matvec_q8's: bf16_to_f32 for
+ * bf16, and for Q8_0 the same per-element "read the f16 scale bytewise
+ * little-endian, bit-cast through half, multiply the signed int8" as
+ * k_matvec_q8 above -- see its comment for the full rationale.
+ *
+ * Buffer order is (X, W, Y), NOT (W, X, Y) like the matvec kernels: buffer 0
+ * is the N x K activation chunk, buffer 1 is the M x K weight (per-dtype
+ * layout, same row stride as the matching k_matvec_* kernel), buffer 2 is
+ * the N x M f32 output, row-major throughout. params: [0]=N [1]=M [2]=K. */
+kernel void k_matmul_bf16(device const float *x  [[buffer(0)]],
+                          device const ushort *w [[buffer(1)]],
+                          device float *y        [[buffer(2)]],
+                          constant uint *p       [[buffer(3)]],
+                          uint2 tile [[threadgroup_position_in_grid]],
+                          uint2 lid  [[thread_position_in_threadgroup]])
+{
+    uint n = p[0], m = p[1], k = p[2];
+    uint row = tile.y * SG_GEMM_TM + lid.y;   /* output row, wants row < n */
+    uint col = tile.x * SG_GEMM_TN + lid.x;   /* output col, wants col < m */
+    if (row >= n || col >= m) return;
+
+    device const float *xr = x + (size_t)row * k;
+    device const ushort *wr = w + (size_t)col * k;
+    float acc = 0.0f;
+    for (uint i = 0; i < k; i++) acc += xr[i] * bf16_to_f32(wr[i]);
+    y[(size_t)row * m + col] = acc;
+}
+
+kernel void k_matmul_f32(device const float *x [[buffer(0)]],
+                         device const float *w [[buffer(1)]],
+                         device float *y       [[buffer(2)]],
+                         constant uint *p      [[buffer(3)]],
+                         uint2 tile [[threadgroup_position_in_grid]],
+                         uint2 lid  [[thread_position_in_threadgroup]])
+{
+    uint n = p[0], m = p[1], k = p[2];
+    uint row = tile.y * SG_GEMM_TM + lid.y;
+    uint col = tile.x * SG_GEMM_TN + lid.x;
+    if (row >= n || col >= m) return;
+
+    device const float *xr = x + (size_t)row * k;
+    device const float *wr = w + (size_t)col * k;
+    float acc = 0.0f;
+    for (uint i = 0; i < k; i++) acc += xr[i] * wr[i];
+    y[(size_t)row * m + col] = acc;
+}
+
+/* Q8_0 dequant fused into the GEMM inner loop, mirroring k_matvec_q8's block
+ * decode bit-for-bit: row `col` of W begins at byte col*(k/32)*34, each
+ * 34-byte block is a little-endian f16 scale then 32 signed int8, and the
+ * dequantized weight for element i is scale(block i/32) * int8[i mod 32]. */
+kernel void k_matmul_q8(device const float *x  [[buffer(0)]],
+                        device const uchar *w  [[buffer(1)]],
+                        device float *y        [[buffer(2)]],
+                        constant uint *p       [[buffer(3)]],
+                        uint2 tile [[threadgroup_position_in_grid]],
+                        uint2 lid  [[thread_position_in_threadgroup]])
+{
+    uint n = p[0], m = p[1], k = p[2];
+    uint row = tile.y * SG_GEMM_TM + lid.y;
+    uint col = tile.x * SG_GEMM_TN + lid.x;
+    if (row >= n || col >= m) return;
+
+    uint blocks = k / 32u;
+    device const float *xr = x + (size_t)row * k;
+    device const uchar *wr = w + (size_t)col * blocks * 34u;
+    float acc = 0.0f;
+    for (uint i = 0; i < k; i++) {
+        device const uchar *blk = wr + (size_t)(i >> 5) * 34u;   /* block i / 32 */
+        ushort sbits = (ushort)blk[0] | ((ushort)blk[1] << 8);   /* f16, little-endian */
+        float scale = float(as_type<half>(sbits));
+        char q = as_type<char>(blk[2u + (i & 31u)]);             /* signed int8 */
+        acc += scale * (float)q * xr[i];
+    }
+    y[(size_t)row * m + col] = acc;
 }

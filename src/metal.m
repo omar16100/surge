@@ -61,10 +61,22 @@ enum {
     SG_K_GATED,   /* params[1] threadgroups of SG_TG (one per value head) */
     SG_K_ELEM01,  /* params[0] * params[1] threads */
     SG_K_ELEM02,  /* params[0] * params[2] threads */
-    SG_K_GROUPS2  /* params[2] threadgroups of SG_TG */
+    SG_K_GROUPS2, /* params[2] threadgroups of SG_TG */
+    /* M5.3: a 2D grid of ceil(params[1]/SG_GEMM_TN) x ceil(params[0]/SG_GEMM_TM)
+     * threadgroups of SG_TG, one per GEMM output tile. Computed by hand in
+     * sg_gpu_run_op (not by gpu_grid, which only returns a 1D count) because
+     * this is the only kind whose group count needs two dimensions. */
+    SG_K_TILES2D
 };
 
 #define SG_TG 256u
+
+/* The tiled-GEMM output tile shape (Task M5.3), mirroring kernels.metal's
+ * SG_GEMM_TM / SG_GEMM_TN constants of the same value; keep both in sync.
+ * TM * TN must equal SG_TG, since each threadgroup dispatches SG_TG threads
+ * and each thread owns exactly one tile element (see k_matmul_bf16 et al.). */
+#define SG_GEMM_TM 16u
+#define SG_GEMM_TN 16u
 
 typedef struct {
     const char *name;
@@ -82,7 +94,8 @@ enum {
     KI_MATVEC_Q8, KI_SOFTMAX, KI_SWIGLU, KI_SILU, KI_GATE_SIGMOID, KI_ATTN,
     KI_CONV1D, KI_DELTA, KI_RMSNORM_HEADS, KI_ROPE_HEADS, KI_GATE_STRIDED,
     KI_SCALE, KI_ADD, KI_DELTA_GATES, KI_DELTA_MULTI,
-    KI_KV_STORE_F16, KI_ATTN_F16, KI_COUNT
+    KI_KV_STORE_F16, KI_ATTN_F16,
+    KI_MATMUL_BF16, KI_MATMUL_F32, KI_MATMUL_Q8, KI_COUNT
 };
 
 static const sg_kernel_desc SG_KERNELS[] = {
@@ -114,6 +127,12 @@ static const sg_kernel_desc SG_KERNELS[] = {
      * sg_gpu_init builds its pipeline and checks its threadgroup width. */
     { "k_kv_store_f16",        SG_K_ELEM    },
     { "k_attn_decode_f16",     SG_K_ATTN    },
+    /* M5.3: tiled GEMM (a whole chunk of N tokens through one weight matrix
+     * in a single dispatch), used by the later M5 prefill tasks; the decode
+     * path above is untouched and never reaches these. */
+    { "k_matmul_bf16",         SG_K_TILES2D },
+    { "k_matmul_f32",          SG_K_TILES2D },
+    { "k_matmul_q8",           SG_K_TILES2D },
 };
 #define SG_N_KERNELS ((int)(sizeof SG_KERNELS / sizeof SG_KERNELS[0]))
 _Static_assert(SG_N_KERNELS == KI_COUNT, "SG_KERNELS and the KI_ enum disagree");
@@ -534,7 +553,7 @@ static sg_err check_sizes(const char *kernel, const sg_gpu_buf *a, const sg_gpu_
                           const sg_gpu_buf *o, const uint32_t *p) {
     uint64_t f = 4;  /* sizeof(float) */
     uint64_t need_a = 0, need_b = 0, need_o = 0;
-    uint64_t t0 = 0, t1 = 0;
+    uint64_t t0 = 0, t1 = 0, t2 = 0;
     bool want_b = true;
     bool ok = true;
 
@@ -588,6 +607,24 @@ static sg_err check_sizes(const char *kernel, const sg_gpu_buf *a, const sg_gpu_
         /* a is p[0] f32 floats in; out is p[0] half (2-byte) elements out. */
         ok = mul_ck(p[0], f, &need_a) && mul_ck(p[0], 2, &need_o);
         want_b = false;
+    } else if (strcmp(kernel, "k_matmul_bf16") == 0) {
+        /* a = X [N, K] f32, b = W [M, K] bf16, o = Y [N, M] f32. p[0]=N
+         * p[1]=M p[2]=K. */
+        ok = mul_ck(p[0], p[2], &t0) && mul_ck(t0, f, &need_a) &&
+             mul_ck(p[1], p[2], &t1) && mul_ck(t1, 2, &need_b) &&
+             mul_ck(p[0], p[1], &t2) && mul_ck(t2, f, &need_o);
+    } else if (strcmp(kernel, "k_matmul_f32") == 0) {
+        ok = mul_ck(p[0], p[2], &t0) && mul_ck(t0, f, &need_a) &&
+             mul_ck(p[1], p[2], &t1) && mul_ck(t1, f, &need_b) &&
+             mul_ck(p[0], p[1], &t2) && mul_ck(t2, f, &need_o);
+    } else if (strcmp(kernel, "k_matmul_q8") == 0) {
+        /* b is M rows of (K/32) Q8_0 blocks of 34 bytes each. K is a nonzero
+         * multiple of 32, which check_params enforces before this runs (the
+         * same ordering k_matvec_q8 relies on), so p[2]/32 is the exact
+         * block count and does not truncate. */
+        ok = mul_ck(p[0], p[2], &t0) && mul_ck(t0, f, &need_a) &&
+             mul_ck(p[1], p[2] / 32u, &t1) && mul_ck(t1, 34, &need_b) &&
+             mul_ck(p[0], p[1], &t2) && mul_ck(t2, f, &need_o);
     } else {
         return gpu_errf("gpu: no size rule for kernel '%s'", kernel);
     }
@@ -640,6 +677,19 @@ static sg_err check_params(const char *kernel, const uint32_t *p) {
         }
     } else if (strcmp(kernel, "k_conv1d_step") == 0) {
         if (p[1] == 0) return (sg_err){"gpu: k_conv1d_step ksize must be nonzero"};
+    } else if (strcmp(kernel, "k_matmul_bf16") == 0 || strcmp(kernel, "k_matmul_f32") == 0) {
+        if (p[0] == 0) return gpu_errf("gpu: %s N must be nonzero", kernel);
+        if (p[1] == 0) return gpu_errf("gpu: %s M must be nonzero", kernel);
+        if (p[2] == 0) return gpu_errf("gpu: %s K must be nonzero", kernel);
+    } else if (strcmp(kernel, "k_matmul_q8") == 0) {
+        if (p[0] == 0) return (sg_err){"gpu: k_matmul_q8 N must be nonzero"};
+        if (p[1] == 0) return (sg_err){"gpu: k_matmul_q8 M must be nonzero"};
+        /* Q8_0 rows are whole 32-element blocks, exactly k_matvec_q8's rule,
+         * checked here (before check_sizes divides by 32) for the same
+         * reason: a truncated block count would silently undersize need_b. */
+        if (p[2] == 0 || p[2] % 32 != 0) {
+            return gpu_errf("gpu: k_matmul_q8 K %u must be a nonzero multiple of 32", p[2]);
+        }
     }
     return SG_OK;
 }
@@ -660,6 +710,11 @@ static void gpu_grid(int kind, const uint32_t *p, uint64_t *groups, uint64_t *el
     case SG_K_ATTN:    *groups = p[0]; break;
     case SG_K_GATED:   *groups = p[1]; break;
     case SG_K_GROUPS2: *groups = p[2]; break;
+    /* SG_K_TILES2D needs two group dimensions, which this function's (groups,
+     * elems) pair cannot carry; sg_gpu_run_op computes both by hand instead
+     * (see the SG_K_TILES2D case there). Left at the default *groups = 1 so
+     * a caller that ignored this comment gets an obviously-wrong single
+     * threadgroup rather than a plausible-looking wrong number. */
     default:           *groups = 1; break;
     }
 }
@@ -715,9 +770,21 @@ sg_err sg_gpu_run_op(sg_gpu *g, const char *kernel, void *a, void *b, void *out,
      * (it aborts the process), so an empty op is rejected here instead. */
     int kind = SG_KERNELS[idx].kind;
     uint64_t groups = 1, elems = 0;
+    uint64_t tiles_m = 0, tiles_n = 0;
     gpu_grid(kind, params, &groups, &elems);
     if (kind == SG_K_ELEM || kind == SG_K_ELEM01 || kind == SG_K_ELEM02) {
         if (elems == 0) return gpu_errf("gpu: %s dispatched with zero elements", kernel);
+    } else if (kind == SG_K_TILES2D) {
+        /* Two group dimensions: params[0]=N tiles vertically, params[1]=M
+         * tiles horizontally. check_params has already rejected N == 0 and
+         * M == 0 for every k_matmul_* kernel, so both ceil-divisions here are
+         * already known nonzero; the explicit check below is a second,
+         * cheap guard rather than trust across a function boundary. */
+        tiles_n = ((uint64_t)params[0] + SG_GEMM_TM - 1) / SG_GEMM_TM;
+        tiles_m = ((uint64_t)params[1] + SG_GEMM_TN - 1) / SG_GEMM_TN;
+        if (tiles_n == 0 || tiles_m == 0) {
+            return gpu_errf("gpu: %s dispatched with zero tiles", kernel);
+        }
     } else if (groups == 0) {
         return gpu_errf("gpu: %s dispatched with zero threadgroups", kernel);
     }
@@ -755,6 +822,17 @@ sg_err sg_gpu_run_op(sg_gpu *g, const char *kernel, void *a, void *b, void *out,
                 if (w > elems) w = (NSUInteger)elems;
                 [enc dispatchThreads:MTLSizeMake((NSUInteger)elems, 1, 1)
                 threadsPerThreadgroup:MTLSizeMake(w, 1, 1)];
+            } else if (kind == SG_K_TILES2D) {
+                /* x = M tiles, y = N tiles, matching k_matmul_*'s
+                 * tile.x/tile.y reading in kernels.metal. The per-threadgroup
+                 * shape is 2D too (SG_GEMM_TN, SG_GEMM_TM), matching the
+                 * kernel's uint2 thread_position_in_threadgroup -- Metal
+                 * requires that attribute's vector width to match
+                 * threadgroup_position_in_grid's, so it cannot be a flat
+                 * SG_TG the way the reduction kernels dispatch. Total
+                 * threads per threadgroup is still SG_TG (16*16). */
+                [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)tiles_m, (NSUInteger)tiles_n, 1)
+                    threadsPerThreadgroup:MTLSizeMake(SG_GEMM_TN, SG_GEMM_TM, 1)];
             } else {
                 [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)groups, 1, 1)
                     threadsPerThreadgroup:MTLSizeMake(SG_TG, 1, 1)];

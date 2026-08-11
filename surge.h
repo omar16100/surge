@@ -589,6 +589,19 @@ sg_err sg_gpu_run_op(sg_gpu *g, const char *kernel, void *a, void *b, void *out,
 sg_err sg_gpu_run_attn_decode_f16(sg_gpu *g, void *q, void *k, void *v, void *out,
                                   const uint32_t params[8]);
 
+/* One-shot dispatch for k_attn_prefill (Task M5.4's full-attention tiled
+ * prefill kernel), the same synchronous three-device-input contract as
+ * sg_gpu_run_attn_decode_f16 but over a CHUNK of n query tokens. q is f32
+ * [n, n_heads, q_stride]; k and v are f16 [base+n, n_kv_heads, head_dim]
+ * SEPARATE buffers (the sg_kv layout) that ALREADY hold base+n positions (the
+ * caller stores the chunk's own K/V into the cache before this runs); out is
+ * f32 [n, n_heads, head_dim]. Query token t (absolute position base+t) attends
+ * causally over cache positions 0..base+t only, so no query ever reads a
+ * strictly-future key. params: [0]=n_heads [1]=n_kv_heads [2]=head_dim
+ * [3]=base [4]=n [5]=q_stride [6]=softmax scale bits (f32 bit pattern). */
+sg_err sg_gpu_run_attn_prefill(sg_gpu *g, void *q, void *k, void *v, void *out,
+                               const uint32_t params[8]);
+
 /* ---------------------------------------------------------------------
  * The full Metal decode path (Task 10)
  * ---------------------------------------------------------------------

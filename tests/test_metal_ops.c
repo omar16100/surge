@@ -1415,6 +1415,263 @@ static void metal_attn_decode_f16_matches_f32(void) {
 }
 
 /* --------------------------------------------------------------------
+ * M5.4: full-attention tiled prefill
+ * -------------------------------------------------------------------- */
+
+/* Gate 1: k_rope_chunk applied to a whole chunk of N tokens == k_rope_heads
+ * applied once per token at that token's absolute position, BIT-IDENTICAL.
+ * Both are GPU kernels reading the same input bytes and the same f32 cos/sin
+ * values (the host builds each token's table in double, exactly as the decode
+ * path does), and k_rope_chunk's rotation math is k_rope_heads' verbatim, so
+ * the two must agree to the byte. Both output buffers are poisoned first, so
+ * the untouched non-rotated regions (the [rope_dim, head_dim) tail is copied,
+ * but the [head_dim, stride) gate half neither kernel writes) also match:
+ * identical 0xA5 on both sides. */
+static void rope_chunk_case(uint32_t head_dim, uint32_t rope_dim, uint32_t heads,
+                            uint32_t stride, uint32_t n_tok, uint32_t base, float theta) {
+    uint64_t slice_floats = (uint64_t)heads * stride;
+    uint64_t xn = (uint64_t)n_tok * slice_floats;
+    float *x = xmalloc(xn * sizeof *x);
+    for (uint64_t i = 0; i < xn; i++) x[i] = lcg_next();
+
+    /* Per-token cos/sin table [n_tok, rope_dim], each token at absolute pos base+t. */
+    float *cs = xmalloc((uint64_t)n_tok * rope_dim * sizeof *cs);
+    for (uint32_t t = 0; t < n_tok; t++) {
+        rope_table(cs + (uint64_t)t * rope_dim, rope_dim, base + t, theta);
+    }
+
+    gbuf a = gb_from(x, xn), b = gb_from(cs, (uint64_t)n_tok * rope_dim), o = gb_new(xn);
+    uint32_t p[8] = {head_dim, rope_dim, heads, stride, n_tok, 0, 0, 0};
+    gb_poison(&o);
+    bool ok = gpu_run("k_rope_chunk", &a, &b, &o, p);
+
+    uint64_t mism = 0;
+    uint32_t at_tok = 0;
+    if (ok) {
+        gbuf xr = gb_new(slice_floats), csr = gb_new(rope_dim), ores = gb_new(slice_floats);
+        uint32_t pv[8] = {head_dim, rope_dim, heads, stride, 0, 0, 0, 0};
+        for (uint32_t t = 0; t < n_tok; t++) {
+            memcpy(xr.h, x + (uint64_t)t * slice_floats, (size_t)slice_floats * sizeof(float));
+            rope_table(csr.h, rope_dim, base + t, theta);
+            gb_poison(&ores);
+            if (!gpu_run("k_rope_heads", &xr, &csr, &ores, pv)) { ok = false; break; }
+            if (memcmp(ores.h, o.h + (uint64_t)t * slice_floats,
+                       (size_t)slice_floats * sizeof(float)) != 0) {
+                if (mism == 0) at_tok = t;
+                mism++;
+            }
+        }
+        gb_free(&xr); gb_free(&csr); gb_free(&ores);
+    }
+
+    char lbl[96];
+    snprintf(lbl, sizeof lbl, "k_rope_chunk==k_rope_heads N=%u base=%u heads=%u stride=%u",
+             n_tok, base, heads, stride);
+    tt_assert(ok && mism == 0, "%s: %llu of %u tokens differed (first at token %u)",
+              lbl, (unsigned long long)mism, n_tok, at_tok);
+    if (ok && mism == 0) {
+        fprintf(stderr, "   %-58s %u/%u tokens bit-identical\n", lbl, n_tok, n_tok);
+    }
+    gb_free(&a); gb_free(&b); gb_free(&o);
+    free(x); free(cs);
+}
+
+static void metal_rope_chunk_matches_rope_heads(void) {
+    /* The real checkpoint's RoPE parameters: head_dim 256, rope_dim 64 partial,
+     * theta 1e7. base 1000 puts every token past the f32-angle danger zone the
+     * double-precision host table exists for. */
+    const uint32_t hd = 256, rope_dim = 64;
+    const float theta = 1e7f;
+    const uint32_t ns[4] = {1, 2, 17, 512};
+    const uint32_t bases[2] = {0, 1000};
+    lcg_seed(0x50BEC0DEu);
+    for (int bi = 0; bi < 2; bi++) {
+        for (int ni = 0; ni < 4; ni++) {
+            /* Q layout: heads slices at stride 2*head_dim (the query interleaved
+             * with the untouched attention-gate half). */
+            rope_chunk_case(hd, rope_dim, 4, 2 * hd, ns[ni], bases[bi], theta);
+        }
+    }
+    /* K layout: stride == head_dim (no interleaved gate), one representative
+     * (N, base) since the kernel treats it as just a different heads/stride. */
+    rope_chunk_case(hd, rope_dim, 2, hd, 17, 1000, theta);
+
+    /* Gate 3 (determinism): 100 reruns byte-identical, output poisoned before
+     * each run. (Inlined rather than via det_check, which is defined later in
+     * this file.) */
+    {
+        const uint32_t n_tok = 17, heads = 4, stride = 2 * hd, base = 1000;
+        uint64_t xn = (uint64_t)n_tok * heads * stride;
+        float *x = xmalloc(xn * sizeof *x);
+        for (uint64_t i = 0; i < xn; i++) x[i] = lcg_next();
+        float *cs = xmalloc((uint64_t)n_tok * rope_dim * sizeof *cs);
+        for (uint32_t t = 0; t < n_tok; t++) {
+            rope_table(cs + (uint64_t)t * rope_dim, rope_dim, base + t, theta);
+        }
+        gbuf a = gb_from(x, xn), b = gb_from(cs, (uint64_t)n_tok * rope_dim), o = gb_new(xn);
+        uint32_t p[8] = {hd, rope_dim, heads, stride, n_tok, 0, 0, 0};
+        /* Byte compare, not float compare: the untouched [head_dim, stride)
+         * gate half stays 0xA5 poison (a NaN), and NaN != NaN would be a false
+         * mismatch. The poison is re-applied identically each run, so a correct
+         * kernel is byte-identical over the whole buffer. */
+        uint8_t *first = xmalloc((size_t)xn * sizeof(float));
+        uint64_t mism = 0;
+        for (int rep = 0; rep < 100; rep++) {
+            gb_poison(&o);
+            if (!gpu_run("k_rope_chunk", &a, &b, &o, p)) break;
+            if (rep == 0) memcpy(first, o.h, (size_t)xn * sizeof(float));
+            else if (memcmp(first, o.h, (size_t)xn * sizeof(float)) != 0) mism++;
+        }
+        tt_assert(mism == 0, "k_rope_chunk: %llu of 99 reruns differed byte-wise",
+                  (unsigned long long)mism);
+        if (mism == 0) {
+            fprintf(stderr, "   k_rope_chunk (17 tok, base 1000): "
+                            "byte-identical over 100 reruns\n");
+        }
+        free(first);
+        gb_free(&a); gb_free(&b); gb_free(&o);
+        free(x); free(cs);
+    }
+}
+
+/* Gate 2: k_attn_prefill over a chunk == k_attn_decode_f16 run once per token
+ * at seq = base+t+1 (the KV built up to and including that token), within the
+ * per-op 1e-4 relative bar. The two share one fp16 KV fixture (base prior
+ * positions plus the n-token chunk), and k_attn_prefill's per-(token, head)
+ * threadgroup mirrors k_attn_decode_f16 statement for statement, so the
+ * agreement is in fact bit-exact; the case asserts the 1e-4 gate and also
+ * reports the exact-byte token count. Returns the worst relative error. */
+static double attn_prefill_case(uint32_t n_heads, uint32_t n_kv, uint32_t hd,
+                                uint32_t n_tok, uint32_t base) {
+    uint32_t q_stride = 2 * hd;
+    float scale = (float)(1.0 / sqrt((double)hd));
+    uint64_t seq_max = (uint64_t)base + n_tok;
+    uint64_t qn = (uint64_t)n_tok * n_heads * q_stride;
+    uint64_t kvn = seq_max * n_kv * hd;
+    uint64_t out_n = (uint64_t)n_tok * n_heads * hd;
+
+    float *q = xmalloc(qn * sizeof *q);
+    for (uint64_t i = 0; i < qn; i++) q[i] = lcg_next();
+    uint16_t *k16 = xmalloc(kvn * sizeof *k16), *v16 = xmalloc(kvn * sizeof *v16);
+    for (uint64_t i = 0; i < kvn; i++) {
+        k16[i] = sg_f32_to_f16(lcg_next() * 2.0f);
+        v16[i] = sg_f32_to_f16(lcg_next() * 2.0f);
+    }
+
+    gbuf qb = gb_from(q, qn);
+    gbuf16 kb = gb16_new(kvn), vb = gb16_new(kvn);
+    memcpy(kb.h, k16, kvn * sizeof(uint16_t));
+    memcpy(vb.h, v16, kvn * sizeof(uint16_t));
+    gbuf ob = gb_new(out_n);
+    gb_poison(&ob);
+    uint32_t pp[8] = {n_heads, n_kv, hd, base, n_tok, q_stride, f32_bits(scale), 0};
+    sg_err e = sg_gpu_run_attn_prefill(g_gpu, qb.b, kb.b, vb.b, ob.b, pp);
+    tt_assert(!sg_failed(e), "k_attn_prefill (N=%u base=%u): %s", n_tok, base,
+              e.msg ? e.msg : "ok");
+
+    double worst = 0.0;
+    uint64_t exact = 0;
+    if (!sg_failed(e)) {
+        gbuf qtok = gb_new((uint64_t)n_heads * q_stride);
+        gbuf dec = gb_new((uint64_t)n_heads * hd);
+        bool ok = true;
+        for (uint32_t t = 0; t < n_tok && ok; t++) {
+            memcpy(qtok.h, q + (uint64_t)t * n_heads * q_stride,
+                   (size_t)n_heads * q_stride * sizeof(float));
+            uint32_t seq = base + t + 1u;
+            uint32_t pd[8] = {n_heads, n_kv, hd, seq, q_stride, f32_bits(scale), 0, 0};
+            gb_poison(&dec);
+            sg_err ed = sg_gpu_run_attn_decode_f16(g_gpu, qtok.b, kb.b, vb.b, dec.b, pd);
+            if (sg_failed(ed)) { tt_assert(0, "decode ref t=%u: %s", t, ed.msg); ok = false; break; }
+
+            const float *got = ob.h + (uint64_t)t * n_heads * hd;
+            const float *want = dec.h;
+            uint32_t hn = n_heads * hd;
+            double sc = 0.0;
+            for (uint32_t i = 0; i < hn; i++) { double m = fabs((double)want[i]); if (m > sc) sc = m; }
+            if (sc == 0.0) sc = 1.0;
+            for (uint32_t i = 0; i < hn; i++) {
+                double d = fabs((double)got[i] - (double)want[i]) / sc;
+                if (d > worst) worst = d;
+            }
+            if (memcmp(got, want, (size_t)hn * sizeof(float)) == 0) exact++;
+        }
+        gb_free(&qtok); gb_free(&dec);
+    }
+
+    char lbl[96];
+    snprintf(lbl, sizeof lbl, "k_attn_prefill vs decode looped N=%u base=%u", n_tok, base);
+    tt_assert(worst < TOL_REL, "%s: worst rel %.3e >= tol %.0e", lbl, worst, TOL_REL);
+    fprintf(stderr, "   %-52s rel %.3e  (%llu/%u tokens bit-exact)\n",
+            lbl, worst, (unsigned long long)exact, n_tok);
+    if (worst > g_worst_rel) {
+        g_worst_rel = worst;
+        snprintf(g_worst_label, sizeof g_worst_label, "%s", lbl);
+    }
+
+    gb_free(&qb); gb16_free(&kb); gb16_free(&vb); gb_free(&ob);
+    free(q); free(k16); free(v16);
+    return worst;
+}
+
+static void metal_attn_prefill_matches_decode(void) {
+    /* GQA (8 query heads over 2 kv heads, repeat 4), head_dim 64 for a fast
+     * but representative shape. N in {1,2,17,512}, base in {0,1000}. */
+    const uint32_t n_heads = 8, n_kv = 2, hd = 64;
+    const uint32_t ns[4] = {1, 2, 17, 512};
+    const uint32_t bases[2] = {0, 1000};
+    lcg_seed(0x9EF11Eu);
+    for (int bi = 0; bi < 2; bi++) {
+        for (int ni = 0; ni < 4; ni++) {
+            attn_prefill_case(n_heads, n_kv, hd, ns[ni], bases[bi]);
+        }
+    }
+
+    /* Gate 3 (determinism): 100 reruns of k_attn_prefill byte-identical, output
+     * poisoned before each run, at one representative (N=17, base=1000). */
+    {
+        const uint32_t n_tok = 17, base = 1000, q_stride = 2 * hd;
+        float scale = (float)(1.0 / sqrt((double)hd));
+        uint64_t seq_max = (uint64_t)base + n_tok;
+        uint64_t qn = (uint64_t)n_tok * n_heads * q_stride, kvn = seq_max * n_kv * hd;
+        uint64_t out_n = (uint64_t)n_tok * n_heads * hd;
+        float *q = xmalloc(qn * sizeof *q);
+        for (uint64_t i = 0; i < qn; i++) q[i] = lcg_next();
+        uint16_t *k16 = xmalloc(kvn * sizeof *k16), *v16 = xmalloc(kvn * sizeof *v16);
+        for (uint64_t i = 0; i < kvn; i++) {
+            k16[i] = sg_f32_to_f16(lcg_next() * 2.0f);
+            v16[i] = sg_f32_to_f16(lcg_next() * 2.0f);
+        }
+        gbuf qb = gb_from(q, qn);
+        gbuf16 kb = gb16_new(kvn), vb = gb16_new(kvn);
+        memcpy(kb.h, k16, kvn * sizeof(uint16_t));
+        memcpy(vb.h, v16, kvn * sizeof(uint16_t));
+        gbuf ob = gb_new(out_n);
+        uint32_t pp[8] = {n_heads, n_kv, hd, base, n_tok, q_stride, f32_bits(scale), 0};
+
+        float *first = xmalloc(out_n * sizeof *first);
+        uint64_t mism = 0;
+        for (int rep = 0; rep < 100; rep++) {
+            gb_poison(&ob);
+            sg_err e = sg_gpu_run_attn_prefill(g_gpu, qb.b, kb.b, vb.b, ob.b, pp);
+            tt_assert(!sg_failed(e), "k_attn_prefill det rep %d: %s", rep, e.msg ? e.msg : "ok");
+            if (sg_failed(e)) break;
+            if (rep == 0) memcpy(first, ob.h, out_n * sizeof *first);
+            else for (uint64_t i = 0; i < out_n; i++) if (ob.h[i] != first[i]) mism++;
+        }
+        tt_assert(mism == 0, "k_attn_prefill: %llu bit mismatches over 100 reruns",
+                  (unsigned long long)mism);
+        if (mism == 0) {
+            fprintf(stderr, "   k_attn_prefill (17 tok, base 1000): "
+                            "byte-identical over 100 reruns\n");
+        }
+        free(first);
+        gb_free(&qb); gb16_free(&kb); gb16_free(&vb); gb_free(&ob);
+        free(q); free(k16); free(v16);
+    }
+}
+
+/* --------------------------------------------------------------------
  * sg_gpu_wrap: the no-copy path a checkpoint mmap goes through
  * -------------------------------------------------------------------- */
 
@@ -1821,6 +2078,8 @@ int main(void) {
     tt_run("metal_attn_decode_matches_ref", metal_attn_decode_matches_ref);
     tt_run("metal_kv_store_f16_roundtrips", metal_kv_store_f16_roundtrips);
     tt_run("metal_attn_decode_f16_matches_f32", metal_attn_decode_f16_matches_f32);
+    tt_run("metal_rope_chunk_matches_rope_heads", metal_rope_chunk_matches_rope_heads);
+    tt_run("metal_attn_prefill_matches_decode", metal_attn_prefill_matches_decode);
     tt_run("metal_wrap_handles_page_offset", metal_wrap_handles_page_offset);
     tt_run("metal_reductions_are_deterministic", metal_reductions_are_deterministic);
     tt_run("metal_rejects_bad_arguments", metal_rejects_bad_arguments);

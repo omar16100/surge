@@ -44,7 +44,7 @@ optionally Accelerate for the CPU reference path. No third-party libraries.
 | `src/kv.c` | (M5.1) fp16 growable KV cache for full-attention layers + fixed-size DeltaNet recurrent state, over opaque GPU-buffer handles; Metal-free (allocation injected). `sg_kv_bytes` = 16 GiB K+V at 262,144. Wired into decode by M5.2 (see below). |
 | `src/bench.c` | (B-series) pure-C benchmark math: decode-by-slope, leaderboard-row/JSON formatters, prompt file read, ingestion/truncation guard, NIAH recall scorer. |
 | `src/metal.m` | Metal device init, weight-buffer wrapping (mmap, no-copy; bf16/f32/Q8_0 sizing), per-weight matvec kernel dispatch (`matmul_kernel_for`), one command buffer per decode token, kernel registration (KI_ enum + SG_KERNELS table + size/param checks). Registers itself as `sg_kv`'s allocation backend at init. Decode state: the DEFAULT full-attention KV cache is fp16, allocated through `sg_kv` as SEPARATE per-layer K/V buffers (M5.2, `SURGE_KV_DTYPE` env toggle); `SURGE_KV_DTYPE=f32` selects the original combined-buffer f32 path unchanged, kept so the M2 gate's oracle never moves. DeltaNet conv/S state stays on its pre-M5.1 ad hoc allocation either way (DeltaNet decode is not yet refit onto `sg_kv`). |
-| `src/kernels.metal` | deterministic Metal kernels: decode-step ones fold a fixed reduction tree (no atomics/simd_sum) -- bf16/f32/Q8_0 matvec, attention decode (f32-KV `k_attn_decode` and fp16-KV `k_attn_decode_f16`, M5.2), a decode-step fp16 store (`k_kv_store_f16`, M5.2), gated-DeltaNet decode, RoPE, RMSNorm, SwiGLU. Prefill's tiled GEMM (M5.3, `k_matmul_bf16`/`k_matmul_f32`/`k_matmul_q8`, `Y[N,M]=X[N,K]@W[M,K]^T`) uses a different determinism mechanism: one thread per output element of a 16x16 output tile, a private serial K-loop, no cross-thread reduction at all (nothing to fold). Tiled/flash attention and the DeltaNet chunked scan kernels arrive later in M5. |
+| `src/kernels.metal` | deterministic Metal kernels: decode-step ones fold a fixed reduction tree (no atomics/simd_sum) -- bf16/f32/Q8_0 matvec, attention decode (f32-KV `k_attn_decode` and fp16-KV `k_attn_decode_f16`, M5.2), a decode-step fp16 store (`k_kv_store_f16`, M5.2), gated-DeltaNet decode, RoPE, RMSNorm, SwiGLU. Prefill's tiled GEMM (M5.3, `k_matmul_bf16`/`k_matmul_f32`/`k_matmul_q8`, `Y[N,M]=X[N,K]@W[M,K]^T`) uses a different determinism mechanism: one thread per output element of a 16x16 output tile, a private serial K-loop, no cross-thread reduction at all (nothing to fold). Full-attention prefill (M5.4) adds `k_rope_chunk` (partial RoPE over a whole chunk) and `k_attn_prefill` (causal chunk attention over the fp16 KV cache, one threadgroup per (query token, query head), same fixed-tree softmax as `k_attn_decode_f16`). The DeltaNet chunked scan kernels arrive later in M5. |
 | `src/cli_*.c` | the four CLI mains. |
 
 ## Level 4: Data flows
@@ -91,7 +91,18 @@ optionally Accelerate for the CPU reference path. No third-party libraries.
     class), not yet wired into `sg_gpu_forward` (that is M5.4+'s job); vs a host f64
     reference and vs the existing matvec kernels, worst measured 2.5e-6 relative
     (bf16/f32, gate 1e-5) and 8e-7 (Q8_0, gate 2e-2); 100/100 byte-identical determinism.
-    M5.4-M5.7 pending.
+    M5.4 (full-attention tiled prefill kernels) DONE: `k_rope_chunk` (partial RoPE over a
+    whole chunk, each token at its absolute position; bit-identical to `k_rope_heads`
+    per token) and `k_attn_prefill` (one threadgroup per (query token, query head),
+    causal over the fp16 KV cache: token t attends the first `base+t+1` positions, so no
+    query reads a strictly-future key). The per-(token,head) structure mirrors
+    `k_attn_decode_f16` statement for statement, so prefill of a chunk is BIT-EXACT to
+    looped decode (measured rel 0.0, gate 1e-4) and byte-identical over 100 reruns. Host
+    side: public `sg_gpu_run_attn_prefill` (three-input one-shot, like the f16 decode
+    entry) and the encoder `enc_attn_prefill` (chunked twin of `enc_attn`: tiled GEMM
+    Q/K/V, chunk qk-norm + `k_rope_chunk`, store-chunk-K/V-then-attend, output gate,
+    o_proj). `enc_attn_prefill` is built but not yet driven (that is M5.6's whole-prompt
+    orchestration, which also sizes its chunk buffers). M5.5-M5.7 pending.
   - Bench harness: B1/B3/B4 (pure C) done; B2/B5/B6 (Metal/CLI) and B7 (gated 256K run)
     pending.
 - **Not built:** M4 (kernel excellence / beat mlx-lm), server mode, non-Metal platforms,

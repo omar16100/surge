@@ -66,7 +66,12 @@ enum {
      * threadgroups of SG_TG, one per GEMM output tile. Computed by hand in
      * sg_gpu_run_op (not by gpu_grid, which only returns a 1D count) because
      * this is the only kind whose group count needs two dimensions. */
-    SG_K_TILES2D
+    SG_K_TILES2D,
+    /* M5.4: k_rope_chunk, one thread per (token, head, element) of the chunk,
+     * params[0]*params[2]*params[4] = head_dim*heads*n_tok threads, non-uniform
+     * threadgroups. An elementwise kernel with no reduction, dispatched through
+     * gpu_grid's *elems path like SG_K_ELEM but with a 3-factor count. */
+    SG_K_ROPE_CHUNK
 };
 
 #define SG_TG 256u
@@ -95,7 +100,8 @@ enum {
     KI_CONV1D, KI_DELTA, KI_RMSNORM_HEADS, KI_ROPE_HEADS, KI_GATE_STRIDED,
     KI_SCALE, KI_ADD, KI_DELTA_GATES, KI_DELTA_MULTI,
     KI_KV_STORE_F16, KI_ATTN_F16,
-    KI_MATMUL_BF16, KI_MATMUL_F32, KI_MATMUL_Q8, KI_COUNT
+    KI_MATMUL_BF16, KI_MATMUL_F32, KI_MATMUL_Q8,
+    KI_ROPE_CHUNK, KI_ATTN_PREFILL, KI_COUNT
 };
 
 static const sg_kernel_desc SG_KERNELS[] = {
@@ -133,6 +139,14 @@ static const sg_kernel_desc SG_KERNELS[] = {
     { "k_matmul_bf16",         SG_K_TILES2D },
     { "k_matmul_f32",          SG_K_TILES2D },
     { "k_matmul_q8",           SG_K_TILES2D },
+    /* M5.4: full-attention tiled prefill. k_rope_chunk is a plain elementwise
+     * kernel dispatched through the generic sg_gpu_run_op path (a=x, b=cs,
+     * out); k_attn_prefill takes THREE device buffer inputs (Q, separate K,
+     * separate V) like k_attn_decode_f16, so it is dispatched by hand (see
+     * sg_gpu_run_attn_prefill and enc_attn_prefill) and is listed here only so
+     * sg_gpu_init builds its pipeline and checks its threadgroup width. */
+    { "k_rope_chunk",          SG_K_ROPE_CHUNK },
+    { "k_attn_prefill",        SG_K_ATTN       },
 };
 #define SG_N_KERNELS ((int)(sizeof SG_KERNELS / sizeof SG_KERNELS[0]))
 _Static_assert(SG_N_KERNELS == KI_COUNT, "SG_KERNELS and the KI_ enum disagree");
@@ -569,6 +583,13 @@ static sg_err check_sizes(const char *kernel, const sg_gpu_buf *a, const sg_gpu_
     } else if (strcmp(kernel, "k_rope") == 0) {
         ok = mul_ck(p[0], f, &need_a) && mul_ck(p[1], f, &need_b);
         need_o = need_a;                  /* b is cos[rope_dim/2] then sin[..] */
+    } else if (strcmp(kernel, "k_rope_heads") == 0) {
+        /* a = out = [heads, stride] f32 (a head's rotated tail stays inside its
+         * own stride, guaranteed by check_params' stride>=head_dim); b is the
+         * single-token cos/sin table [rope_dim] f32. p[0]=head_dim p[1]=rope_dim
+         * p[2]=heads p[3]=stride. */
+        ok = mul_ck(p[2], p[3], &t0) && mul_ck(t0, f, &need_a) && mul_ck(p[1], f, &need_b);
+        need_o = need_a;
     } else if (strcmp(kernel, "k_matvec_bf16") == 0) {
         ok = mul_ck(p[0], p[1], &t0) && mul_ck(t0, 2, &need_a) &&
              mul_ck(p[1], f, &need_b) && mul_ck(p[0], f, &need_o);
@@ -625,6 +646,16 @@ static sg_err check_sizes(const char *kernel, const sg_gpu_buf *a, const sg_gpu_
         ok = mul_ck(p[0], p[2], &t0) && mul_ck(t0, f, &need_a) &&
              mul_ck(p[1], p[2] / 32u, &t1) && mul_ck(t1, 34, &need_b) &&
              mul_ck(p[0], p[1], &t2) && mul_ck(t2, f, &need_o);
+    } else if (strcmp(kernel, "k_rope_chunk") == 0) {
+        /* a = out = [n_tok*heads, stride] f32 (a slice's rotated tail stays
+         * inside its own stride, guaranteed by check_params' stride>=head_dim,
+         * so n_tok*heads*stride is a safe cover); b = cos/sin table
+         * [n_tok, rope_dim] f32. p[0]=head_dim p[1]=rope_dim p[2]=heads
+         * p[3]=stride p[4]=n_tok. */
+        ok = mul_ck((uint64_t)p[4], p[2], &t0) && mul_ck(t0, p[3], &t1) &&
+             mul_ck(t1, f, &need_a) &&
+             mul_ck((uint64_t)p[4], p[1], &t2) && mul_ck(t2, f, &need_b);
+        need_o = need_a;
     } else {
         return gpu_errf("gpu: no size rule for kernel '%s'", kernel);
     }
@@ -666,6 +697,21 @@ static sg_err check_params(const char *kernel, const uint32_t *p) {
             return gpu_errf("gpu: k_rope rope_dim %u must be even and in [2, head_dim %u]",
                             p[1], p[0]);
         }
+    } else if (strcmp(kernel, "k_rope_heads") == 0) {
+        /* Same rope_dim rule as k_rope; stride (p[3]) must be at least head_dim
+         * or a head's rotated tail would spill into the next head's slice.
+         * (This kernel is normally dispatched by the decode encoder, which
+         * always passes valid values; the rule lets sg_gpu_run_op reach it too,
+         * which the M5.4 per-op test uses as the k_rope_chunk oracle.) */
+        if (p[0] == 0) return (sg_err){"gpu: k_rope_heads head_dim must be nonzero"};
+        if (p[1] < 2 || p[1] > p[0] || p[1] % 2 != 0) {
+            return gpu_errf("gpu: k_rope_heads rope_dim %u must be even and in [2, head_dim %u]",
+                            p[1], p[0]);
+        }
+        if (p[3] < p[0]) {
+            return gpu_errf("gpu: k_rope_heads stride %u is smaller than head_dim %u",
+                            p[3], p[0]);
+        }
     } else if (strcmp(kernel, "k_attn_decode") == 0) {
         if (p[1] == 0 || p[0] % p[1] != 0) {
             return gpu_errf("gpu: k_attn_decode n_heads %u is not a multiple of n_kv_heads %u",
@@ -690,6 +736,29 @@ static sg_err check_params(const char *kernel, const uint32_t *p) {
         if (p[2] == 0 || p[2] % 32 != 0) {
             return gpu_errf("gpu: k_matmul_q8 K %u must be a nonzero multiple of 32", p[2]);
         }
+    } else if (strcmp(kernel, "k_rope_chunk") == 0) {
+        /* Same rope_dim rule as k_rope. stride must be at least head_dim, or a
+         * slice's rotated tail would spill into the next slice; heads and n_tok
+         * must be nonzero or the dispatch is empty. */
+        if (p[0] == 0) return (sg_err){"gpu: k_rope_chunk head_dim must be nonzero"};
+        if (p[1] < 2 || p[1] > p[0] || p[1] % 2 != 0) {
+            return gpu_errf("gpu: k_rope_chunk rope_dim %u must be even and in [2, head_dim %u]",
+                            p[1], p[0]);
+        }
+        if (p[2] == 0) return (sg_err){"gpu: k_rope_chunk heads must be nonzero"};
+        if (p[3] < p[0]) {
+            return gpu_errf("gpu: k_rope_chunk stride %u is smaller than head_dim %u",
+                            p[3], p[0]);
+        }
+        if (p[4] == 0) return (sg_err){"gpu: k_rope_chunk n_tok must be nonzero"};
+        /* The kernel carries slices = n_tok*heads and slices*head_dim (the grid
+         * element count, and thread_position_in_grid) in 32-bit uint, so the
+         * total must fit u32 or those wrap in-kernel even though the byte sizes
+         * in check_sizes are u64-guarded. Reject rather than truncate. */
+        uint64_t rc_slices = (uint64_t)p[4] * p[2];
+        if (rc_slices > UINT32_MAX || rc_slices * p[0] > UINT32_MAX) {
+            return (sg_err){"gpu: k_rope_chunk head_dim*heads*n_tok exceeds the 32-bit grid range"};
+        }
     }
     return SG_OK;
 }
@@ -710,6 +779,11 @@ static void gpu_grid(int kind, const uint32_t *p, uint64_t *groups, uint64_t *el
     case SG_K_ATTN:    *groups = p[0]; break;
     case SG_K_GATED:   *groups = p[1]; break;
     case SG_K_GROUPS2: *groups = p[2]; break;
+    /* M5.4 k_rope_chunk: one thread per (token, head, element). Three u32
+     * factors; the (uint64)p[0]*p[2] cannot wrap (two u32) and *p[4] cannot
+     * either at any real chunk size (head_dim*heads*n_tok is far under 2^64).
+     * check_sizes re-guards the byte counts with mul_ck regardless. */
+    case SG_K_ROPE_CHUNK: *elems = (uint64_t)p[0] * p[2] * p[4]; break;
     /* SG_K_TILES2D needs two group dimensions, which this function's (groups,
      * elems) pair cannot carry; sg_gpu_run_op computes both by hand instead
      * (see the SG_K_TILES2D case there). Left at the default *groups = 1 so
@@ -772,7 +846,8 @@ sg_err sg_gpu_run_op(sg_gpu *g, const char *kernel, void *a, void *b, void *out,
     uint64_t groups = 1, elems = 0;
     uint64_t tiles_m = 0, tiles_n = 0;
     gpu_grid(kind, params, &groups, &elems);
-    if (kind == SG_K_ELEM || kind == SG_K_ELEM01 || kind == SG_K_ELEM02) {
+    if (kind == SG_K_ELEM || kind == SG_K_ELEM01 || kind == SG_K_ELEM02
+        || kind == SG_K_ROPE_CHUNK) {
         if (elems == 0) return gpu_errf("gpu: %s dispatched with zero elements", kernel);
     } else if (kind == SG_K_TILES2D) {
         /* Two group dimensions: params[0]=N tiles vertically, params[1]=M
@@ -948,6 +1023,124 @@ sg_err sg_gpu_run_attn_decode_f16(sg_gpu *g, void *q, void *k, void *v, void *ou
     return rc;
 }
 
+/* One-shot dispatch for k_attn_prefill (Task M5.4), the same synchronous
+ * commit-and-wait, three-device-input contract as sg_gpu_run_attn_decode_f16,
+ * but over a CHUNK of n query tokens instead of one. q is f32
+ * [n, n_heads, q_stride]; k and v are f16 [base+n, n_kv_heads, head_dim]
+ * SEPARATE buffers (the sg_kv layout) that already hold base+n positions
+ * (prior context in 0..base-1, the chunk's own K/V in base..base+n-1, stored
+ * by the caller before this runs); out is f32 [n, n_heads, head_dim]. Each of
+ * the n*n_heads threadgroups attends causally over the first base+t+1 cache
+ * positions for its token t. Used by the per-op test; enc_attn_prefill
+ * dispatches the same kernel by hand inside an open command buffer.
+ *
+ * params: [0]=n_heads [1]=n_kv_heads [2]=head_dim [3]=base [4]=n
+ * [5]=q_stride [6]=softmax scale bits (params[7] unused). */
+sg_err sg_gpu_run_attn_prefill(sg_gpu *g, void *q, void *k, void *v, void *out,
+                               const uint32_t params[8]) {
+    if (!g || !q || !k || !v || !out || !params) {
+        return (sg_err){"gpu: sg_gpu_run_attn_prefill got a NULL argument"};
+    }
+    uint32_t n_heads = params[0], n_kv = params[1], hd = params[2], base = params[3];
+    uint32_t n = params[4], q_stride = params[5];
+    if (n_kv == 0 || n_heads % n_kv != 0) {
+        return gpu_errf("gpu: k_attn_prefill n_heads %u is not a multiple of n_kv_heads %u",
+                        n_heads, n_kv);
+    }
+    if (q_stride < hd) {
+        return gpu_errf("gpu: k_attn_prefill q_stride %u is smaller than head_dim %u",
+                        q_stride, hd);
+    }
+    if (n_heads == 0 || hd == 0 || n == 0) {
+        return (sg_err){"gpu: k_attn_prefill dispatched with a zero dimension"};
+    }
+
+    sg_gpu_buf *qb = (sg_gpu_buf *)q, *kb = (sg_gpu_buf *)k, *vb = (sg_gpu_buf *)v,
+               *ob = (sg_gpu_buf *)out;
+
+    /* base+n is the total cache position count; the kernel carries seq and the
+     * per-threadgroup score-row stride in 32-bit uint, and tg = token*n_heads+h
+     * is a 32-bit threadgroup index, so both base+n and n*n_heads must fit u32
+     * or host sizing and kernel indexing would disagree (breaking the causal
+     * window and the per-threadgroup scratch isolation). Reject rather than
+     * truncate; real callers are far under this (sg_kv caps positions at
+     * SG_KV_CAP_MAX == 262144). */
+    uint64_t seq_max = 0, t0 = 0, t1 = 0;
+    if (!add_ck((uint64_t)base, n, &seq_max)) {
+        return (sg_err){"gpu: k_attn_prefill base+n overflows 64 bits"};
+    }
+    if (seq_max > UINT32_MAX) {
+        return (sg_err){"gpu: k_attn_prefill base+n exceeds the 32-bit position range"};
+    }
+    if ((uint64_t)n * n_heads > UINT32_MAX) {
+        return (sg_err){"gpu: k_attn_prefill n*n_heads exceeds the 32-bit threadgroup range"};
+    }
+
+    /* q [n, n_heads, q_stride] f32; k/v [base+n, n_kv, hd] f16;
+     * out [n, n_heads, hd] f32; scores [n*n_heads, base+n] f32. Every product
+     * is u64-guarded: the byte counts are products of up to three caller u32s
+     * and a wrapped-small `need` would let an undersized buffer through. */
+    uint64_t need_q = 0, need_kv = 0, need_o = 0, need_scratch = 0;
+    bool ok = mul_ck((uint64_t)n * n_heads, q_stride, &t0) && mul_ck(t0, 4, &need_q)
+           && mul_ck(seq_max, n_kv, &t0) && mul_ck(t0, hd, &t1) && mul_ck(t1, 2, &need_kv)
+           && mul_ck((uint64_t)n * n_heads, hd, &t0) && mul_ck(t0, 4, &need_o)
+           && mul_ck((uint64_t)n * n_heads, seq_max, &t0) && mul_ck(t0, 4, &need_scratch);
+    if (!ok) {
+        return (sg_err){"gpu: k_attn_prefill params describe a region that overflows 64 bits"};
+    }
+    if (!buf_big_enough(qb, need_q)) {
+        return gpu_errf("gpu: k_attn_prefill q is %llu bytes, needs %llu",
+                        (unsigned long long)(qb ? qb->nbytes : 0), (unsigned long long)need_q);
+    }
+    if (!buf_big_enough(kb, need_kv)) {
+        return gpu_errf("gpu: k_attn_prefill k is %llu bytes, needs %llu",
+                        (unsigned long long)(kb ? kb->nbytes : 0), (unsigned long long)need_kv);
+    }
+    if (!buf_big_enough(vb, need_kv)) {
+        return gpu_errf("gpu: k_attn_prefill v is %llu bytes, needs %llu",
+                        (unsigned long long)(vb ? vb->nbytes : 0), (unsigned long long)need_kv);
+    }
+    if (!buf_big_enough(ob, need_o)) {
+        return gpu_errf("gpu: k_attn_prefill out is %llu bytes, needs %llu",
+                        (unsigned long long)(ob ? ob->nbytes : 0), (unsigned long long)need_o);
+    }
+    if (bufs_overlap(qb, ob) || bufs_overlap(kb, ob) || bufs_overlap(vb, ob)) {
+        return (sg_err){"gpu: k_attn_prefill output overlaps an input buffer"};
+    }
+
+    sg_err e = scratch_ensure(g, need_scratch);
+    if (sg_failed(e)) return e;
+
+    __block sg_err rc = SG_OK;
+    @autoreleasepool {
+        id<MTLCommandBuffer> cb = [g->queue commandBuffer];
+        id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+        if (!cb || !enc) {
+            rc = (sg_err){"gpu: could not open a compute encoder"};
+        } else {
+            [enc setComputePipelineState:g->pipes[KI_ATTN_PREFILL]];
+            [enc setBuffer:qb->buf offset:(NSUInteger)qb->offset atIndex:0];
+            [enc setBuffer:kb->buf offset:(NSUInteger)kb->offset atIndex:1];
+            [enc setBuffer:vb->buf offset:(NSUInteger)vb->offset atIndex:2];
+            [enc setBuffer:ob->buf offset:(NSUInteger)ob->offset atIndex:3];
+            [enc setBytes:params length:8 * sizeof(uint32_t) atIndex:4];
+            [enc setBuffer:g->scratch offset:0 atIndex:5];
+            /* One threadgroup per (query token, query head), same SG_TG width
+             * as k_attn_decode_f16. */
+            [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)n * n_heads, 1, 1)
+                threadsPerThreadgroup:MTLSizeMake(SG_TG, 1, 1)];
+            [enc endEncoding];
+            [cb commit];
+            [cb waitUntilCompleted];
+            if ([cb error]) {
+                rc = gpu_errf("gpu: k_attn_prefill failed: %s",
+                              [[[cb error] localizedDescription] UTF8String]);
+            }
+        }
+    }
+    return rc;
+}
+
 /* =====================================================================
  * The full hybrid decode path (Task 10)
  * =====================================================================
@@ -1050,6 +1243,20 @@ static int matmul_kernel_for(sg_tensor_type t) {
     case SG_T_Q8_0: return KI_MATVEC_Q8;
     case SG_T_BF16: return KI_MATVEC_BF16;
     default:        return KI_MATVEC_F32;   /* SG_T_F32 */
+    }
+}
+
+/* The tiled-GEMM (M5.3) analog of matmul_kernel_for, for the M5.4 prefill
+ * path: it projects a whole CHUNK of tokens through one weight matrix at once
+ * (Y[N,M] = X[N,K] @ W[M,K]^T) rather than one token per matvec. Same
+ * per-tensor dtype dispatch, same one-selection-per-model reasoning as
+ * matmul_kernel_for (the loader guarantees the matmul weights are
+ * dtype-uniform), just the batched kernel family. */
+static int gemm_kernel_for(sg_tensor_type t) {
+    switch (t) {
+    case SG_T_Q8_0: return KI_MATMUL_Q8;
+    case SG_T_BF16: return KI_MATMUL_BF16;
+    default:        return KI_MATMUL_F32;   /* SG_T_F32 */
     }
 }
 
@@ -1191,6 +1398,32 @@ static void enc_attn_f16(sg_enc *E, void *q, void *k, void *v, void *out,
       threadsPerThreadgroup:MTLSizeMake(SG_TG, 1, 1)];
 }
 
+/* One tiled-GEMM (M5.3) dispatch into an already-open encoder, the batched
+ * analog of enc_op for a KI_MATMUL_* kernel. Buffer order is (X, W, Y) -- the
+ * REVERSE of the matvec kernels enc_op drives -- so `x` is the [N, K]
+ * activation chunk, `w` a wrapped [M, K] weight (bound at its own base, like
+ * every wrapped weight), `y` the [N, M] output. `xoff`/`yoff` are element
+ * offsets in FLOATS. The 2D tile grid (ceil(M/TN) x ceil(N/TM) threadgroups of
+ * SG_GEMM_TN x SG_GEMM_TM threads) matches sg_gpu_run_op's SG_K_TILES2D branch
+ * exactly; gpu_grid cannot express two group dimensions, so this is by hand. */
+static void enc_matmul(sg_enc *E, int ki, void *x, uint64_t xoff, void *w,
+                       void *y, uint64_t yoff, uint32_t nn, uint32_t mm, uint32_t kk) {
+    sg_gpu *g = E->g;
+    id<MTLComputeCommandEncoder> e = E->enc;
+    const uint32_t p[8] = { nn, mm, kk, 0, 0, 0, 0, 0 };
+
+    [e setComputePipelineState:g->pipes[ki]];
+    [e setBuffer:bufof(x) offset:(NSUInteger)(offof(x) + xoff * 4) atIndex:0];
+    [e setBuffer:bufof(w) offset:(NSUInteger)offof(w) atIndex:1];
+    [e setBuffer:bufof(y) offset:(NSUInteger)(offof(y) + yoff * 4) atIndex:2];
+    [e setBytes:p length:8 * sizeof(uint32_t) atIndex:3];
+
+    uint64_t tiles_n = ((uint64_t)nn + SG_GEMM_TM - 1) / SG_GEMM_TM;
+    uint64_t tiles_m = ((uint64_t)mm + SG_GEMM_TN - 1) / SG_GEMM_TN;
+    [e dispatchThreadgroups:MTLSizeMake((NSUInteger)tiles_m, (NSUInteger)tiles_n, 1)
+        threadsPerThreadgroup:MTLSizeMake(SG_GEMM_TN, SG_GEMM_TM, 1)];
+}
+
 /* Qwen3NextAttention for one token, mirroring ref.c's attn_layer statement
  * for statement. b_h holds rms_norm(x, ln1) on entry; b_r receives the
  * layer's residual contribution. `layer_idx` is only used on the fp16 path,
@@ -1272,6 +1505,96 @@ static void enc_attn(sg_enc *E, sg_gpu_layer *L, uint32_t layer_idx, uint32_t po
            PARAMS(hd, c->n_heads, 2 * hd, hd));
     enc_op(E, g->mat_kernel, L->w_o, 0, g->b_ctx, 0, g->b_r, 0, nil, 0,
            PARAMS(c->hidden, g->attn_width));
+}
+
+/* Qwen3NextAttention for a CHUNK of `n` query tokens at absolute positions
+ * base .. base+n-1, the chunked twin of enc_attn's fp16 path. It is the
+ * single-full-attn-layer prefill encoder (Task M5.4); the whole-prompt,
+ * all-layers prefill orchestration that drives it is Task M5.6, which is also
+ * what sizes the buffers it reads. External linkage (rather than static) on
+ * purpose: nothing in this build calls it yet, and a static uncalled function
+ * would fail -Werror's -Wunused-function; M5.6's sg_gpu_prefill will call it.
+ *
+ * STORE-VS-ATTEND ORDER: store first, then attend. The chunk's own K and V
+ * are cast into g->kv's per-layer fp16 buffers at positions base..base+n-1
+ * BEFORE the attention dispatch, so at attend time the cache holds all base+n
+ * positions and k_attn_prefill's threadgroup for token t attends over the
+ * first base+t+1 of them (keys 0..base+t). That bound IS the causal mask: a
+ * query at absolute position base+t never reads a key at a strictly-future
+ * position (base+t' with t' > t is >= base+t+1, past the bound), while it does
+ * read every earlier chunk token (t' < t) and all prior context.
+ *
+ * BUFFER SIZING (the caller's contract, since this reuses the decode field
+ * names sized for one token): before calling, g->b_h must hold the chunk's
+ * post-ln1 hidden [n, hidden]; g->b_qg [n, 2*attn_width], g->b_k32/b_v32
+ * [n, kv_width], g->b_ctx [n, attn_width], g->b_r [n, hidden] must be
+ * chunk-sized scratch; g->b_cs must hold the per-token RoPE table
+ * [n, rope_dim] (cos half then sin half per absolute position, built in double
+ * on the host exactly as sg_gpu_forward builds the one-token table); g->scratch
+ * must be at least n*n_heads*(base+n) floats (ensured before the command
+ * buffer opens, never mid-encode). g->kv must be the fp16 sg_kv cache.
+ * Everything is left in g->b_r on exit, the same handle enc_attn writes. */
+void enc_attn_prefill(sg_enc *E, sg_gpu_layer *L, uint32_t layer_idx,
+                      uint32_t base, uint32_t n) {
+    sg_gpu *g = E->g;
+    const sg_cfg *c = &g->cfg;
+    uint32_t hd = c->head_dim;
+    uint32_t eps = fbits(c->rms_eps);
+    float scale = (float)(1.0 / sqrt((double)hd));
+    int gemm = gemm_kernel_for(g->model->wtype);
+
+    /* Q/K/V projections for the whole chunk in one tiled GEMM each:
+     * Y[n, width] = b_h[n, hidden] @ W[width, hidden]^T. */
+    enc_matmul(E, gemm, g->b_h, 0, L->w_q, g->b_qg, 0, n, g->q_width, c->hidden);
+    /* q_norm on every (token, head) query slice: n*n_heads slices of head_dim
+     * at stride 2*head_dim, weight = qk_norm[0..head_dim). Same in-place
+     * k_rmsnorm_heads the decode path uses, applied across the chunk. */
+    enc_op(E, KI_RMSNORM_HEADS, g->b_qg, 0, L->qk_norm, 0, g->b_qg, 0, nil, 0,
+           PARAMS(hd, n * c->n_heads, eps, 1, 2 * hd));
+    /* Partial RoPE per token at its absolute position, from the chunk's cos/sin
+     * table in g->b_cs. */
+    enc_op(E, KI_ROPE_CHUNK, g->b_qg, 0, g->b_cs, 0, g->b_qg, 0, nil, 0,
+           PARAMS(hd, c->rope_dim, c->n_heads, 2 * hd, n));
+
+    enc_matmul(E, gemm, g->b_h, 0, L->w_k, g->b_k32, 0, n, g->kv_width, c->hidden);
+    enc_matmul(E, gemm, g->b_h, 0, L->w_v, g->b_v32, 0, n, g->kv_width, c->hidden);
+    enc_op(E, KI_RMSNORM_HEADS, g->b_k32, 0, L->qk_norm, hd, g->b_k32, 0, nil, 0,
+           PARAMS(hd, n * c->n_kv_heads, eps, 1, hd));
+    enc_op(E, KI_ROPE_CHUNK, g->b_k32, 0, g->b_cs, 0, g->b_k32, 0, nil, 0,
+           PARAMS(hd, c->rope_dim, c->n_kv_heads, hd, n));
+
+    /* STORE: cast the chunk's finished K and V (f32) into the fp16 cache at
+     * positions base..base+n-1. The chunk's [n, kv_width] rows map one-to-one
+     * onto cache positions base..base+n-1 (both kv_width-contiguous), so one
+     * store of n*kv_width elements at cache offset base*kv_width lands them. */
+    void *kbuf = sg_kv_k(g->kv, layer_idx);
+    void *vbuf = sg_kv_v(g->kv, layer_idx);
+    enc_kv_store(E, g->b_k32, kbuf, (uint64_t)base * g->kv_width, n * g->kv_width);
+    enc_kv_store(E, g->b_v32, vbuf, (uint64_t)base * g->kv_width, n * g->kv_width);
+
+    /* ATTEND: k_attn_prefill over the now base+n-position cache, one
+     * threadgroup per (token, head). Dispatched by hand (three device inputs),
+     * exactly as sg_gpu_run_attn_prefill does. */
+    {
+        id<MTLComputeCommandEncoder> e = E->enc;
+        const uint32_t pa[8] = { c->n_heads, c->n_kv_heads, hd, base, n,
+                                 2 * hd, fbits(scale), 0 };
+        [e setComputePipelineState:g->pipes[KI_ATTN_PREFILL]];
+        [e setBuffer:bufof(g->b_qg) offset:(NSUInteger)offof(g->b_qg) atIndex:0];
+        [e setBuffer:bufof(kbuf) offset:(NSUInteger)offof(kbuf) atIndex:1];
+        [e setBuffer:bufof(vbuf) offset:(NSUInteger)offof(vbuf) atIndex:2];
+        [e setBuffer:bufof(g->b_ctx) offset:(NSUInteger)offof(g->b_ctx) atIndex:3];
+        [e setBytes:pa length:8 * sizeof(uint32_t) atIndex:4];
+        [e setBuffer:g->scratch offset:0 atIndex:5];
+        [e dispatchThreadgroups:MTLSizeMake((NSUInteger)n * c->n_heads, 1, 1)
+            threadsPerThreadgroup:MTLSizeMake(SG_TG, 1, 1)];
+    }
+
+    /* Output gate (sigmoid of the second half of each head's q_proj slice),
+     * then o_proj, both chunked. */
+    enc_op(E, KI_GATE_STRIDED, g->b_ctx, 0, g->b_qg, 0, g->b_ctx, 0, nil, 0,
+           PARAMS(hd, n * c->n_heads, 2 * hd, hd));
+    enc_matmul(E, gemm, g->b_ctx, 0, L->w_o, g->b_r, 0, n, c->hidden, g->attn_width);
 }
 
 /* GatedDeltaNet for one token, mirroring ref.c's gdn_layer. The conv output

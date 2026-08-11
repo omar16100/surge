@@ -1244,3 +1244,69 @@ threadgroup unchanged (256).
 These kernels are not yet wired into `sg_gpu_forward` / the prefill
 orchestration -- that is M5.4+ (full-attn prefill) and M5.5 (DeltaNet
 chunked scan)'s job.
+
+## Task M5.4 Results (kernels.metal/metal.m: full-attention tiled prefill)
+
+Two new kernels + a public one-shot + the single-full-attn-layer encoder, so a
+whole CHUNK of prompt tokens goes through one full-attention layer per command
+buffer instead of one token at a time.
+
+- `k_rope_chunk`: partial RoPE over a chunk of N tokens, each rotated at its
+  ABSOLUTE position base+i. The chunk is `heads*n_tok` head slices at a fixed
+  stride (token-major then head); slice s reads token s/heads's cos/sin table
+  from a host-built [n_tok, rope_dim] buffer. Pairing/half-split/tail-copy are
+  `k_rope_heads`' verbatim, so it is BIT-IDENTICAL to `k_rope_heads` per token.
+- `k_attn_prefill`: causal chunk attention over the fp16 KV cache (sg_kv
+  layout). One threadgroup per (query token t, query head h); token t attends
+  the first seq=base+t+1 cache positions (keys 0..base+t). That loop bound IS
+  the causal mask: a query at abs pos base+t never reads a strictly-future key,
+  later chunk tokens see earlier ones, all prior context is included. Every
+  accumulation is `k_attn_decode_f16`'s verbatim (same GQA h/repeat map, same
+  fixed-tree tg_max/tg_sum, same divide softmax, same half->float widen), so
+  prefill of a chunk is bit-exact to looped decode.
+- Host: `sg_gpu_run_attn_prefill` (three-device-input one-shot, mirrors
+  `sg_gpu_run_attn_decode_f16`); `SG_K_ROPE_CHUNK` grid class + gpu_grid case;
+  check_params/check_sizes for `k_rope_chunk` and, so the test can use it as
+  the oracle, newly for `k_rope_heads` too (additive; decode uses enc_op, not
+  sg_gpu_run_op, so its path is unchanged). `gemm_kernel_for` + `enc_matmul`
+  (2D-tile GEMM dispatch inside an open encoder) + the `enc_attn_prefill`
+  encoder: tiled-GEMM Q/K/V, chunk qk-norm, `k_rope_chunk`, STORE chunk K/V
+  into sg_kv at base..base+n-1, then `k_attn_prefill`, output gate, o_proj.
+  `enc_attn_prefill` is non-static (external linkage) so -Werror's
+  -Wunused-function stays happy until M5.6's orchestration calls it; it reuses
+  the decode buffer field names, which M5.6 sizes for the chunk.
+
+### Gate: PASSED, all 4 items (live Metal, GPU idle)
+1. `k_rope_chunk` == `k_rope_heads` per token BIT-IDENTICAL, N in {1,2,17,512},
+   base in {0,1000}, both Q (stride 2*head_dim) and K (stride head_dim)
+   layouts: 0 differing tokens (memcmp).
+2. `k_attn_prefill` vs `k_attn_decode_f16` looped over the N tokens (each at
+   seq=base+t+1), same N/base: worst **rel 0.000e+00**, every token bit-exact
+   (gate 1e-4).
+3. Determinism: 100 reruns of `k_rope_chunk` and `k_attn_prefill`, output
+   poisoned before each run: byte-identical.
+4. `make check` (live Metal) + `make debug` (SURGE_NO_METAL, ASan/UBSan) both
+   exit 0, no sanitizer diagnostics. `make surge` still builds.
+
+### Store-vs-attend order
+Store first, then attend. `enc_attn_prefill` casts the chunk's K/V into the
+fp16 cache at positions base..base+n-1 BEFORE the attention dispatch, so at
+attend time the cache holds all base+n positions and the causal bound
+seq=base+t+1 selects exactly keys 0..base+t for token t.
+
+### Review round (codex gpt-5.5)
+Confirmed causal window `0..base+t` inclusive, GQA `h/repeat` parity, RoPE
+pairing/tail/per-token-cos-sin parity with `k_rope_heads`, fixed-order
+reductions, store-before-attend, and no decode-path change from enabling
+`k_rope_heads` via `sg_gpu_run_op`. Two overflow-hardening findings on the
+public-op entries (gates use tiny sizes, unaffected), both fixed:
+- [High] `sg_gpu_run_attn_prefill` sized `base+n` in u64 but the kernel carries
+  `seq`/row-stride/`tg` in 32-bit; now rejects `base+n` and `n*n_heads` above
+  UINT32_MAX and guards `seq_max*n_kv` with `mul_ck`.
+- [Medium] `k_rope_chunk` in-kernel `slices*head_dim` is 32-bit; check_params
+  now rejects `head_dim*heads*n_tok > UINT32_MAX`.
+All four gates re-ran green after the fixes.
+
+### Not done (out of scope for M5.4)
+`enc_attn_prefill` is not yet driven end-to-end (no chunk-sized buffers exist
+until M5.6's `sg_gpu_prefill`); DeltaNet-layer prefill is M5.5.

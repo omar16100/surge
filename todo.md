@@ -1452,3 +1452,59 @@ The low 1.2e-6 rel gap (vs the 2e-4 bar) is because attn/conv/delta/gates/rmsnor
 chunk kernels are bit-identical to their per-token siblings; the only
 prefill-vs-decode arithmetic difference is GEMM-vs-matvec reassociation in the
 projections, tiny at these dims.
+
+## Task M5.7 Results (test_gpu_prefill.c/cli_metal.c: long-context gate, CLOSES M5)
+The M5 closing gate: validate the chunked prefill path (M5.2-M5.6) on a REAL
+model at 8k/16k/32k depth, prove surge can ingest 262144 tokens, enforce the
+context cap. Runs behind SURGE_GATE_MODEL (the C test SKIPs cleanly without it,
+so `make check` stays mini-only and hermetic); driven entirely through the C API
+(sg_gpu_prefill / sg_gpu_forward) since 262144 ids do not fit through argv.
+Token-id sequences are a deterministic 64-bit LCG in [0, vocab). Model: the 2B
+bf16 qwen3_5 interim (/Users/macmini/models/qwen35-2b, 24 layers, vocab 248320,
+full_attn_interval 4, 6 full-attn + 18 DeltaNet layers).
+
+New public API: sg_gpu_used(g) returns g->used (0 without live state), so the
+gate reads the used counter without reaching into the opaque sg_gpu.
+
+Gate (A) DEPTH EQUIVALENCE, 0 token-id mismatches at every depth (prefill+decode
+32 == serial-forward+decode 32, same argmax_f32 both sides, state reset between):
+  depth  8192: 32/32 match  (prefill+decode 29.95s, serial+decode 205.09s)
+  depth 16384: 32/32 match  (prefill+decode 62.26s, serial+decode 1002.17s)
+  depth 32768: 32/32 match  (prefill+decode 278.31s, serial+decode 2495.97s)
+
+Gate (B) 262144 INGEST: SG_KV_CAP_MAX == 262144 leaves no cache slot to append
+after a full-cap prefill, so the 262144-position context is filled as 262112
+prefill (chunk 1024) + 32 decode, reaching used == 262144. Asserted: used ==
+262144, no Metal fault, non-degenerate final prefill logits (finite, not
+all-equal, argmax in range), 32 non-degenerate decoded tokens (finite each step,
+ids in range, not one id repeated). Measured (2026-08-12, M3 Ultra, 2B bf16):
+262112 prefill (chunk 1024) 13063.3s (~3.63h), used=262112, final argmax 197;
+then 32-token decode 25.5s, 2 distinct ids, used=262144. Total gate B wall 13089s.
+The 32 decoded tokens are all fed back (32 forwards, positions 262112..262143) so
+the whole 262144-position cache fills and used reaches exactly 262144.
+(The 2B safetensors carries no surge-readable tokenizer, so the interim coherence
+bar is non-degenerate ids; valid-UTF-8 coherence on real text is B7's job on the
+27B, which has a tokenizer.)
+
+Gate (C) CAP ENFORCEMENT: cli_metal.c now treats an explicit --max-ctx as a HARD
+cap. A prompt (or prompt+generated) that exceeds it is rejected with a clear
+message ("the prompt exceeds the context cap" / "exceeds --max-ctx N") and a
+nonzero exit, instead of the old silent enlarge-to-fit. Covered in `make check`
+by tests/test_cli_prefill.sh: `surge mini.gguf --ids 1..8 --max-ctx 4` exits 1.
+
+Serial+decode times grow super-linearly (not 2x per doubling) because the M3
+firmware power limiter clamps the GPU after a few minutes of sustained load; a
+known property of this box, irrelevant to the FUNCTIONAL result. M5 COMPLETE.
+
+Files: tests/test_gpu_prefill.c (gated gate_real_model, SURGE_GATE_SKIP_A to run
+B only), src/cli_metal.c (cap guard), src/metal.m + surge.h (sg_gpu_used),
+tools/prefill_longctx_gate.sh (runner), tests/test_cli_prefill.sh (C check),
+docs/11082026_m57_longctx_gate.md.
+
+Gates (all pass):
+1. (A) 0 token mismatches at 8192/16384/32768 on the real 2B.
+2. (B) 262144 ingest: used == 262144, no fault, non-degenerate final logits + 32
+   non-degenerate decoded tokens.
+3. (C) prompt > cap rejected by the CLI (clear message + nonzero exit).
+4. make check (live Metal, mini-only, gate SKIPs without SURGE_GATE_MODEL) and
+   make debug (SURGE_NO_METAL, ASan/UBSan) both exit 0, no sanitizer diagnostics.

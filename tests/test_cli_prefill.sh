@@ -87,6 +87,23 @@ for model in "$GGUF" "$ST"; do
     check_pair "$tag chunk1  1tok"           "$model" 8  1    "$IDS1"
 done
 
+# (C) M5.7 context-cap guard: an explicit --max-ctx smaller than the prompt must
+# be REJECTED (nonzero exit + a clear message), never silently enlarged. The
+# guard fires before any GPU work, so this needs only the tiny mini gguf and a
+# short --ids -- no big model. 8 prompt tokens against --max-ctx 4.
+ncase=$((ncase + 1))
+cap_out="$("$SURGE" "$GGUF" --ids 1,2,3,4,5,6,7,8 --max-ctx 4 --quiet 2>&1)"
+cap_rc=$?
+if [ "$cap_rc" -eq 0 ]; then
+    echo "FAIL cap-guard: surge accepted an 8-token prompt with --max-ctx 4 (rc=0)" >&2
+    fail=1
+elif ! printf '%s' "$cap_out" | grep -qiE "max-ctx|context cap|exceeds"; then
+    echo "FAIL cap-guard: nonzero exit but no clear cap message: $cap_out" >&2
+    fail=1
+else
+    echo "  ok cap-guard: over-cap prompt rejected (rc=$cap_rc)" >&2
+fi
+
 if [ "$fail" -ne 0 ]; then
     echo "test_cli_prefill: FAILED ($ncase cases)" >&2
     exit 1

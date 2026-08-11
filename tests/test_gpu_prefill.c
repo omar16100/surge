@@ -48,9 +48,15 @@ int main(void) {
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #define MINI_DIR "tests/fixtures/mini_fwd"
 #define N_GEN 16u
+
+/* M5.7 long-context gate constants. N_GATE_GEN is the 32-token greedy decode
+ * the depth-equivalence gate compares byte-for-byte; SG_KV_CAP_MAX (262144,
+ * from surge.h) is the full-ingest depth. */
+#define N_GATE_GEN 32u
 
 static sg_gpu *g_gpu;
 static double g_worst_rel = 0.0;
@@ -302,6 +308,265 @@ static void mini_gguf_prefill(void) {
     free(ids);
 }
 
+/* ============================ M5.7 long-context gate ======================= *
+ *
+ * A REAL model (SURGE_GATE_MODEL, e.g. /Users/macmini/models/qwen35-2b, the 2B
+ * bf16 qwen3_5 safetensors, the M1/M2 gate model) driven ENTIRELY through the C
+ * API, because the id sequences (up to 262144) do not fit through the CLI's
+ * argv. When SURGE_GATE_MODEL is unset the whole gate SKIPs cleanly, so
+ * `make check` stays mini-only and hermetic (mirrors test_gpu_fwd.c's
+ * SURGE_GGUF pattern).
+ *
+ *   (A) DEPTH EQUIVALENCE at 8192 / 16384 / 32768: prefill(prompt)+decode 32
+ *       tokens must equal serial-forward(prompt one token at a time)+decode 32,
+ *       with 0 token-id mismatches at each depth. State is reset between the two
+ *       runs and the SAME argmax_f32 is used both sides. The serial reference at
+ *       32k is ~32800 forwards and slow; that is expected for a gated (not
+ *       make-check) run.
+ *
+ *   (B) 262144 INGEST: fill the whole 262144-position context and decode at
+ *       ~256K depth. SG_KV_CAP_MAX == 262144 leaves NO cache slot to append
+ *       after a full-cap prefill, so the context is filled as 262112 prefill +
+ *       32 decode, which reaches the used counter == 262144 while still
+ *       exercising decode at depth. That satisfies every clause of the gate:
+ *       used == 262144, no Metal fault, non-degenerate final (prefill-position)
+ *       logits, and 32 non-degenerate decoded tokens (finite each step, ids in
+ *       range, not one id repeated). Valid-UTF-8 coherence on real text is B7's
+ *       job (the 27B carries a surge-readable tokenizer; this 2B safetensors
+ *       carries none), so the interim capability check here is non-degenerate
+ *       token ids, per the plan's 2B-interim allowance.
+ *
+ * SURGE_GATE_SKIP_A=1 skips (A) (already proven; its 32k serial reference is
+ * ~40 min under the box's power limiter) so a re-run can exercise only (B).
+ */
+
+static double now_s(void) {
+    struct timespec t;
+    clock_gettime(CLOCK_MONOTONIC, &t);
+    return (double)t.tv_sec + 1e-9 * (double)t.tv_nsec;
+}
+
+/* Deterministic 64-bit LCG (Knuth's MMIX constants), token ids in [0, vocab).
+ * Seeded per call so a given (seed, vocab) always yields the same sequence,
+ * which is what lets the prefill and serial paths ingest the SAME ids. */
+static void lcg_fill_ids(int32_t *ids, uint32_t n, uint32_t vocab, uint64_t seed) {
+    uint64_t s = seed;
+    for (uint32_t i = 0; i < n; i++) {
+        s = s * 6364136223846793005ULL + 1442695040888963407ULL;
+        ids[i] = (int32_t)((s >> 33) % vocab);
+    }
+}
+
+/* Non-degenerate == all finite, NOT all-equal, argmax in range. A broken deep
+ * prefill tends to produce NaN/Inf or a flat (all-equal) logit vector. */
+static bool logits_nondegenerate(const float *v, uint32_t n) {
+    bool finite = true, all_equal = true;
+    for (uint32_t i = 0; i < n; i++) if (!isfinite(v[i])) { finite = false; break; }
+    for (uint32_t i = 1; i < n; i++) if (v[i] != v[0]) { all_equal = false; break; }
+    return finite && !all_equal && argmax_f32(v, n) < n;
+}
+
+static void gate_real_model(void) {
+    const char *path = getenv("SURGE_GATE_MODEL");
+    if (!path) {
+        fprintf(stderr, "   SKIP: set SURGE_GATE_MODEL to a real model "
+                        "(e.g. /Users/macmini/models/qwen35-2b) to run the M5.7 "
+                        "long-context gate\n");
+        return;
+    }
+
+    /* A .gguf path uses the GGUF loader; anything else is a safetensors
+     * directory (the 2B interim model). */
+    sg_gguf *gg = NULL;
+    sg_st *st = NULL;
+    sg_model m;
+    sg_err e;
+    size_t plen = strlen(path);
+    bool is_gguf = plen >= 5 && strcmp(path + plen - 5, ".gguf") == 0;
+    if (is_gguf) {
+        e = sg_gguf_open(path, &gg);
+        tt_assert(!sg_failed(e), "gate: sg_gguf_open %s: %s", path, e.msg ? e.msg : "ok");
+        if (sg_failed(e)) return;
+        e = sg_model_from_gguf(gg, &m);
+        tt_assert(!sg_failed(e), "gate: sg_model_from_gguf: %s", e.msg ? e.msg : "ok");
+        if (sg_failed(e)) { sg_gguf_close(gg); return; }
+    } else {
+        e = sg_st_open(path, &st);
+        tt_assert(!sg_failed(e), "gate: sg_st_open %s: %s", path, e.msg ? e.msg : "ok");
+        if (sg_failed(e)) return;
+        e = sg_model_from_st(st, &m);
+        tt_assert(!sg_failed(e), "gate: sg_model_from_st: %s", e.msg ? e.msg : "ok");
+        if (sg_failed(e)) { sg_st_close(st); return; }
+    }
+
+    uint32_t vocab = m.cfg.vocab;
+    fprintf(stderr, "   gate model: %s (%u layers, vocab %u, full_attn_interval %u)\n",
+            path, m.cfg.n_layers, vocab, m.cfg.full_attn_interval);
+
+    e = sg_gpu_load_model(g_gpu, &m);
+    tt_assert(!sg_failed(e), "gate: sg_gpu_load_model: %s", e.msg ? e.msg : "ok");
+    if (!sg_failed(e)) {
+        /* One deterministic id stream, reused at every depth (each depth takes
+         * the first `depth` ids). SG_KV_CAP_MAX ids so gate B uses it whole. */
+        int32_t *ids = xmalloc((size_t)SG_KV_CAP_MAX * sizeof *ids);
+        lcg_fill_ids(ids, SG_KV_CAP_MAX, vocab, 0x9E3779B97F4A7C15ULL);
+
+        /* ---- (A) depth equivalence: prefill+decode 32 == serial+decode 32 --- */
+        static const uint32_t depths[] = { 8192u, 16384u, 32768u };
+        bool skip_a = getenv("SURGE_GATE_SKIP_A") != NULL;
+        if (skip_a) fprintf(stderr, "   [A] SKIPPED (SURGE_GATE_SKIP_A set)\n");
+        for (uint32_t d = 0; !skip_a && d < sizeof depths / sizeof depths[0]; d++) {
+            uint32_t depth = depths[d];
+            e = sg_gpu_state_new(g_gpu, &m, depth + N_GATE_GEN);
+            tt_assert(!sg_failed(e), "gate A depth %u: sg_gpu_state_new: %s",
+                      depth, e.msg ? e.msg : "ok");
+            if (sg_failed(e)) continue;
+
+            /* Prefill path. sg_gpu_prefill resets state internally; the explicit
+             * reset makes the "reset between the two runs" contract visible. */
+            double t0 = now_s();
+            sg_gpu_state_reset(g_gpu);
+            const float *lg = NULL;
+            e = sg_gpu_prefill(g_gpu, &m, ids, depth, 1024, &lg);
+            tt_assert(!sg_failed(e), "gate A depth %u: sg_gpu_prefill: %s",
+                      depth, e.msg ? e.msg : "ok");
+            if (sg_failed(e)) continue;
+            int32_t pre_gen[N_GATE_GEN];
+            for (uint32_t i = 0; i < N_GATE_GEN; i++) {
+                pre_gen[i] = (int32_t)argmax_f32(lg, vocab);
+                if (i + 1 == N_GATE_GEN) break;
+                e = sg_gpu_forward(g_gpu, &m, pre_gen[i], depth + i, &lg);
+                tt_assert(!sg_failed(e), "gate A depth %u: prefill-decode %u: %s",
+                          depth, i, e.msg ? e.msg : "ok");
+                if (sg_failed(e)) break;
+            }
+            if (sg_failed(e)) continue;
+            double t_prefill = now_s() - t0;
+
+            /* Serial oracle: the prompt one token at a time, then decode 32. */
+            t0 = now_s();
+            sg_gpu_state_reset(g_gpu);
+            lg = NULL;
+            for (uint32_t t = 0; t < depth; t++) {
+                e = sg_gpu_forward(g_gpu, &m, ids[t], t, &lg);
+                if (sg_failed(e)) break;
+            }
+            tt_assert(!sg_failed(e), "gate A depth %u: serial forward: %s",
+                      depth, e.msg ? e.msg : "ok");
+            if (sg_failed(e)) continue;
+            int32_t ser_gen[N_GATE_GEN];
+            for (uint32_t i = 0; i < N_GATE_GEN; i++) {
+                ser_gen[i] = (int32_t)argmax_f32(lg, vocab);
+                if (i + 1 == N_GATE_GEN) break;
+                e = sg_gpu_forward(g_gpu, &m, ser_gen[i], depth + i, &lg);
+                if (sg_failed(e)) break;
+            }
+            tt_assert(!sg_failed(e), "gate A depth %u: serial decode: %s",
+                      depth, e.msg ? e.msg : "ok");
+            if (sg_failed(e)) continue;
+            double t_serial = now_s() - t0;
+
+            uint32_t mism = 0, first_bad = N_GATE_GEN;
+            for (uint32_t i = 0; i < N_GATE_GEN; i++) {
+                if (pre_gen[i] != ser_gen[i]) {
+                    mism++;
+                    if (first_bad == N_GATE_GEN) first_bad = i;
+                }
+            }
+            tt_assert(mism == 0, "gate A depth %u: %u/%u token mismatches "
+                      "(first at step %u)", depth, mism, N_GATE_GEN, first_bad);
+            fprintf(stderr, "   [A] depth %6u: %u/%u tokens match "
+                    "(prefill+decode %.2fs, serial+decode %.2fs)\n",
+                    depth, N_GATE_GEN - mism, N_GATE_GEN, t_prefill, t_serial);
+        }
+
+        /* ---- (B) 262144 ingest: fill the whole 262144-position cache and
+         * decode at ~256K depth in ONE run. SG_KV_CAP_MAX == 262144 leaves no
+         * slot to append after a full-cap prefill, so the context is filled as
+         * (cap - 32) prefill + 32 decode, reaching used == cap. SURGE_GATE_B_CAP
+         * overrides the cap for a cheap smoke test of this used-counter logic;
+         * the gate itself (unset) uses the full SG_KV_CAP_MAX == 262144. ---- */
+        uint32_t bcap = SG_KV_CAP_MAX;
+        const char *bcap_env = getenv("SURGE_GATE_B_CAP");
+        if (bcap_env) {
+            unsigned long v = strtoul(bcap_env, NULL, 10);
+            if (v > N_GATE_GEN && v <= SG_KV_CAP_MAX) bcap = (uint32_t)v;
+        }
+        e = sg_gpu_state_new(g_gpu, &m, bcap);
+        tt_assert(!sg_failed(e), "gate B: sg_gpu_state_new(%u): %s",
+                  bcap, e.msg ? e.msg : "ok");
+        if (!sg_failed(e)) {
+            uint32_t pdepth = bcap - N_GATE_GEN;
+            double t0 = now_s();
+            const float *lg = NULL;
+            e = sg_gpu_prefill(g_gpu, &m, ids, pdepth, 1024, &lg);
+            tt_assert(!sg_failed(e), "gate B: sg_gpu_prefill(%u): %s",
+                      pdepth, e.msg ? e.msg : "ok");
+            double t_ingest = now_s() - t0;
+            if (!sg_failed(e)) {
+                tt_assert(sg_gpu_used(g_gpu) == pdepth,
+                          "gate B: used counter %u != %u after prefill",
+                          sg_gpu_used(g_gpu), pdepth);
+                tt_assert(logits_nondegenerate(lg, vocab),
+                          "gate B: final prefill-position logits are degenerate "
+                          "(non-finite, all-equal, or argmax out of range)");
+                fprintf(stderr, "   [B] ingest %u (prefill): used=%u, final logits "
+                        "non-degenerate (argmax %u), prefill %.2fs\n",
+                        pdepth, sg_gpu_used(g_gpu), argmax_f32(lg, vocab), t_ingest);
+
+                /* Decode 32 at depth -> used reaches bcap (262144 for the gate). */
+                t0 = now_s();
+                int32_t gen[N_GATE_GEN];
+                bool all_finite = true, all_in_range = true;
+                for (uint32_t i = 0; i < N_GATE_GEN; i++) {
+                    for (uint32_t k = 0; k < vocab; k++) {
+                        if (!isfinite(lg[k])) { all_finite = false; break; }
+                    }
+                    uint32_t arg = argmax_f32(lg, vocab);
+                    if (arg >= vocab) all_in_range = false;
+                    gen[i] = (int32_t)arg;
+                    /* Feed EVERY decoded token back (all 32 forwards, positions
+                     * pdepth..pdepth+31) so the whole bcap-position cache is
+                     * filled and the used counter reaches exactly bcap (262144
+                     * for the gate). Unlike
+                     * an ordinary greedy loop (which skips the final feedback
+                     * because it does not need that token's logits), here the
+                     * position advance is the point; the last forward's logits
+                     * are simply unused. */
+                    e = sg_gpu_forward(g_gpu, &m, gen[i], pdepth + i, &lg);
+                    tt_assert(!sg_failed(e), "gate B: decode %u: %s", i, e.msg ? e.msg : "ok");
+                    if (sg_failed(e)) break;
+                }
+                double t_decode = now_s() - t0;
+                uint32_t distinct = 1;
+                for (uint32_t i = 1; i < N_GATE_GEN; i++) {
+                    bool seen = false;
+                    for (uint32_t j = 0; j < i; j++) if (gen[j] == gen[i]) { seen = true; break; }
+                    if (!seen) distinct++;
+                }
+                tt_assert(all_finite, "gate B: a decode step produced non-finite logits");
+                tt_assert(all_in_range, "gate B: a decode argmax was out of vocab range");
+                tt_assert(distinct >= 2, "gate B: 32 decoded tokens collapsed to a single "
+                          "repeated id (%u distinct)", distinct);
+                if (!sg_failed(e)) {
+                    tt_assert(sg_gpu_used(g_gpu) == bcap,
+                              "gate B: used counter %u != %u after 32-token decode",
+                              sg_gpu_used(g_gpu), bcap);
+                }
+                fprintf(stderr, "   [B] decode %u at depth: %u distinct ids, finite + "
+                        "in-range, used=%u (== %u), decode %.2fs\n",
+                        N_GATE_GEN, distinct, sg_gpu_used(g_gpu), bcap, t_decode);
+            }
+        }
+
+        free(ids);
+    }
+
+    sg_model_free(&m);
+    if (st) sg_st_close(st);
+    if (gg) sg_gguf_close(gg);
+}
+
 int main(void) {
     sg_err e = sg_gpu_init(&g_gpu);
     if (sg_failed(e)) {
@@ -314,6 +579,9 @@ int main(void) {
     setenv("SURGE_KV_DTYPE", "f16", 1);
     tt_run("mini_st_prefill", mini_st_prefill);
     tt_run("mini_gguf_prefill", mini_gguf_prefill);
+    /* M5.7: the real-model long-context gate. SKIPs cleanly (make check stays
+     * mini-only and hermetic) unless SURGE_GATE_MODEL points at a real model. */
+    tt_run("gate_real_model", gate_real_model);
     unsetenv("SURGE_KV_DTYPE");
 
     fprintf(stderr, "worst prefill-vs-serial last-logit relative gap: %.3e\n", g_worst_rel);

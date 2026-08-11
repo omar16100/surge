@@ -136,7 +136,23 @@ optionally Accelerate for the CPU reference path. No third-party libraries.
     path. Gated by tests/test_gpu_prefill.c: prefill last-argmax == serial forward
     last-argmax on both mini formats for chunk {1,2,3} (worst rel 1.2e-6, bar 2e-4),
     prefill+decode gen_ids == serial+decode (16/16), byte-identical reruns, and the CLI
-    with/without --no-prefill identical. M5.7 pending.
+    with/without --no-prefill identical.
+    M5.7 (long-context gate, CLOSES M5) DONE: on the real 2B bf16 model
+    (`SURGE_GATE_MODEL`, driven through the C API since 262144 ids do not fit through
+    argv), (A) prefill(prompt)+decode 32 == serial-forward(prompt one at a time)+decode 32
+    with 0 token-id mismatches at each of 8192 / 16384 / 32768; (B) a 262144-token prefill
+    (chunk 1024) leaves the used counter at 262144 with no Metal fault and non-degenerate
+    final logits, and a decode of 32 tokens at ~256K depth stays non-degenerate (finite,
+    in-range, not one id repeated). Because `SG_KV_CAP_MAX` == 262144 leaves no cache slot
+    to append after a full-cap prefill, gate B's decode run prefills 262112 then decodes 32
+    (reaching used == 262144). (C) the `surge` CLI now rejects a prompt that exceeds an
+    explicit `--max-ctx` with a clear message + nonzero exit (covered by
+    tests/test_cli_prefill.sh in `make check`). The 2B safetensors carries no
+    surge-readable tokenizer, so the coherence bar here is non-degenerate ids; valid-UTF-8
+    coherence on real text is B7's job on the 27B. Gate is `tools/prefill_longctx_gate.sh`
+    (live GPU, env-gated); the C test SKIPs cleanly without `SURGE_GATE_MODEL`, so
+    `make check` stays mini-only and hermetic. Public `sg_gpu_used` added so the gate reads
+    the used counter without reaching into the opaque `sg_gpu`. M5 COMPLETE.
   - Bench harness: B1/B3/B4 (pure C) done; B2/B5/B6 (Metal/CLI) and B7 (gated 256K run)
     pending.
 - **Not built:** M4 (kernel excellence / beat mlx-lm), server mode, non-Metal platforms,

@@ -698,6 +698,14 @@ void sg_gpu_state_reset(sg_gpu *g);
  * gpu and valid until the next call. */
 sg_err sg_gpu_forward(sg_gpu *g, const sg_model *m, int32_t token, uint32_t pos,
                       const float **logits);
+/* Positions currently held in the decode/prefill state (g->used): 0 after
+ * sg_gpu_state_new / sg_gpu_state_reset, n_tokens after sg_gpu_prefill, and
+ * pos+1 after sg_gpu_forward(pos). Returns 0 for a NULL gpu or one with no live
+ * state. This is the public read of the same counter sg_kv_used exposes on the
+ * kv module; the M5.7 long-context gate uses it to assert the used counter
+ * reaches 262144 after a full-cap ingest without reaching into the opaque
+ * sg_gpu. */
+uint32_t sg_gpu_used(const sg_gpu *g);
 
 /* ---------------------------------------------------------------------
  * Chunked prompt prefill (Task M5.6)

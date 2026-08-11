@@ -28,6 +28,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <unistd.h>
 
 /* Errors that quote a runtime detail (a Metal error string, a size) need
@@ -2577,6 +2578,11 @@ void sg_gpu_state_reset(sg_gpu *g) {
     }
 }
 
+uint32_t sg_gpu_used(const sg_gpu *g) {
+    if (!g || !g->have_state) return 0;
+    return g->used;
+}
+
 /* --------------------------------------------------------------------
  * One token
  * -------------------------------------------------------------------- */
@@ -2735,6 +2741,13 @@ static void prefill_free_chunk(sg_gpu *g) {
     g->h_x = g->h_cs = NULL;
 }
 
+/* Monotonic seconds for the long-prefill progress log below. */
+static double pf_now_s(void) {
+    struct timespec t;
+    clock_gettime(CLOCK_MONOTONIC, &t);
+    return (double)t.tv_sec + 1e-9 * (double)t.tv_nsec;
+}
+
 sg_err sg_gpu_prefill(sg_gpu *g, const sg_model *m, const int32_t *tokens,
                       uint32_t n_tokens, uint32_t chunk_size,
                       const float **out_last_logits) {
@@ -2843,6 +2856,11 @@ sg_err sg_gpu_prefill(sg_gpu *g, const sg_model *m, const int32_t *tokens,
         }
     }
 
+    /* Progress log for long prefills (a 256K ingest is minutes-to-hours on this
+     * box). Auto-quiet for short prompts so `make check` stays silent; logs a
+     * throttled line every 8th chunk plus the last. */
+    bool pf_log = n_tokens >= 8192u;
+    double t_pf0 = pf_now_s();
     for (uint32_t base = 0; base < n_tokens; base += chunk) {
         uint32_t n = n_tokens - base;
         if (n > chunk) n = chunk;
@@ -2946,6 +2964,14 @@ sg_err sg_gpu_prefill(sg_gpu *g, const sg_model *m, const int32_t *tokens,
         g->used += n;
         e = sg_kv_advance(g->kv, n);
         if (sg_failed(e)) goto cleanup;
+
+        if (pf_log && (last || ((base / chunk) & 7u) == 0u)) {
+            double el = pf_now_s() - t_pf0;
+            fprintf(stderr, "gpu: prefill %u/%u tokens (%.1f%%), %.0f tok/s, "
+                    "%.1fs elapsed\n", base + n, n_tokens,
+                    100.0 * (double)(base + n) / (double)n_tokens,
+                    el > 0.0 ? (double)(base + n) / el : 0.0, el);
+        }
     }
 
     /* Bridge the DeltaNet state from the sg_kv carriers into the decode

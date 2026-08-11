@@ -232,9 +232,31 @@ int main(int argc, char **argv) {
     }
 
     /* max_position_embeddings is 262144 on this model family, so the cache is
-     * sized from the ACTUAL run length, never from the config. */
-    uint32_t max_ctx = max_ctx_arg ? max_ctx_arg : (uint32_t)(n_ids + n_gen);
-    if ((uint64_t)max_ctx < n_ids + n_gen) max_ctx = (uint32_t)(n_ids + n_gen);
+     * sized from the ACTUAL run length, never from the config.
+     *
+     * An explicit --max-ctx is a HARD cap on the cache (M5.7). A prompt (plus
+     * the tokens it asks to generate) that does not fit is REJECTED here with a
+     * clear message and a nonzero exit, rather than silently enlarging the cache
+     * (which would make --max-ctx meaningless) or letting the ingest run past
+     * the cap. Without an explicit --max-ctx the cache is sized to the run. */
+    uint32_t max_ctx;
+    if (max_ctx_arg) {
+        if (n_ids > max_ctx_arg) {
+            fprintf(stderr, "surge: prompt is %llu tokens but --max-ctx is %u; "
+                            "the prompt exceeds the context cap\n",
+                    (unsigned long long)n_ids, max_ctx_arg);
+            goto done;
+        }
+        if (n_ids + n_gen > max_ctx_arg) {
+            fprintf(stderr, "surge: %llu prompt + %u generated tokens exceeds "
+                            "--max-ctx %u; raise --max-ctx or lower -n\n",
+                    (unsigned long long)n_ids, n_gen, max_ctx_arg);
+            goto done;
+        }
+        max_ctx = max_ctx_arg;
+    } else {
+        max_ctx = (uint32_t)(n_ids + n_gen);
+    }
 
     if (use_ref) {
         e = sg_ref_state_new(&m, max_ctx, &rs);

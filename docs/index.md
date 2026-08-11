@@ -16,10 +16,11 @@ Studio M3 Ultra (github.com/omar16100/surge, MIT). All doc paths are under
 
 | Doc | Category | Path | Hook |
 |---|---|---|---|
-| Architecture (C4 model) | Architecture (evergreen) | `docs/c4model.md` | Source of truth for containers, components (per-file responsibilities), decode/prefill data flows, and built-vs-planned status (M0-M2 shipped, M3+M5 in progress). |
+| Architecture (C4 model) | Architecture (evergreen) | `docs/c4model.md` | Source of truth for containers, components (per-file responsibilities), decode/prefill data flows, and built-vs-planned status (M0-M3 + M5 shipped; bench harness B2/B5/B6/B7 pending). |
 | surge design spec | Design (evergreen) | `docs/superpowers/specs/2026-08-08-surge-design.md` | The approved design: goals, the M0-M9 milestones, correctness ladder, the beat-mlx-lm bar, and the hybrid-arch correction. |
 | M3 + M5 + bench plan | Plan (dated) | `docs/superpowers/plans/2026-08-09-surge-m3-m5.md` | The ~18-task implementation plan to let surge run the 27B-Q8_0 GGUF at 262,144 context: M3 (Q8_0), M5 (fp16 KV + tiled prefill), bench harness (B1-B7). Execution order, gates, risks. |
 | M3.4 Q8_0 forward gate | Gate (dated) | `docs/11082026_m34_q8_gate.md` | How to run and re-freeze the manual Q8_0 correctness gate on the 27B GGUF: (A) surge Metal Q8_0 vs surge CPU-ref (100% top-1, teacher-forced), (B) surge vs llama.cpp greedy (byte-identical). `make gate`; frozen fixtures in `tests/fixtures/m3q8/`. |
+| M5.7 long-context gate | Gate (dated) | `docs/11082026_m57_longctx_gate.md` | How to run the M5.7 gate that closes M5 (`tools/prefill_longctx_gate.sh`, env-gated on `SURGE_GATE_MODEL`): (A) prefill+decode == serial+decode at 8192/16384/32768 (0 token-id mismatches), (B) 262144 ingest (262112 prefill + 32 decode) reaches used==262144 with non-degenerate output, (C) CLI `--max-ctx` cap rejection. |
 
 ## Related (not in docs/)
 

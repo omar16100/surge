@@ -41,19 +41,23 @@ optionally Accelerate for the CPU reference path. No third-party libraries.
 | `src/tok.c` | byte-level BPE tokenizer built from `tokenizer.ggml.*` GGUF metadata; fixture-exact vs the real tokenizer. |
 | `src/model_qwen.c` | config extraction + weight-name mapping for the hybrid qwen3_5/qwen35 arch (full-attention + gated-DeltaNet layers), from GGUF and safetensors. Carries per-tensor dtype and the source-flags `ssm_a_form` / `v_heads_tiled`. |
 | `src/ref.c` | scalar CPU reference for every op (the correctness oracle), incl. `sg_ref_matvec_q8`, attention, gated-DeltaNet, partial RoPE, and the full forward pass. |
-| `src/kv.c` | (M5.1) fp16 growable KV cache for full-attention layers + fixed-size DeltaNet recurrent state, over opaque GPU-buffer handles; Metal-free (allocation injected). `sg_kv_bytes` = 16 GiB K+V at 262,144. |
+| `src/kv.c` | (M5.1) fp16 growable KV cache for full-attention layers + fixed-size DeltaNet recurrent state, over opaque GPU-buffer handles; Metal-free (allocation injected). `sg_kv_bytes` = 16 GiB K+V at 262,144. Wired into decode by M5.2 (see below). |
 | `src/bench.c` | (B-series) pure-C benchmark math: decode-by-slope, leaderboard-row/JSON formatters, prompt file read, ingestion/truncation guard, NIAH recall scorer. |
-| `src/metal.m` | Metal device init, weight-buffer wrapping (mmap, no-copy; bf16/f32/Q8_0 sizing), per-weight matvec kernel dispatch (`matmul_kernel_for`), one command buffer per decode token, kernel registration (KI_ enum + SG_KERNELS table + size/param checks), state via `sg_kv`. |
-| `src/kernels.metal` | deterministic Metal kernels (fixed-tree reductions, no atomics/simd_sum): bf16/f32/Q8_0 matvec, attention decode, gated-DeltaNet decode, RoPE, RMSNorm, SwiGLU. Tiled prefill kernels arrive in M5. |
+| `src/metal.m` | Metal device init, weight-buffer wrapping (mmap, no-copy; bf16/f32/Q8_0 sizing), per-weight matvec kernel dispatch (`matmul_kernel_for`), one command buffer per decode token, kernel registration (KI_ enum + SG_KERNELS table + size/param checks). Registers itself as `sg_kv`'s allocation backend at init. Decode state: the DEFAULT full-attention KV cache is fp16, allocated through `sg_kv` as SEPARATE per-layer K/V buffers (M5.2, `SURGE_KV_DTYPE` env toggle); `SURGE_KV_DTYPE=f32` selects the original combined-buffer f32 path unchanged, kept so the M2 gate's oracle never moves. DeltaNet conv/S state stays on its pre-M5.1 ad hoc allocation either way (DeltaNet decode is not yet refit onto `sg_kv`). |
+| `src/kernels.metal` | deterministic Metal kernels (fixed-tree reductions, no atomics/simd_sum): bf16/f32/Q8_0 matvec, attention decode (f32-KV `k_attn_decode` and fp16-KV `k_attn_decode_f16`, M5.2), a decode-step fp16 store (`k_kv_store_f16`, M5.2), gated-DeltaNet decode, RoPE, RMSNorm, SwiGLU. Tiled prefill kernels arrive later in M5. |
 | `src/cli_*.c` | the four CLI mains. |
 
 ## Level 4: Data flows
 
-- **Decode (M2, shipped):** token -> host embedding lookup -> per layer, one command
-  buffer: RMSNorm, projections (matvec), qk-norm + partial RoPE, KV append, attention
-  decode (full-attn layers) or conv-step + delta-step (DeltaNet layers), output gate,
-  residuals; final norm + lm_head -> logits -> host argmax -> next token. Byte-exact to
-  the CPU reference at temp 0 (M2 gate).
+- **Decode (M2, shipped; KV dtype refit M5.2):** token -> host embedding lookup -> per
+  layer, one command buffer: RMSNorm, projections (matvec), qk-norm + partial RoPE, KV
+  append (fp16 by default: q/k-norm and RoPE run in an f32 scratch, then `k_kv_store_f16`
+  casts into `sg_kv`'s per-layer half buffers; `SURGE_KV_DTYPE=f32` keeps the original
+  path), attention decode (full-attn layers, `k_attn_decode_f16` or `k_attn_decode`) or
+  conv-step + delta-step (DeltaNet layers), output gate, residuals; final norm + lm_head
+  -> logits -> host argmax -> next token. Byte-exact GREEDY TOKENS to the CPU reference at
+  temp 0 (M2 gate, oracle is the f32-KV path); fp16 KV adds ~1e-6 logit noise on the
+  measured fixture, absorbed by argmax.
 - **Prefill (M5, in progress):** chunk the prompt (default 1024 tokens); per chunk one
   command buffer runs all layers via tiled GEMM + tiled/flash attention + the DeltaNet
   chunked scan, advancing `sg_kv` by the chunk size; only the final chunk's last row
@@ -78,7 +82,11 @@ optionally Accelerate for the CPU reference path. No third-party libraries.
     greedy is byte-identical to llama.cpp (llama-simple) on 4 prompts with tokenizer parity.
     Gate is `make gate` (manual, needs the 28 GB GGUF + llama.cpp + one ~11 min CPU forward,
     never in `make check`); regression fixtures frozen under `tests/fixtures/m3q8/`.
-  - M5 (fp16 KV to 262,144 + tiled prefill): M5.1 `kv.c` done; M5.2-M5.7 pending.
+  - M5 (fp16 KV to 262,144 + tiled prefill): M5.1 `kv.c` done. M5.2 (fp16 KV wired into
+    the decode path) DONE: default full-attention KV cache is fp16 via `sg_kv` (separate
+    K/V buffers), `k_kv_store_f16`/`k_attn_decode_f16` bit-identical to the f32 kernels
+    fed pre-rounded inputs (100 reruns), M2 gate re-verified byte-for-bit unchanged on
+    the f32 path (`git stash`-diffed, not just "still passes"). M5.3-M5.7 pending.
   - Bench harness: B1/B3/B4 (pure C) done; B2/B5/B6 (Metal/CLI) and B7 (gated 256K run)
     pending.
 - **Not built:** M4 (kernel excellence / beat mlx-lm), server mode, non-Metal platforms,

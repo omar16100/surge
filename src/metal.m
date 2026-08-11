@@ -81,7 +81,8 @@ enum {
     KI_RMSNORM = 0, KI_RMSNORM_GATED, KI_ROPE, KI_MATVEC_BF16, KI_MATVEC_F32,
     KI_MATVEC_Q8, KI_SOFTMAX, KI_SWIGLU, KI_SILU, KI_GATE_SIGMOID, KI_ATTN,
     KI_CONV1D, KI_DELTA, KI_RMSNORM_HEADS, KI_ROPE_HEADS, KI_GATE_STRIDED,
-    KI_SCALE, KI_ADD, KI_DELTA_GATES, KI_DELTA_MULTI, KI_COUNT
+    KI_SCALE, KI_ADD, KI_DELTA_GATES, KI_DELTA_MULTI,
+    KI_KV_STORE_F16, KI_ATTN_F16, KI_COUNT
 };
 
 static const sg_kernel_desc SG_KERNELS[] = {
@@ -105,6 +106,14 @@ static const sg_kernel_desc SG_KERNELS[] = {
     { "k_add",                 SG_K_ELEM    },
     { "k_delta_gates",         SG_K_ELEM    },
     { "k_delta_multi",         SG_K_GROUPS2 },
+    /* M5.2: fp16 KV. k_kv_store_f16 is a plain elementwise cast (dispatched
+     * through the generic sg_gpu_run_op path below); k_attn_decode_f16 takes
+     * THREE device buffer inputs (Q, separate K, separate V) where every
+     * other kernel here takes at most two, so it is dispatched by hand (see
+     * enc_attn_f16 and sg_gpu_run_attn_decode_f16) and is listed here only so
+     * sg_gpu_init builds its pipeline and checks its threadgroup width. */
+    { "k_kv_store_f16",        SG_K_ELEM    },
+    { "k_attn_decode_f16",     SG_K_ATTN    },
 };
 #define SG_N_KERNELS ((int)(sizeof SG_KERNELS / sizeof SG_KERNELS[0]))
 _Static_assert(SG_N_KERNELS == KI_COUNT, "SG_KERNELS and the KI_ enum disagree");
@@ -140,7 +149,13 @@ typedef struct {
      * exactly that reason. */
     void *zw;
     /* state */
-    void *kv;         /* [2, max_ctx, n_kv_heads, head_dim]: K then V */
+    /* [2, max_ctx, n_kv_heads, head_dim]: K then V, f32. Populated ONLY when
+     * SURGE_KV_DTYPE selects f32 (sg_gpu.kv_dtype == SG_T_F32): that path is
+     * kept byte-for-bit as it was before M5.2, combined buffer and all, so
+     * the pre-existing M2 gate never sees a numerical or allocation change.
+     * The default fp16 path does not use this field at all; its K/V live in
+     * sg_gpu.kv (a separate-buffer sg_kv object, indexed by layer). */
+    void *kv;
     void *conv_buf;   /* [conv_kernel, conv_dim]: output row then carried tail */
     void *ssm;        /* [n_v_heads, head_v_dim, head_k_dim] */
 } sg_gpu_layer;
@@ -178,6 +193,21 @@ struct sg_gpu {
     void *b_cs;                        /* [rope_dim]: cos half then sin half */
     void *b_logits;                    /* [vocab] */
     float *h_x, *h_cs, *h_logits;      /* host views of the three above */
+
+    /* --- M5.2: fp16 KV cache --- */
+    /* SURGE_KV_DTYPE at the last sg_gpu_state_new call: SG_T_F16 (default) or
+     * SG_T_F32. Decides which of {g->kv, per-layer L->kv} is live. */
+    sg_tensor_type kv_dtype;
+    /* Full-attention K/V, SEPARATE per-layer buffers, allocated through
+     * sg_kv (Task M5.1) ONLY on the fp16 path; NULL on the f32 path, where
+     * L->kv (the pre-M5.2 combined buffer) is used instead. */
+    sg_kv *kv;
+    /* [kv_width] f32 landing spots for this token's freshly computed K and V,
+     * fp16 path only: q/k-norm and RoPE run here in f32 exactly as they did
+     * on the old combined buffer, and k_kv_store_f16 then casts the result
+     * into g->kv's per-layer half buffers. NULL on the f32 path (matvec
+     * writes straight into L->kv there, as before). */
+    void *b_k32, *b_v32;
 };
 
 /* --------------------------------------------------------------------
@@ -309,6 +339,14 @@ sg_err sg_gpu_init(sg_gpu **out) {
             }
         }
     }
+
+    /* Register this gpu's alloc/free/host as sg_kv's backend, so sg_kv_new
+     * (Task M5.1/M5.2) can allocate real GPU buffers rather than the NULL
+     * stub every sg_kv call would otherwise hit. Must happen before the
+     * first sg_kv_new call, i.e. before sg_gpu_state_new. This is a global
+     * registration (sg_kv.c carries no gpu handle of its own), so the last
+     * sg_gpu_init to run wins; the codebase runs one sg_gpu at a time. */
+    sg_kv_set_backend(sg_gpu_alloc, sg_gpu_buf_free, sg_gpu_buf_host);
 
     *out = g;
     return SG_OK;
@@ -546,6 +584,10 @@ static sg_err check_sizes(const char *kernel, const sg_gpu_buf *a, const sg_gpu_
         ok = mul_ck((uint64_t)p[0] * p[1], f, &need_a) &&
              add_ck(2ull * p[0], p[1], &t0) && mul_ck(t0, f, &need_b) &&
              mul_ck(p[1], f, &need_o);
+    } else if (strcmp(kernel, "k_kv_store_f16") == 0) {
+        /* a is p[0] f32 floats in; out is p[0] half (2-byte) elements out. */
+        ok = mul_ck(p[0], f, &need_a) && mul_ck(p[0], 2, &need_o);
+        want_b = false;
     } else {
         return gpu_errf("gpu: no size rule for kernel '%s'", kernel);
     }
@@ -722,6 +764,105 @@ sg_err sg_gpu_run_op(sg_gpu *g, const char *kernel, void *a, void *b, void *out,
             [cb waitUntilCompleted];
             if ([cb error]) {
                 rc = gpu_errf("gpu: %s failed: %s", kernel,
+                              [[[cb error] localizedDescription] UTF8String]);
+            }
+        }
+    }
+    return rc;
+}
+
+/* One-shot dispatch for k_attn_decode_f16 (Task M5.2), sg_gpu_run_op's
+ * synchronous commit-and-wait contract extended to a THREE-input kernel: q
+ * is f32 [n_heads, q_stride], k and v are f16 [seq, n_kv_heads, head_dim]
+ * SEPARATE buffers (the sg_kv layout), out is f32 [n_heads, head_dim].
+ * sg_gpu_run_op cannot reach this kernel at all -- its (a, b, out) contract
+ * has no slot for a third input -- so this is its dedicated entry point,
+ * used by the per-op test and nowhere else (the batched decode path in
+ * enc_attn calls enc_attn_f16 directly, inside the one open command buffer a
+ * whole token's layers share).
+ *
+ * params: [0]=n_heads [1]=n_kv_heads [2]=head_dim [3]=seq_len [4]=q_stride
+ * [5]=softmax scale bits (params[6] and params[7] are unused). */
+sg_err sg_gpu_run_attn_decode_f16(sg_gpu *g, void *q, void *k, void *v, void *out,
+                                  const uint32_t params[8]) {
+    if (!g || !q || !k || !v || !out || !params) {
+        return (sg_err){"gpu: sg_gpu_run_attn_decode_f16 got a NULL argument"};
+    }
+    uint32_t n_heads = params[0], n_kv = params[1], hd = params[2], seq = params[3];
+    uint32_t q_stride = params[4];
+    if (n_kv == 0 || n_heads % n_kv != 0) {
+        return gpu_errf("gpu: k_attn_decode_f16 n_heads %u is not a multiple of n_kv_heads %u",
+                        n_heads, n_kv);
+    }
+    if (q_stride < hd) {
+        return gpu_errf("gpu: k_attn_decode_f16 q_stride %u is smaller than head_dim %u",
+                        q_stride, hd);
+    }
+    if (n_heads == 0 || hd == 0 || seq == 0) {
+        return (sg_err){"gpu: k_attn_decode_f16 dispatched with a zero dimension"};
+    }
+
+    sg_gpu_buf *qb = (sg_gpu_buf *)q, *kb = (sg_gpu_buf *)k, *vb = (sg_gpu_buf *)v,
+               *ob = (sg_gpu_buf *)out;
+
+    uint64_t need_q = 0, need_kv = 0, need_o = 0, t0 = 0;
+    bool ok = mul_ck((uint64_t)n_heads, q_stride, &t0) && mul_ck(t0, 4, &need_q)
+           && mul_ck((uint64_t)seq * n_kv, hd, &t0) && mul_ck(t0, 2, &need_kv)
+           && mul_ck((uint64_t)n_heads, hd, &t0) && mul_ck(t0, 4, &need_o);
+    if (!ok) {
+        return (sg_err){"gpu: k_attn_decode_f16 params describe a region that overflows 64 bits"};
+    }
+    if (!buf_big_enough(qb, need_q)) {
+        return gpu_errf("gpu: k_attn_decode_f16 q is %llu bytes, needs %llu",
+                        (unsigned long long)(qb ? qb->nbytes : 0), (unsigned long long)need_q);
+    }
+    if (!buf_big_enough(kb, need_kv)) {
+        return gpu_errf("gpu: k_attn_decode_f16 k is %llu bytes, needs %llu",
+                        (unsigned long long)(kb ? kb->nbytes : 0), (unsigned long long)need_kv);
+    }
+    if (!buf_big_enough(vb, need_kv)) {
+        return gpu_errf("gpu: k_attn_decode_f16 v is %llu bytes, needs %llu",
+                        (unsigned long long)(vb ? vb->nbytes : 0), (unsigned long long)need_kv);
+    }
+    if (!buf_big_enough(ob, need_o)) {
+        return gpu_errf("gpu: k_attn_decode_f16 out is %llu bytes, needs %llu",
+                        (unsigned long long)(ob ? ob->nbytes : 0), (unsigned long long)need_o);
+    }
+    if (bufs_overlap(qb, ob) || bufs_overlap(kb, ob) || bufs_overlap(vb, ob)) {
+        return (sg_err){"gpu: k_attn_decode_f16 output overlaps an input buffer"};
+    }
+
+    /* n_heads*seq alone cannot wrap (two uint32 factors, as above), but *4
+     * can when both sit near UINT32_MAX; guard it like every other byte
+     * count here rather than let scratch_ensure see a wrapped-small need. */
+    uint64_t need_scratch = 0;
+    if (!mul_ck((uint64_t)n_heads * seq, 4, &need_scratch)) {
+        return (sg_err){"gpu: k_attn_decode_f16 score-scratch size overflows 64 bits"};
+    }
+    sg_err e = scratch_ensure(g, need_scratch);
+    if (sg_failed(e)) return e;
+
+    __block sg_err rc = SG_OK;
+    @autoreleasepool {
+        id<MTLCommandBuffer> cb = [g->queue commandBuffer];
+        id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+        if (!cb || !enc) {
+            rc = (sg_err){"gpu: could not open a compute encoder"};
+        } else {
+            [enc setComputePipelineState:g->pipes[KI_ATTN_F16]];
+            [enc setBuffer:qb->buf offset:(NSUInteger)qb->offset atIndex:0];
+            [enc setBuffer:kb->buf offset:(NSUInteger)kb->offset atIndex:1];
+            [enc setBuffer:vb->buf offset:(NSUInteger)vb->offset atIndex:2];
+            [enc setBuffer:ob->buf offset:(NSUInteger)ob->offset atIndex:3];
+            [enc setBytes:params length:8 * sizeof(uint32_t) atIndex:4];
+            [enc setBuffer:g->scratch offset:0 atIndex:5];
+            [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)n_heads, 1, 1)
+                threadsPerThreadgroup:MTLSizeMake(SG_TG, 1, 1)];
+            [enc endEncoding];
+            [cb commit];
+            [cb waitUntilCompleted];
+            if ([cb error]) {
+                rc = gpu_errf("gpu: k_attn_decode_f16 failed: %s",
                               [[[cb error] localizedDescription] UTF8String]);
             }
         }
@@ -925,49 +1066,130 @@ static void enc_op(sg_enc *E, int ki, void *a, uint64_t ao, void *b, uint64_t bo
     }
 }
 
+/* Casts n f32 values out of `src` (offset 0, always a whole small scratch
+ * buffer here) into `dst` (an sg_kv K or V buffer) at element offset
+ * `dst_off`. dst is HALF-typed storage, so its byte offset is dst_off * 2,
+ * not the *4 enc_op assumes for its all-f32 buffers -- that mismatch is
+ * exactly why this is a standalone dispatch rather than a call to enc_op. */
+static void enc_kv_store(sg_enc *E, void *src, void *dst, uint64_t dst_off, uint32_t n) {
+    sg_gpu *g = E->g;
+    id<MTLComputeCommandEncoder> e = E->enc;
+    const uint32_t p[8] = { n, 0, 0, 0, 0, 0, 0, 0 };
+
+    [e setComputePipelineState:g->pipes[KI_KV_STORE_F16]];
+    [e setBuffer:bufof(src) offset:(NSUInteger)offof(src) atIndex:0];
+    /* Buffer 1 is unused by k_kv_store_f16 but declared in its signature. */
+    [e setBuffer:bufof(src) offset:(NSUInteger)offof(src) atIndex:1];
+    [e setBuffer:bufof(dst) offset:(NSUInteger)(offof(dst) + dst_off * 2) atIndex:2];
+    [e setBytes:p length:8 * sizeof(uint32_t) atIndex:3];
+
+    NSUInteger w = [g->pipes[KI_KV_STORE_F16] maxTotalThreadsPerThreadgroup];
+    if (w > SG_TG) w = SG_TG;
+    if (w > n) w = n;
+    [e dispatchThreads:MTLSizeMake(n, 1, 1) threadsPerThreadgroup:MTLSizeMake(w, 1, 1)];
+}
+
+/* k_attn_decode_f16's dispatch: THREE device buffer inputs (q, separate k,
+ * separate v) where every other kernel in this file needs at most two, so it
+ * cannot go through enc_op's (a, b, out) shape. Buffer indices follow the
+ * kernel's own signature in kernels.metal: q=0, k=1, v=2, out=3, params=4,
+ * scores=5. p must supply exactly k_attn_decode_f16's six params. */
+static void enc_attn_f16(sg_enc *E, void *q, void *k, void *v, void *out,
+                         const uint32_t *p) {
+    sg_gpu *g = E->g;
+    id<MTLComputeCommandEncoder> e = E->enc;
+
+    [e setComputePipelineState:g->pipes[KI_ATTN_F16]];
+    [e setBuffer:bufof(q) offset:(NSUInteger)offof(q) atIndex:0];
+    [e setBuffer:bufof(k) offset:(NSUInteger)offof(k) atIndex:1];
+    [e setBuffer:bufof(v) offset:(NSUInteger)offof(v) atIndex:2];
+    [e setBuffer:bufof(out) offset:(NSUInteger)offof(out) atIndex:3];
+    [e setBytes:p length:8 * sizeof(uint32_t) atIndex:4];
+    [e setBuffer:g->scratch offset:0 atIndex:5];
+
+    /* One threadgroup per query head, same geometry as k_attn_decode
+     * (SG_K_ATTN: params[0] threadgroups of SG_TG). */
+    [e dispatchThreadgroups:MTLSizeMake((NSUInteger)p[0], 1, 1)
+      threadsPerThreadgroup:MTLSizeMake(SG_TG, 1, 1)];
+}
+
 /* Qwen3NextAttention for one token, mirroring ref.c's attn_layer statement
  * for statement. b_h holds rms_norm(x, ln1) on entry; b_r receives the
- * layer's residual contribution.
+ * layer's residual contribution. `layer_idx` is only used on the fp16 path,
+ * to look up this layer's K/V buffers in g->kv.
  *
- * k_proj and v_proj write STRAIGHT INTO the cache slot for this position and
- * the qk-norm and RoPE then run in place there, which is the same values
- * ref.c computes into kbuf/vbuf and memcpy's afterwards, with one fewer
- * copy. The queries keep their interleaved [head, 2*head_dim] layout the
- * whole way through: q_norm and RoPE touch only the first head_dim of each
- * head (k_rmsnorm_heads / k_rope_heads take the stride), so the attention
- * output gate in the second half arrives at k_gate_sigmoid_strided exactly
- * as q_proj produced it. */
-static void enc_attn(sg_enc *E, sg_gpu_layer *L, uint32_t pos) {
+ * The queries keep their interleaved [head, 2*head_dim] layout the whole way
+ * through on BOTH paths: q_norm and RoPE touch only the first head_dim of
+ * each head (k_rmsnorm_heads / k_rope_heads take the stride), so the
+ * attention output gate in the second half arrives at k_gate_sigmoid_strided
+ * exactly as q_proj produced it.
+ *
+ * f32 path (SURGE_KV_DTYPE=f32): byte-for-bit the pre-M5.2 code. k_proj and
+ * v_proj write STRAIGHT INTO the cache slot for this position and the
+ * qk-norm and RoPE run in place there, which is the same values ref.c
+ * computes into kbuf/vbuf and memcpy's afterwards, with one fewer copy.
+ *
+ * f16 path (default): k_proj and v_proj cannot write directly into the half
+ * cache (a matvec kernel only ever produces f32), so they land in the f32
+ * scratch b_k32/b_v32 instead; k-norm and RoPE run there in place exactly as
+ * they did on the f32 cache slot; then enc_kv_store casts the finished K and
+ * V into g->kv's per-layer half buffers at this position, and enc_attn_f16
+ * reads them back widened to f32 for the dot products and softmax. */
+static void enc_attn(sg_enc *E, sg_gpu_layer *L, uint32_t layer_idx, uint32_t pos) {
     sg_gpu *g = E->g;
     const sg_cfg *c = &g->cfg;
     uint32_t hd = c->head_dim;
     uint32_t used = pos + 1;
-    uint64_t koff = (uint64_t)pos * g->kv_width;
-    uint64_t vbase = (uint64_t)g->max_ctx * g->kv_width;
     float scale = (float)(1.0 / sqrt((double)hd));
 
     enc_op(E, g->mat_kernel, L->w_q, 0, g->b_h, 0, g->b_qg, 0, nil, 0,
            PARAMS(g->q_width, c->hidden));
-    enc_op(E, g->mat_kernel, L->w_k, 0, g->b_h, 0, L->kv, koff, nil, 0,
-           PARAMS(g->kv_width, c->hidden));
-    enc_op(E, g->mat_kernel, L->w_v, 0, g->b_h, 0, L->kv, vbase + koff, nil, 0,
-           PARAMS(g->kv_width, c->hidden));
-
     /* q_norm applies to the queries only, never to the gate. */
     enc_op(E, KI_RMSNORM_HEADS, g->b_qg, 0, L->qk_norm, 0, g->b_qg, 0, nil, 0,
            PARAMS(hd, c->n_heads, fbits(c->rms_eps), 1, 2 * hd));
     enc_op(E, KI_ROPE_HEADS, g->b_qg, 0, g->b_cs, 0, g->b_qg, 0, nil, 0,
            PARAMS(hd, c->rope_dim, c->n_heads, 2 * hd));
-    enc_op(E, KI_RMSNORM_HEADS, L->kv, koff, L->qk_norm, hd, L->kv, koff, nil, 0,
-           PARAMS(hd, c->n_kv_heads, fbits(c->rms_eps), 1, hd));
-    enc_op(E, KI_ROPE_HEADS, L->kv, koff, g->b_cs, 0, L->kv, koff, nil, 0,
-           PARAMS(hd, c->rope_dim, c->n_kv_heads, hd));
 
-    enc_op(E, KI_ATTN, g->b_qg, 0, L->kv, 0, g->b_ctx, 0, g->scratch, 0,
-           PARAMS(c->n_heads, c->n_kv_heads, hd, used, 2 * hd,
-                  (uint32_t)vbase, fbits(scale)));
+    if (g->kv_dtype == SG_T_F32) {
+        uint64_t koff = (uint64_t)pos * g->kv_width;
+        uint64_t vbase = (uint64_t)g->max_ctx * g->kv_width;
 
-    /* The output gate is a sigmoid applied before o_proj. */
+        enc_op(E, g->mat_kernel, L->w_k, 0, g->b_h, 0, L->kv, koff, nil, 0,
+               PARAMS(g->kv_width, c->hidden));
+        enc_op(E, g->mat_kernel, L->w_v, 0, g->b_h, 0, L->kv, vbase + koff, nil, 0,
+               PARAMS(g->kv_width, c->hidden));
+
+        enc_op(E, KI_RMSNORM_HEADS, L->kv, koff, L->qk_norm, hd, L->kv, koff, nil, 0,
+               PARAMS(hd, c->n_kv_heads, fbits(c->rms_eps), 1, hd));
+        enc_op(E, KI_ROPE_HEADS, L->kv, koff, g->b_cs, 0, L->kv, koff, nil, 0,
+               PARAMS(hd, c->rope_dim, c->n_kv_heads, hd));
+
+        enc_op(E, KI_ATTN, g->b_qg, 0, L->kv, 0, g->b_ctx, 0, g->scratch, 0,
+               PARAMS(c->n_heads, c->n_kv_heads, hd, used, 2 * hd,
+                      (uint32_t)vbase, fbits(scale)));
+    } else {
+        void *kbuf = sg_kv_k(g->kv, layer_idx);
+        void *vbuf = sg_kv_v(g->kv, layer_idx);
+
+        enc_op(E, g->mat_kernel, L->w_k, 0, g->b_h, 0, g->b_k32, 0, nil, 0,
+               PARAMS(g->kv_width, c->hidden));
+        enc_op(E, g->mat_kernel, L->w_v, 0, g->b_h, 0, g->b_v32, 0, nil, 0,
+               PARAMS(g->kv_width, c->hidden));
+
+        enc_op(E, KI_RMSNORM_HEADS, g->b_k32, 0, L->qk_norm, hd, g->b_k32, 0, nil, 0,
+               PARAMS(hd, c->n_kv_heads, fbits(c->rms_eps), 1, hd));
+        enc_op(E, KI_ROPE_HEADS, g->b_k32, 0, g->b_cs, 0, g->b_k32, 0, nil, 0,
+               PARAMS(hd, c->rope_dim, c->n_kv_heads, hd));
+
+        enc_kv_store(E, g->b_k32, kbuf, (uint64_t)pos * g->kv_width, g->kv_width);
+        enc_kv_store(E, g->b_v32, vbuf, (uint64_t)pos * g->kv_width, g->kv_width);
+
+        enc_attn_f16(E, g->b_qg, kbuf, vbuf, g->b_ctx,
+                     PARAMS(c->n_heads, c->n_kv_heads, hd, used, 2 * hd, fbits(scale)));
+    }
+
+    /* The output gate is a sigmoid applied before o_proj -- same for both
+     * dtypes. */
     enc_op(E, KI_GATE_STRIDED, g->b_ctx, 0, g->b_qg, 0, g->b_ctx, 0, nil, 0,
            PARAMS(hd, c->n_heads, 2 * hd, hd));
     enc_op(E, g->mat_kernel, L->w_o, 0, g->b_ctx, 0, g->b_r, 0, nil, 0,
@@ -1045,6 +1267,14 @@ static void gpu_free_state(sg_gpu *g) {
             sg_gpu_buf_free(L->ssm);      L->ssm = NULL;
         }
     }
+    /* M5.2: the fp16 full-attention K/V (sg_kv-owned) and its f32 landing
+     * scratch. sg_kv_free walks its own per-layer buffers through the
+     * registered backend (sg_gpu_buf_free), same as the loop above does for
+     * the f32 path's L->kv. */
+    sg_kv_free(g->kv); g->kv = NULL;
+    sg_gpu_buf_free(g->b_k32); g->b_k32 = NULL;
+    sg_gpu_buf_free(g->b_v32); g->b_v32 = NULL;
+
     void *shared[] = { g->b_x, g->b_h, g->b_r, g->b_qg, g->b_ctx, g->b_ffg,
                        g->b_ffu, g->b_qkv, g->b_ab, g->b_gates, g->b_y,
                        g->b_cs, g->b_logits };
@@ -1322,12 +1552,35 @@ sg_err sg_gpu_state_new(sg_gpu *g, const sg_model *m, uint32_t max_ctx) {
     g->max_ctx = max_ctx;
     g->used = 0;
 
-    /* k_attn_decode's v_cache offset is a uint32 param, so the K half of one
-     * layer's cache has to be addressable in floats by a uint32. That is 4
-     * billion floats; the real ceiling here is memory, not this check, but a
-     * silently truncated offset would read the wrong half of the cache. */
-    uint64_t half = (uint64_t)max_ctx * g->kv_width;
-    if (half > UINT32_MAX) return (sg_err){"gpu: max_ctx is too large for this kv cache layout"};
+    /* SURGE_KV_DTYPE selects the full-attention K/V cache's element type:
+     * f16 (default, M5.2) or f32 (the pre-M5.2 path, kept byte-for-bit so
+     * the M2 gate's oracle comparison is untouched). An unrecognized value
+     * logs a warning and falls back to the default rather than picking one
+     * silently. */
+    const char *dt_env = getenv("SURGE_KV_DTYPE");
+    sg_tensor_type kv_dtype = SG_T_F16;
+    if (dt_env && strcmp(dt_env, "f32") == 0) {
+        kv_dtype = SG_T_F32;
+    } else if (dt_env && dt_env[0] != '\0' && strcmp(dt_env, "f16") != 0) {
+        fprintf(stderr, "gpu: SURGE_KV_DTYPE='%s' not recognized (want f16 or f32); "
+                        "using f16\n", dt_env);
+    }
+    g->kv_dtype = kv_dtype;
+    fprintf(stderr, "gpu: KV cache dtype = %s\n", kv_dtype == SG_T_F16 ? "f16" : "f32");
+
+    uint64_t half = 0;
+    if (kv_dtype == SG_T_F32) {
+        /* k_attn_decode's v_cache offset is a uint32 param, so the K half of
+         * one layer's cache has to be addressable in floats by a uint32.
+         * That is 4 billion floats; the real ceiling here is memory, not
+         * this check, but a silently truncated offset would read the wrong
+         * half of the cache. Only the f32 path's combined buffer needs this
+         * check: k_attn_decode_f16 has no v_cache offset at all (K and V
+         * are separate buffers), and sg_kv_new enforces its own cap ceiling
+         * (SG_KV_CAP_MAX) on that path instead. */
+        half = (uint64_t)max_ctx * g->kv_width;
+        if (half > UINT32_MAX) return (sg_err){"gpu: max_ctx is too large for this kv cache layout"};
+    }
 
     sg_err e;
     uint32_t n_attn = 0, n_gdn = 0;
@@ -1357,6 +1610,14 @@ sg_err sg_gpu_state_new(sg_gpu *g, const sg_model *m, uint32_t max_ctx) {
         /* One private score row per query head, the full context long. */
         e = scratch_ensure(g, (uint64_t)c->n_heads * max_ctx * 4);
         if (sg_failed(e)) { gpu_free_state(g); return e; }
+        if (kv_dtype == SG_T_F16) {
+            /* fp16 path: this token's freshly computed K and V land here in
+             * f32 for q/k-norm and RoPE (same in-place ops the f32 path
+             * uses), and k_kv_store_f16 then casts the result into g->kv's
+             * per-layer half buffers. */
+            SHARED(b_k32, g->kv_width);
+            SHARED(b_v32, g->kv_width);
+        }
     }
     if (n_gdn > 0) {
         SHARED(b_qkv, g->conv_dim);
@@ -1369,8 +1630,12 @@ sg_err sg_gpu_state_new(sg_gpu *g, const sg_model *m, uint32_t max_ctx) {
     for (uint32_t i = 0; i < c->n_layers; i++) {
         sg_gpu_layer *L = &g->ls[i];
         if (L->is_attn) {
-            e = gpu_alloc_f32(g, SG_KV_GROUPS * half, &L->kv, NULL);
-            if (sg_failed(e)) { gpu_free_state(g); return e; }
+            if (kv_dtype == SG_T_F32) {
+                e = gpu_alloc_f32(g, SG_KV_GROUPS * half, &L->kv, NULL);
+                if (sg_failed(e)) { gpu_free_state(g); return e; }
+            }
+            /* kv_dtype == SG_T_F16: nothing per-layer here. g->kv (below)
+             * owns every full-attention layer's K and V buffer at once. */
         } else {
             e = gpu_alloc_f32(g, (uint64_t)g->conv_dim * c->conv_kernel,
                               &L->conv_buf, NULL);
@@ -1379,6 +1644,20 @@ sg_err sg_gpu_state_new(sg_gpu *g, const sg_model *m, uint32_t max_ctx) {
                               &L->ssm, NULL);
             if (sg_failed(e)) { gpu_free_state(g); return e; }
         }
+    }
+
+    if (kv_dtype == SG_T_F16 && n_attn > 0) {
+        /* sg_kv_new sizes and allocates every full-attention layer's
+         * SEPARATE K and V buffer (the M5.1 layout) in one call, through the
+         * backend sg_gpu_init registered. It also sizes DeltaNet conv/S
+         * state internally (sg_kv models both layer kinds), which duplicates
+         * the ad hoc L->conv_buf/L->ssm allocated just above; that state is
+         * fixed-size and small (kilobytes per layer) and this task does not
+         * read it back through sg_kv's getters, so the duplication costs
+         * memory, not correctness -- DeltaNet decode is not part of M5.2's
+         * scope (see the task brief). */
+        e = sg_kv_new(g, c, max_ctx, SG_T_F16, &g->kv);
+        if (sg_failed(e)) { gpu_free_state(g); return e; }
     }
 
     g->have_state = true;
@@ -1453,7 +1732,7 @@ sg_err sg_gpu_forward(sg_gpu *g, const sg_model *m, int32_t token, uint32_t pos,
 
                 enc_op(&E, KI_RMSNORM, g->b_x, 0, L->ln1, 0, g->b_h, 0, nil, 0,
                        PARAMS(c->hidden, eps, 1));
-                if (L->is_attn) enc_attn(&E, L, pos);
+                if (L->is_attn) enc_attn(&E, L, i, pos);
                 else            enc_gdn(&E, L);
                 enc_op(&E, KI_ADD, g->b_x, 0, g->b_r, 0, g->b_x, 0, nil, 0,
                        PARAMS(c->hidden));

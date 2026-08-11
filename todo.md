@@ -1113,3 +1113,78 @@ regression anchor, M1 layout; ids.txt self-describing; result.json; xcheck.json)
 
 **Green build:** make check 13 suites 0 failures + make debug 51 checks 0
 sanitizer diagnostics, both exit 0 (unchanged; no C sources touched).
+
+## Task M5.2 Results (metal.m/kernels.metal: fp16 KV in the decode path)
+
+**What:** refit the M2 decode path to use an fp16 KV cache by default, while
+keeping a byte-for-bit unchanged f32-KV path (`SURGE_KV_DTYPE=f32`) so the M2
+gate's oracle comparison is untouched. Two new kernels
+(`k_kv_store_f16`, `k_attn_decode_f16`), `sg_gpu_init` now calls
+`sg_kv_set_backend`, `sg_gpu_state_new` allocates the fp16 full-attention K/V
+through `sg_kv` (M5.1) as SEPARATE per-layer buffers, `enc_attn` branches on
+`g->kv_dtype`.
+
+**Design decision (interpreting a brief tension):** the brief says both
+"allocate decode state through sg_kv" (which always gives separate K/V
+buffers) AND "the f32 path may be the existing k_attn_decode kernel"
+(which needs ONE combined buffer with a v_cache offset -- structurally
+incompatible with separate buffers). Resolved by NOT routing the f32 path's
+full-attention K/V through sg_kv at all: it keeps the exact pre-M5.2
+ad hoc combined-buffer allocation and the exact pre-M5.2 `k_attn_decode`
+dispatch, unmodified. sg_kv is used only for the new f16 default path.
+Verified via `git stash` that the f32 path's measured M2 gate number
+(worst relative logit gap 1.299e-06) is IDENTICAL before and after this
+change, not merely "still passes". DeltaNet conv/S state also stays on its
+pre-existing ad hoc allocation (brief: "not exercised by full-attn decode");
+`sg_kv_new` still sizes/allocates it as an unavoidable side effect of sizing
+the model's DeltaNet layers too, which costs a few KB of duplicate memory
+per model but nothing is ever read back through those getters.
+
+**k_attn_decode_f16's dispatch problem:** it needs THREE device buffer
+inputs (q, separate k, separate v) where `sg_gpu_run_op`'s fixed (a, b, out)
+contract supports at most two, so it cannot be reached through that
+function at all (calling it with the kernel name is a clean error, not a
+misbound buffer). Added a dedicated one-shot entry point,
+`sg_gpu_run_attn_decode_f16`, for the per-op test; the batched decode path
+(`enc_attn`) dispatches the same kernel by hand inside the token's one open
+command buffer via a new `enc_attn_f16` helper. A second helper,
+`enc_kv_store`, casts+stores K/V into the half buffers at the right
+element (not float) byte offset, since `enc_op`'s existing offset math
+assumes 4-byte (f32) elements throughout.
+
+### Gate: PASSED, all 5 items
+
+1. **k_kv_store_f16 round-trips exact f16**: 777/777 synthetic values (mixed
+   tiny/huge/ordinary magnitudes) bit-identical to `sg_f32_to_f16` (kv.c's
+   pure-C reference).
+2. **k_attn_decode_f16 == k_attn_decode fed f16-pre-rounded inputs**:
+   8 heads/2 kv heads/head_dim 128/seq 300, bit-identical over 100 reruns
+   (0 mismatches vs the f32 oracle AND vs itself across all 100 runs).
+3. **M2 gate UNCHANGED on the f32-KV path**: `tests/test_gpu_fwd.c` now pins
+   `SURGE_KV_DTYPE=f32` explicitly for `mini_st_matches_ref` /
+   `mini_gguf_matches_ref` / `q8_loads_and_decodes`. Worst relative logit gap
+   vs ref: **1.299e-06**, argmax 12/12 both fixtures -- confirmed via
+   `git stash` to be the EXACT same number as the pre-M5.2 tree, not just
+   "still passes".
+4. **New f16 forward subtest** (`mini_f16_kv_decode_coherent`, default
+   f16 dtype, no override): all logits finite, all argmaxes in-vocab, and
+   (stronger than the gate requires) argmax agreed with the f32 ref at
+   **12/12** positions on the mini hybrid fixture.
+5. **make check / make debug**: both exit 0. `make debug`
+   (SURGE_NO_METAL, ASan+UBSan) reports zero sanitizer diagnostics.
+
+### Files touched
+`src/kernels.metal` (+96 lines: 2 new kernels), `src/metal.m` (+~300 net:
+kernel table, `sg_kv_set_backend` call, struct fields, `sg_gpu_state_new`
+dtype branch, rewritten `enc_attn` + 2 new encode helpers,
+`sg_gpu_run_attn_decode_f16`), `surge.h` (+31: new declaration, doc updates),
+`tests/test_metal_ops.c` (+145: 2 new per-op gates), `tests/test_gpu_fwd.c`
+(+79: setenv pins + new coherence subtest).
+
+### Known minor inefficiency (not a correctness bug)
+`sg_kv_new` sizes and allocates DeltaNet conv/S state internally (it always
+sizes both layer kinds from the config), duplicating the pre-existing ad hoc
+`L->conv_buf`/`L->ssm` allocation. Fixed-size, kilobytes per layer, never
+read back through sg_kv's getters. Left as is since DeltaNet decode is out
+of this task's scope; a future task refitting DeltaNet decode onto sg_kv
+should drop the ad hoc allocation instead of keeping both.

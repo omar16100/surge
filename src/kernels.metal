@@ -433,6 +433,102 @@ kernel void k_attn_decode(device const float *q  [[buffer(0)]],
 }
 
 /* =====================================================================
+ * fp16 KV cache (Task M5.2): a decode-step cast+store and the matching
+ * attention kernel, so the K/V cache can shrink to half the bytes without
+ * changing the decode arithmetic. Both mirror k_attn_decode above statement
+ * for statement -- same accumulation order, same fixed-tree reduction, no
+ * atomics, no simd_sum -- so feeding k_attn_decode f32 inputs that are
+ * ALREADY the f16-rounded values makes the two kernels bit-identical:
+ * widening half -> float is exact (binary16 embeds into binary32 with no
+ * rounding), so there is no second rounding on the f16 kernel's side that
+ * the f32 kernel does not also see.
+ * ===================================================================== */
+
+/* Casts src[0..n) to half and writes it into dst. One thread per element,
+ * trivially deterministic (each output is written by exactly one thread from
+ * one input it alone reads). Used to land a freshly computed K or V vector
+ * into the sg_kv cache at the current position; buffer(1) is unused and only
+ * bound because every kernel signature must bind index 1. */
+kernel void k_kv_store_f16(device const float *src   [[buffer(0)]],
+                           device const float *unused [[buffer(1)]],
+                           device half *dst           [[buffer(2)]],
+                           constant uint *p           [[buffer(3)]],
+                           uint i [[thread_position_in_grid]])
+{
+    (void)unused;
+    if (i >= p[0]) return;
+    dst[i] = (half)src[i];
+}
+
+/* Attention decode reading a fp16 KV cache held in SEPARATE per-layer K and V
+ * buffers (the sg_kv layout: [cap, n_kv_heads, head_dim], head-interleaved),
+ * rather than k_attn_decode's one combined [K;V] buffer with a v_cache
+ * offset. Buffer indices are therefore shifted by one from every other
+ * kernel in this file (q, k, v, out, params, scores) to make room for the
+ * extra input; metal.m dispatches this one by hand rather than through the
+ * generic (a, b, out) path the rest of the kernels share.
+ *
+ * Every accumulation is IDENTICAL to k_attn_decode's: same thread-to-key
+ * striding, same serial per-element dot product, same tg_max/tg_sum fold,
+ * same division (not reciprocal-multiply) in the softmax. The only
+ * difference is the half -> float widen on each K/V read, which is exact. */
+kernel void k_attn_decode_f16(device const float *q  [[buffer(0)]],
+                              device const half *kc   [[buffer(1)]],
+                              device const half *vc   [[buffer(2)]],
+                              device float *out       [[buffer(3)]],
+                              constant uint *p        [[buffer(4)]],
+                              device float *scores    [[buffer(5)]],
+                              uint h   [[threadgroup_position_in_grid]],
+                              uint lid [[thread_position_in_threadgroup]])
+{
+    uint n_heads = p[0], n_kv = p[1], hd = p[2], seq = p[3];
+    uint q_stride = p[4];
+    float scale = as_type<float>(p[5]);
+    /* h is uniform across the threadgroup, so this return is uniform and
+     * cannot strand a thread on a barrier below. */
+    if (h >= n_heads || n_kv == 0u || hd == 0u || seq == 0u) return;
+
+    uint repeat = n_heads / n_kv;         /* GQA: mlx repeats the kv-head axis */
+    uint hk = repeat ? (h / repeat) : 0u;
+    device const float *qh = q + (size_t)h * q_stride;
+    device float *sc = scores + (size_t)h * seq;   /* this head's private slice */
+    threadgroup float red[SG_TG];
+
+    /* 1. scores. Thread `lid` owns keys lid, lid+256, ...; the dot product
+     *    itself is a serial loop over head_dim, so no reduction is needed
+     *    here at all. */
+    for (uint t = lid; t < seq; t += SG_TG) {
+        device const half *kt = kc + ((size_t)t * n_kv + hk) * hd;
+        float dot = 0.0f;
+        for (uint i = 0; i < hd; i++) dot += qh[i] * (float)kt[i];
+        sc[t] = dot * scale;
+    }
+    threadgroup_barrier(mem_flags::mem_device | mem_flags::mem_threadgroup);
+
+    /* 2. softmax over 0..seq-1, same degenerate-branch-free shape as
+     *    k_attn_decode (see its comment: no mask value exists here either). */
+    float m = -INFINITY;
+    for (uint t = lid; t < seq; t += SG_TG) { float v = sc[t]; m = (v > m) ? v : m; }
+    m = tg_max(red, lid, m);
+
+    float s = 0.0f;
+    for (uint t = lid; t < seq; t += SG_TG) { float e = precise::exp(sc[t] - m); sc[t] = e; s += e; }
+    float sum = tg_sum(red, lid, s);
+    for (uint t = lid; t < seq; t += SG_TG) sc[t] = sc[t] / sum;
+    threadgroup_barrier(mem_flags::mem_device | mem_flags::mem_threadgroup);
+
+    /* 3. context = sum_t p[t] * v[t], same fixed order as k_attn_decode. */
+    device float *oh = out + (size_t)h * hd;
+    for (uint i = lid; i < hd; i += SG_TG) {
+        float acc = 0.0f;
+        for (uint t = 0; t < seq; t++) {
+            acc += sc[t] * (float)vc[((size_t)t * n_kv + hk) * hd + i];
+        }
+        oh[i] = acc;
+    }
+}
+
+/* =====================================================================
  * Gated DeltaNet decode step
  * ===================================================================== */
 

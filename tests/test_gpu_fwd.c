@@ -215,6 +215,71 @@ static void mini_gguf_matches_ref(void) {
     free(ids);
 }
 
+/* M5.2: the DEFAULT KV dtype (f16, set explicitly in main() before this runs)
+ * over the same mini hybrid fixture as mini_gguf_matches_ref. This is gate
+ * 4's bar -- "a short greedy decode with f16 KV runs, output finite/
+ * in-range/coherent" -- not mini_gguf_matches_ref's 1e-4 logit-parity bar:
+ * the task brief's correctness philosophy explicitly expects fp16 KV to add
+ * ~1e-3 logit noise, absorbed by argmax at the token level, so this checks
+ * finiteness, in-range argmax, and logs (without hard-failing on) argmax
+ * agreement against the f32 ref instead of re-litigating logit parity. */
+static void mini_f16_kv_decode_coherent(void) {
+    size_t n_ids = 0;
+    int32_t *ids = read_ids_file(MINI_DIR "/ids.txt", &n_ids);
+    tt_assert(ids && n_ids > 1, "read %s/ids.txt", MINI_DIR);
+    if (!ids || n_ids < 2) { free(ids); return; }
+
+    sg_gguf *gg = NULL;
+    sg_err e = sg_gguf_open(MINI_DIR "/model.gguf", &gg);
+    tt_assert(!sg_failed(e), "sg_gguf_open: %s", e.msg ? e.msg : "ok");
+    if (sg_failed(e)) { free(ids); return; }
+
+    sg_model m;
+    e = sg_model_from_gguf(gg, &m);
+    tt_assert(!sg_failed(e), "sg_model_from_gguf: %s", e.msg ? e.msg : "ok");
+    if (sg_failed(e)) { sg_gguf_close(gg); free(ids); return; }
+
+    sg_ref_state *rs = NULL;
+    sg_err re = sg_ref_state_new(&m, (uint32_t)n_ids, &rs);
+    tt_assert(!sg_failed(re), "sg_ref_state_new: %s", re.msg ? re.msg : "ok");
+
+    e = sg_gpu_load_model(g_gpu, &m);
+    tt_assert(!sg_failed(e), "sg_gpu_load_model: %s", e.msg ? e.msg : "ok");
+    if (!sg_failed(e)) {
+        e = sg_gpu_state_new(g_gpu, &m, (uint32_t)n_ids);
+        tt_assert(!sg_failed(e), "sg_gpu_state_new: %s", e.msg ? e.msg : "ok");
+    }
+
+    if (!sg_failed(e) && !sg_failed(re)) {
+        uint32_t vocab = m.cfg.vocab;
+        bool all_finite = true, all_in_range = true;
+        uint32_t argmax_agree = 0;
+
+        for (uint32_t t = 0; t < n_ids; t++) {
+            const float *gl = NULL;
+            e = sg_gpu_forward(g_gpu, &m, ids[t], t, &gl);
+            tt_assert(!sg_failed(e), "sg_gpu_forward %u: %s", t, e.msg ? e.msg : "ok");
+            if (sg_failed(e)) break;
+            for (uint32_t i = 0; i < vocab; i++) if (!isfinite(gl[i])) all_finite = false;
+            uint32_t arg = argmax_f32(gl, vocab);
+            if (arg >= vocab) all_in_range = false;
+
+            const float *rl = NULL;
+            re = sg_ref_forward(rs, &m, ids[t], t, &rl);
+            if (!sg_failed(re) && argmax_f32(rl, vocab) == arg) argmax_agree++;
+        }
+        tt_assert(all_finite, "f16-KV decode logits are all finite");
+        tt_assert(all_in_range, "f16-KV decode argmaxes are in vocab range");
+        fprintf(stderr, "   f16-KV decode: argmax agreed with the f32 ref at %u/%zu positions\n",
+                argmax_agree, n_ids);
+    }
+
+    if (rs) sg_ref_state_free(rs);
+    sg_model_free(&m);
+    sg_gguf_close(gg);
+    free(ids);
+}
+
 /* Q8_0 now loads on the Metal path (M3.2+M3.3). This env-guarded check wants
  * a real Q8_0 gguf, loads it, and greedily decodes a few tokens, asserting the
  * outputs are valid (in-vocab, finite logits) and NOT degenerate (not the same
@@ -293,9 +358,23 @@ int main(void) {
         fprintf(stderr, "SKIP test_gpu_fwd: %s\n", e.msg);
         return 0;
     }
+
+    /* M5.2 changed sg_gpu_state_new's DEFAULT KV dtype to f16. Pin the
+     * pre-existing M2 gate to f32 explicitly so it keeps comparing against
+     * the exact same combined-buffer k_attn_decode path it always has,
+     * regardless of the new default; see gate 3 in the M5.2 task brief. */
+    setenv("SURGE_KV_DTYPE", "f32", 1);
     tt_run("mini_st_matches_ref", mini_st_matches_ref);
     tt_run("mini_gguf_matches_ref", mini_gguf_matches_ref);
     tt_run("q8_loads_and_decodes", q8_loads_and_decodes);
+
+    /* M5.2's new default path: no override, but set explicitly for clarity
+     * and so this test does not silently start testing f32 again if the
+     * default ever changes back. */
+    setenv("SURGE_KV_DTYPE", "f16", 1);
+    tt_run("mini_f16_kv_decode_coherent", mini_f16_kv_decode_coherent);
+    unsetenv("SURGE_KV_DTYPE");
+
     fprintf(stderr, "worst relative logit gap vs ref: %.3e\n", g_worst_rel);
     sg_gpu_free(g_gpu);
     return tt_report();

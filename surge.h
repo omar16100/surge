@@ -563,6 +563,19 @@ void *sg_gpu_buf_host(void *buf);
 sg_err sg_gpu_run_op(sg_gpu *g, const char *kernel, void *a, void *b, void *out,
                      const uint32_t params[8]);
 
+/* One-shot dispatch for k_attn_decode_f16 (Task M5.2's fp16-KV attention
+ * kernel), same synchronous commit-and-wait contract as sg_gpu_run_op above.
+ * It needs THREE device buffer inputs (q, a separate k, a separate v) where
+ * every kernel sg_gpu_run_op reaches needs at most two, so it does not fit
+ * that function's (a, b, out) shape and gets this dedicated entry point
+ * instead. q is f32 [n_heads, q_stride]; k and v are f16
+ * [seq, n_kv_heads, head_dim] SEPARATE buffers (the sg_kv layout, not one
+ * combined buffer with a v_cache offset like k_attn_decode's b); out is f32
+ * [n_heads, head_dim]. params: [0]=n_heads [1]=n_kv_heads [2]=head_dim
+ * [3]=seq_len [4]=q_stride [5]=softmax scale bits (f32 bit pattern). */
+sg_err sg_gpu_run_attn_decode_f16(sg_gpu *g, void *q, void *k, void *v, void *out,
+                                  const uint32_t params[8]);
+
 /* ---------------------------------------------------------------------
  * The full Metal decode path (Task 10)
  * ---------------------------------------------------------------------
@@ -598,11 +611,19 @@ sg_err sg_gpu_run_op(sg_gpu *g, const char *kernel, void *a, void *b, void *out,
  * fail here rather than bind a misaligned pointer, and needs its weights
  * copied into owned buffers first.
  *
- * The KV cache is fp32 for M2 (fp16 arrives with M5) and holds K then V in
- * one buffer per full-attention layer, [2, max_ctx, n_kv_heads, head_dim].
- * It is sized from max_ctx, so pass the actual run length plus whatever
- * margin you want -- NOT max_position_embeddings, which is 262144 on this
- * model family and would be 24 GB of cache for a 64-token decode.
+ * The KV cache dtype is chosen by the SURGE_KV_DTYPE env var at
+ * sg_gpu_state_new time: f16 (Task M5.2, the default) or f32 (the pre-M5.2
+ * path, kept so the M2 byte-exact-token gate has an unchanged oracle to run
+ * against). The f16 path allocates SEPARATE per-layer K and V buffers
+ * through sg_kv (Task M5.1, see the section below), [max_ctx, n_kv_heads,
+ * head_dim] each, head-interleaved; the f32 path keeps the original one
+ * combined buffer per full-attention layer, [2, max_ctx, n_kv_heads,
+ * head_dim]. Either way it is sized from max_ctx, so pass the actual run
+ * length plus whatever margin you want -- NOT max_position_embeddings,
+ * which is 262144 on this model family and would be a huge cache for a
+ * 64-token decode. (The f16 path additionally inherits sg_kv's own cap
+ * ceiling, SG_KV_CAP_MAX == 262144, which matches this project's 256K
+ * target and so is not a practical limit here.)
  *
  * Order of use: sg_gpu_init -> sg_gpu_load_model -> sg_gpu_state_new ->
  * sg_gpu_forward per token with pos = 0, 1, 2, ... A second sequence needs

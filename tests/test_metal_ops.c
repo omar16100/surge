@@ -109,6 +109,21 @@ static gbuf gb_from_u8(const void *src, uint64_t nbytes) {
 
 static void gb_free(gbuf *b) { sg_gpu_buf_free(b->b); b->b = NULL; b->h = NULL; }
 
+/* Half-precision (2 bytes/element) device buffer, for the M5.2 fp16-KV
+ * kernels: k_kv_store_f16's output and k_attn_decode_f16's K/V inputs. */
+typedef struct { void *b; uint16_t *h; uint64_t n; } gbuf16;
+
+static gbuf16 gb16_new(uint64_t n) {
+    gbuf16 r = {NULL, NULL, n};
+    void *host = NULL;
+    sg_err e = sg_gpu_alloc(g_gpu, n * sizeof(uint16_t), &r.b, &host);
+    if (sg_failed(e)) { fprintf(stderr, "FATAL: %s\n", e.msg); exit(2); }
+    r.h = (uint16_t *)host;
+    return r;
+}
+
+static void gb16_free(gbuf16 *b) { sg_gpu_buf_free(b->b); b->b = NULL; b->h = NULL; }
+
 /* Fill an output buffer with a pattern no kernel would produce, so a
  * kernel that writes only part of its output fails loudly instead of
  * passing on whatever the previous dispatch left there. */
@@ -903,6 +918,181 @@ static void metal_attn_decode_matches_ref(void) {
 }
 
 /* --------------------------------------------------------------------
+ * M5.2: fp16 KV cache
+ * -------------------------------------------------------------------- */
+
+/* Gate 1: k_kv_store_f16 round-trips exact f16 -- store an f32 value, read
+ * back the SAME bits sg_f32_to_f16 (src/kv.c's pure-C reference, already
+ * pinned to match Metal's `half` cast bit-for-bit) would produce. n = 777 is
+ * not a multiple of SG_TG, so the ragged tail of the elementwise dispatch is
+ * exercised too. */
+static void metal_kv_store_f16_roundtrips(void) {
+    const uint32_t n = 777;
+    float *src = xmalloc(n * sizeof *src);
+    lcg_seed(0xF16Du);
+    for (uint32_t i = 0; i < n; i++) {
+        /* A spread of magnitudes -- tiny (near f16 subnormal), huge (near f16
+         * overflow) and ordinary -- so round-to-nearest-even edge cases in
+         * sg_f32_to_f16 are exercised, not just well-behaved values. */
+        float scale = (i % 7 == 0) ? 1e-6f : (i % 5 == 0) ? 6.0e4f : 3.0f;
+        src[i] = lcg_next() * scale;
+    }
+
+    gbuf a = gb_from(src, n);
+    gbuf16 o = gb16_new(n);
+    memset(o.h, 0xA5, n * sizeof(uint16_t));
+    uint32_t p[8] = {n, 0, 0, 0, 0, 0, 0, 0};
+
+    sg_err e = sg_gpu_run_op(g_gpu, "k_kv_store_f16", a.b, NULL, o.b, p);
+    tt_assert(!sg_failed(e), "k_kv_store_f16: %s", e.msg ? e.msg : "ok");
+    if (!sg_failed(e)) {
+        uint64_t mismatches = 0;
+        uint32_t at = 0;
+        for (uint32_t i = 0; i < n; i++) {
+            uint16_t want = sg_f32_to_f16(src[i]);
+            if (o.h[i] != want) { if (mismatches == 0) at = i; mismatches++; }
+        }
+        tt_assert(mismatches == 0,
+                  "k_kv_store_f16 round-trip: %llu/%u mismatches (first at %u: "
+                  "got 0x%04x, want 0x%04x)",
+                  (unsigned long long)mismatches, n, at,
+                  mismatches ? o.h[at] : 0, mismatches ? sg_f32_to_f16(src[at]) : 0);
+        if (mismatches == 0) {
+            fprintf(stderr, "   k_kv_store_f16 round-trip: %u/%u values bit-exact\n", n, n);
+        }
+    }
+    gb_free(&a); gb16_free(&o);
+
+    /* Also store at a NONZERO destination offset, into the middle of a
+     * larger buffer, poisoning the surrounding halves first: the batched
+     * decode path (enc_kv_store) always stores at pos*kv_width, never at
+     * offset 0 past the very first position, and *2-vs-*4 byte-offset
+     * mistakes are exactly the kind of bug that would only show up once the
+     * offset is nonzero. */
+    const uint32_t total = 512, off = 200, n2 = 64;
+    gbuf a2 = gb_from(src, n2);   /* reuse the first n2 rounded values */
+
+    /* sg_gpu_run_op has no offset concept of its own (it always binds a
+     * handle at ITS OWN base); drive the nonzero offset the way enc_kv_store
+     * does, by binding a handle whose contents start `off` halves into a
+     * larger buffer. sg_gpu_wrap gives that (page-aligned base, arbitrary
+     * byte offset from there), which also cross-checks the offset math
+     * against a second, independent code path. */
+    gbuf16 dst = gb16_new(total);
+    memset(dst.h, 0xA5, total * sizeof(uint16_t));
+    void *wrapped = NULL;
+    sg_err ew = sg_gpu_wrap(g_gpu, dst.h + off, (uint64_t)n2 * sizeof(uint16_t), &wrapped);
+    tt_assert(!sg_failed(ew), "sg_gpu_wrap (kv store offset test): %s", ew.msg ? ew.msg : "ok");
+    if (!sg_failed(ew)) {
+        uint32_t p3[8] = {n2, 0, 0, 0, 0, 0, 0, 0};
+        sg_err e3 = sg_gpu_run_op(g_gpu, "k_kv_store_f16", a2.b, NULL, wrapped, p3);
+        tt_assert(!sg_failed(e3), "k_kv_store_f16 (nonzero offset): %s", e3.msg ? e3.msg : "ok");
+        if (!sg_failed(e3)) {
+            uint64_t mism_before = 0, mism_in = 0, mism_after = 0;
+            for (uint32_t i = 0; i < off; i++) if (dst.h[i] != (uint16_t)0xA5A5u) mism_before++;
+            for (uint32_t i = 0; i < n2; i++) {
+                if (dst.h[off + i] != sg_f32_to_f16(src[i])) mism_in++;
+            }
+            for (uint32_t i = off + n2; i < total; i++) {
+                if (dst.h[i] != (uint16_t)0xA5A5u) mism_after++;
+            }
+            tt_assert(mism_before == 0 && mism_in == 0 && mism_after == 0,
+                      "k_kv_store_f16 nonzero-offset store: %llu before / %llu wrong / "
+                      "%llu after the target region",
+                      (unsigned long long)mism_before, (unsigned long long)mism_in,
+                      (unsigned long long)mism_after);
+            if (mism_before == 0 && mism_in == 0 && mism_after == 0) {
+                fprintf(stderr, "   k_kv_store_f16 nonzero-offset store: exact, "
+                                "neighbors untouched\n");
+            }
+        }
+        sg_gpu_buf_free(wrapped);
+    }
+    gb_free(&a2); gb16_free(&dst);
+    free(src);
+}
+
+/* Gate 2: k_attn_decode_f16 == k_attn_decode fed the SAME inputs pre-rounded
+ * to f16, bit-identical, over 100 reruns. K and V are rounded to their f16
+ * value (still stored as f32) before either kernel sees them, so the f32
+ * oracle commits no rounding the f16 kernel's half storage did not already
+ * commit; widening half -> float back is exact, so the two must match bit
+ * for bit. Rerunning the f16 kernel 100 times against one fixed f32-oracle
+ * run proves determinism (all 100 runs equal) and equivalence (all 100 equal
+ * the oracle) in one pass. */
+static void metal_attn_decode_f16_matches_f32(void) {
+    const uint32_t n_heads = 8, n_kv = 2, hd = 128, seq = 300, q_stride = 2 * hd;
+    lcg_seed(0xA771Fu);
+
+    float *qg = xmalloc((size_t)n_heads * q_stride * sizeof *qg);
+    for (uint32_t i = 0; i < n_heads * q_stride; i++) qg[i] = lcg_next();
+
+    uint64_t kvn = (uint64_t)seq * n_kv * hd;
+    float *k32 = xmalloc(kvn * sizeof *k32), *v32 = xmalloc(kvn * sizeof *v32);
+    uint16_t *k16 = xmalloc(kvn * sizeof *k16), *v16 = xmalloc(kvn * sizeof *v16);
+    for (uint64_t i = 0; i < kvn; i++) {
+        k16[i] = sg_f32_to_f16(lcg_next() * 2.0f);
+        v16[i] = sg_f32_to_f16(lcg_next() * 2.0f);
+        k32[i] = sg_f16_to_f32(k16[i]);   /* the f16 rounding, widened back exactly */
+        v32[i] = sg_f16_to_f32(v16[i]);
+    }
+
+    float *kv32 = xmalloc(2 * kvn * sizeof *kv32);
+    memcpy(kv32, k32, kvn * sizeof *kv32);
+    memcpy(kv32 + kvn, v32, kvn * sizeof *kv32);
+
+    uint32_t out_n = n_heads * hd;
+    float scale = (float)(1.0 / sqrt((double)hd));
+
+    /* f32 oracle: the EXISTING k_attn_decode kernel, unmodified, over the
+     * old combined [K;V] buffer layout, fed the f16-rounded values. */
+    gbuf qb = gb_from(qg, (uint64_t)n_heads * q_stride);
+    gbuf kvb = gb_from(kv32, 2 * kvn);
+    gbuf ref = gb_new(out_n);
+    uint32_t pf32[8] = {n_heads, n_kv, hd, seq, q_stride, (uint32_t)kvn, f32_bits(scale), 0};
+    gb_poison(&ref);
+    bool ok = gpu_run("k_attn_decode", &qb, &kvb, &ref, pf32);
+    tt_assert(ok, "k_attn_decode (f32 oracle) failed");
+
+    /* f16 kernel: the SAME q, k, v values, but K/V in separate half buffers. */
+    gbuf qb2 = gb_from(qg, (uint64_t)n_heads * q_stride);
+    gbuf16 kb16 = gb16_new(kvn), vb16 = gb16_new(kvn);
+    memcpy(kb16.h, k16, kvn * sizeof(uint16_t));
+    memcpy(vb16.h, v16, kvn * sizeof(uint16_t));
+    gbuf o16 = gb_new(out_n);
+    uint32_t pf16[8] = {n_heads, n_kv, hd, seq, q_stride, f32_bits(scale), 0, 0};
+
+    float *first_run = xmalloc(out_n * sizeof *first_run);
+    uint64_t total_mismatch = 0;
+    if (ok) {
+        for (int rep = 0; rep < 100; rep++) {
+            gb_poison(&o16);
+            sg_err e = sg_gpu_run_attn_decode_f16(g_gpu, qb2.b, kb16.b, vb16.b, o16.b, pf16);
+            tt_assert(!sg_failed(e), "k_attn_decode_f16 rep %d: %s", rep, e.msg ? e.msg : "ok");
+            if (sg_failed(e)) break;
+            if (rep == 0) {
+                memcpy(first_run, o16.h, out_n * sizeof(float));
+                for (uint32_t i = 0; i < out_n; i++) if (o16.h[i] != ref.h[i]) total_mismatch++;
+            } else {
+                for (uint32_t i = 0; i < out_n; i++) if (o16.h[i] != first_run[i]) total_mismatch++;
+            }
+        }
+    }
+    tt_assert(total_mismatch == 0,
+              "k_attn_decode_f16: %llu bit-exact mismatches over 100 reruns "
+              "(vs the f32 oracle and vs itself)", (unsigned long long)total_mismatch);
+    if (total_mismatch == 0) {
+        fprintf(stderr, "   k_attn_decode_f16 vs k_attn_decode (f16-rounded inputs): "
+                        "bit-identical over 100 reruns\n");
+    }
+
+    free(first_run);
+    gb_free(&qb); gb_free(&kvb); gb_free(&ref);
+    gb_free(&qb2); gb16_free(&kb16); gb16_free(&vb16); gb_free(&o16);
+    free(qg); free(k32); free(v32); free(k16); free(v16); free(kv32);
+}
+
+/* --------------------------------------------------------------------
  * sg_gpu_wrap: the no-copy path a checkpoint mmap goes through
  * -------------------------------------------------------------------- */
 
@@ -1252,6 +1442,8 @@ int main(void) {
     tt_run("metal_delta_step_matches_ref", metal_delta_step_matches_ref);
     tt_run("metal_rmsnorm_gated_matches_ref", metal_rmsnorm_gated_matches_ref);
     tt_run("metal_attn_decode_matches_ref", metal_attn_decode_matches_ref);
+    tt_run("metal_kv_store_f16_roundtrips", metal_kv_store_f16_roundtrips);
+    tt_run("metal_attn_decode_f16_matches_f32", metal_attn_decode_f16_matches_f32);
     tt_run("metal_wrap_handles_page_offset", metal_wrap_handles_page_offset);
     tt_run("metal_reductions_are_deterministic", metal_reductions_are_deterministic);
     tt_run("metal_rejects_bad_arguments", metal_rejects_bad_arguments);

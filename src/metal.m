@@ -528,6 +528,15 @@ void *sg_gpu_buf_host(void *buf) {
     return (uint8_t *)[b->buf contents] + b->offset;
 }
 
+/* Task B2: current bytes allocated by this Metal device across every live
+ * buffer (MTLDevice.currentAllocatedSize) -- a snapshot, not a peak; callers
+ * sample it into an sg_mem_tracker (src/bench.c) to build one. 0 for a NULL
+ * g or g->dev, the same defensive-NULL convention as sg_gpu_buf_host above. */
+uint64_t sg_gpu_current_alloc_bytes(const sg_gpu *g) {
+    if (!g || !g->dev) return 0;
+    return (uint64_t)[g->dev currentAllocatedSize];
+}
+
 /* --------------------------------------------------------------------
  * Dispatch
  * -------------------------------------------------------------------- */

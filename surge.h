@@ -570,6 +570,13 @@ void sg_gpu_buf_free(void *buf);
 /* CPU pointer to a buffer's contents (offset applied), or NULL. */
 void *sg_gpu_buf_host(void *buf);
 
+/* Metal-only (src/metal.m; Task B2). Bytes currently allocated by this
+ * device across every live buffer (MTLDevice.currentAllocatedSize) -- a
+ * snapshot, not a peak. Task B2's peak-memory probe samples this alongside
+ * sg_proc_phys_footprint (below) into an sg_mem_tracker to build one. 0 if g
+ * or g->dev is NULL. */
+uint64_t sg_gpu_current_alloc_bytes(const sg_gpu *g);
+
 /* One-shot dispatch: encode `kernel`, commit, wait. `b` may be NULL for the
  * kernels whose table row above has no second input. Synchronous by design;
  * Task 10 is what batches a whole layer into one command buffer. */
@@ -1045,5 +1052,74 @@ sg_err sg_bench_extract_needles(const char *prompt, sg_bench_needle *out, uint32
  * empty city, for the association half) never matches. */
 void sg_bench_score_niah(const char *gen, const sg_bench_needle *needles, uint32_t n_needles,
                           uint32_t *retrieval_hits, uint32_t *assoc_hits);
+
+/* ---------------------------------------------------------------------
+ * Peak-memory probe (Task B2, src/bench.c + src/metal.m)
+ * ---------------------------------------------------------------------
+ *
+ * surge-bench (B5) needs a peak-RAM column comparable to mlx-lm/llama.cpp's
+ * in the 256K comparison: the highest value seen, over a run, of two
+ * signals -- the Metal device's currently allocated bytes
+ * (sg_gpu_current_alloc_bytes, Metal-only, declared above next to the rest
+ * of the buffer API) and the process's physical footprint
+ * (sg_proc_phys_footprint, below). phys_footprint is process-wide (code,
+ * stacks, every allocation, not just Metal's) and is the number that
+ * ultimately lands in sg_bench_row.peak_ram_gib, but tracking both catches
+ * more: a Metal-buffer leak that never shows up in phys_footprint (or an
+ * ordinary CPU-side leak next to a flat GPU allocator) is invisible to
+ * either signal alone.
+ *
+ * sg_mem_tracker is PURE C and unit-testable with no GPU: feed it numbers,
+ * it maxes them. The mach/Metal SAMPLING (sg_proc_phys_footprint here,
+ * sg_gpu_current_alloc_bytes in src/metal.m) is deliberately kept OUTSIDE
+ * the tracker, so tests/test_gpu_mem.c's tracker-math checks run
+ * deterministically under `make debug` (SURGE_NO_METAL) with no Metal and
+ * no mach call anywhere in that path, while the live probes stay
+ * guarded/live like the rest of the Metal surface. */
+
+/* Process physical footprint, in bytes: mach
+ * task_info(mach_task_self(), TASK_VM_INFO, ...)'s
+ * task_vm_info_data_t.phys_footprint. This is the same number Activity
+ * Monitor's "Memory" column and `footprint`/`vmmap` report: resident pages
+ * actually charged to this process (compressed memory counted, clean
+ * file-backed pages generally not). PURE C: mach syscalls only, no Metal,
+ * no Foundation. Returns 0 if task_info fails, or if the running kernel only
+ * supports the REV0 task_vm_info revision that predates phys_footprint
+ * (never crashes and never reads an uninitialized field; a 0 reading is a
+ * visibly wrong number a caller can catch, not a fabricated one).
+ *
+ * NOT reliably greater than sg_gpu_current_alloc_bytes for a REAL model.
+ * The task-load path (sg_gpu_load_model) wraps checkpoint weights with
+ * newBufferWithBytesNoCopy (no copy, see sg_gpu_wrap), and Metal's
+ * currentAllocatedSize counts a no-copy wrap at its full DECLARED length
+ * the instant it is created, regardless of how many of its pages are
+ * actually resident -- confirmed with a standalone 512 MiB mmap+wrap probe
+ * (reported size == the wrap length exactly, before touching a single
+ * page) and live against the real 2B (SURGE_GATE_MODEL=
+ * /Users/macmini/models/qwen35-2b): immediately after sg_gpu_load_model,
+ * sg_gpu_current_alloc_bytes read 3,768,385,536 bytes (the model's ~3.5 GiB
+ * of wrapped bf16 weights) while this function read only 10,683,616 bytes,
+ * since almost none of that mmap had been touched yet. The ordering DOES
+ * hold for tests/fixtures/mini_fwd (hidden=32, so its wrapped weights are a
+ * few KB, negligible next to the process's own baseline footprint) and
+ * should also hold again once decode has actually run (every matvec/GEMM
+ * kernel reads the weight rows it uses, which pages them in). tests/
+ * test_gpu_mem.c's phys_footprint_exceeds_gpu_alloc_after_load gate is
+ * therefore mini-fixture-only, not SURGE_GATE_MODEL-driven; a second,
+ * SURGE_GATE_MODEL-gated test observes (does not assert an ordering on) the
+ * real-model numbers instead. */
+uint64_t sg_proc_phys_footprint(void);
+
+/* A running max over two signals, sampled together: each call updates
+ * peak = max(peak, max(current_alloc, phys_footprint)). PURE C, no Metal,
+ * no mach -- feed it numbers, it maxes them, which is what makes it
+ * unit-exact under `make debug` with no GPU anywhere in the picture.
+ * sg_mem_tracker_reset zeroes peak; sg_mem_tracker_sample updates it;
+ * sg_mem_tracker_peak reads it. A NULL tracker is a no-op / reads back 0,
+ * matching this file's other defensive-NULL convention. */
+typedef struct { uint64_t peak; } sg_mem_tracker;
+void sg_mem_tracker_reset(sg_mem_tracker *t);
+void sg_mem_tracker_sample(sg_mem_tracker *t, uint64_t current_alloc, uint64_t phys_footprint);
+uint64_t sg_mem_tracker_peak(const sg_mem_tracker *t);
 
 #endif

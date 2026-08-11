@@ -11,6 +11,8 @@
 #include "surge.h"
 #include <ctype.h>
 #include <fcntl.h>
+#include <mach/mach.h>
+#include <mach/task_info.h>
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -374,4 +376,51 @@ void sg_bench_score_niah(const char *gen, const sg_bench_needle *needles, uint32
     if (assoc_hits) *assoc_hits = a_hits;
     fprintf(stderr, "bench: score_niah: retrieval=%u/%u assoc=%u/%u\n",
             r_hits, n_needles, a_hits, n_needles);
+}
+
+/* --------------------------------------------------------------------
+ * Task B2: peak-memory probe (process phys_footprint + the pure-C tracker).
+ * sg_gpu_current_alloc_bytes, the Metal half of the probe, lives in
+ * src/metal.m -- this file stays Metal-free, per the header comment.
+ * -------------------------------------------------------------------- */
+
+uint64_t sg_proc_phys_footprint(void) {
+    task_vm_info_data_t info;
+    memset(&info, 0, sizeof info);
+    mach_msg_type_number_t count = TASK_VM_INFO_COUNT;
+    kern_return_t kr = task_info(mach_task_self(), TASK_VM_INFO,
+                                 (task_info_t)&info, &count);
+    if (kr != KERN_SUCCESS) {
+        fprintf(stderr, "bench: proc_phys_footprint: task_info failed (kr=%d)\n", (int)kr);
+        return 0;
+    }
+    /* task_info's count is IN/OUT: on a kernel that only understands an
+     * older, shorter task_vm_info revision, it can return success with
+     * fewer natural_t words written than this SDK's full struct declares,
+     * leaving the tail (phys_footprint included) uninitialized past
+     * whatever the kernel actually filled in. TASK_VM_INFO_REV0_COUNT is
+     * the one revision that predates phys_footprint entirely ("doesn't
+     * include phys_footprint", mach/task_info.h); reject anything short of
+     * REV1 rather than read that field out of the memset(0) padding. */
+    if (count < TASK_VM_INFO_REV1_COUNT) {
+        fprintf(stderr, "bench: proc_phys_footprint: kernel returned rev0 task_vm_info "
+                        "(count=%u, no phys_footprint field)\n", (unsigned)count);
+        return 0;
+    }
+    return (uint64_t)info.phys_footprint;
+}
+
+void sg_mem_tracker_reset(sg_mem_tracker *t) {
+    if (!t) return;
+    t->peak = 0;
+}
+
+void sg_mem_tracker_sample(sg_mem_tracker *t, uint64_t current_alloc, uint64_t phys_footprint) {
+    if (!t) return;
+    uint64_t m = current_alloc > phys_footprint ? current_alloc : phys_footprint;
+    if (m > t->peak) t->peak = m;
+}
+
+uint64_t sg_mem_tracker_peak(const sg_mem_tracker *t) {
+    return t ? t->peak : 0;
 }

@@ -1508,3 +1508,91 @@ Gates (all pass):
 3. (C) prompt > cap rejected by the CLI (clear message + nonzero exit).
 4. make check (live Metal, mini-only, gate SKIPs without SURGE_GATE_MODEL) and
    make debug (SURGE_NO_METAL, ASan/UBSan) both exit 0, no sanitizer diagnostics.
+
+## Task B2 Results (metal.m + bench.c: peak-memory probe, Metal-only + pure C)
+
+EDIT `src/metal.m` (added `sg_gpu_current_alloc_bytes`, Metal-only), `src/bench.c` (added
+`sg_proc_phys_footprint` and the `sg_mem_tracker` type/functions, pure C), `surge.h` (decls,
+Metal-only vs pure-C documented on each), `Makefile` (new `METAL_HYBRID_TESTS` rule); NEW
+`tests/test_gpu_mem.c`.
+
+### What it does
+- `sg_gpu_current_alloc_bytes(g)` (`src/metal.m`, Metal-only): returns `g->dev.
+  currentAllocatedSize`, 0 for a NULL `g`/`g->dev`.
+- `sg_proc_phys_footprint(void)` (`src/bench.c`, pure C): mach `task_info(mach_task_self(),
+  TASK_VM_INFO, ...)`'s `phys_footprint`. Zero-inits the `task_vm_info_data_t` and rejects a
+  short `count` (`< TASK_VM_INFO_REV1_COUNT`, the revision that first added the field) before
+  trusting it, rather than reading whatever the memset left there; returns 0 on any `task_info`
+  failure.
+- `sg_mem_tracker` (`src/bench.c`, pure C, no Metal/mach in sight): `peak = max(peak,
+  max(current_alloc, phys_footprint))` on every `sg_mem_tracker_sample`; `_reset` zeroes it,
+  `_peak` reads it. Deliberately kept OUTSIDE the mach/Metal sampling so it is unit-testable
+  under `make debug` with no GPU anywhere in the picture.
+- `tests/test_gpu_mem.c` is two tiers in one file (unlike test_gpu_fwd.c/test_metal_ops.c, which
+  are bare skip stubs under `-DSURGE_NO_METAL`): tier 1 (the tracker) runs under both `make
+  check` and `make debug`; tier 2 (`#ifndef SURGE_NO_METAL`) is live Metal + mach. New Makefile
+  `METAL_HYBRID_TESTS` rule links `test_gpu_mem.bin` against `metal.m` + frameworks under check,
+  but only `LIB_SRC` (bench.c's tracker/phys_footprint, no metal.m) under debug, so tier 1 stays
+  linkable while Metal stays out of the ASan build.
+
+### Gate: PASSED. make check (live Metal) + make debug (ASan/UBSan, SURGE_NO_METAL) both exit 0.
+1. Tracker `max()` unit-exact over the gate's own sequence: (10,20)->20, (5,5)->still 20,
+   (100,3)->100, (0,0)->still 100, reset->0. Plus an order-independence check ((7,42) and (42,7)
+   both land on 42) and NULL-safety. Runs in both check and debug.
+2. Live: `sg_proc_phys_footprint() > sg_gpu_current_alloc_bytes()` after loading the mini
+   fixture (gpu_alloc ~1.28 MB, phys_footprint ~7 MB).
+3. Live: after `sg_kv_new` at a synthetic single-layer cfg (n_kv_heads=8, head_dim=128,
+   full_attn_interval=1) and cap=76800 (a MODEST cap, computed to land at exactly 300 MiB, not
+   the 16 GiB real-27B-shape number `tests/test_kv.c` asserts by pure math alone), the tracked
+   peak grows 100.0% of the computed budget (314,720,472 of 314,572,800 bytes).
+4. `make check` + `make debug` both exit 0, no sanitizer diagnostics, `-Wall -Wextra -Werror`
+   clean.
+
+### Deviations / fixes from live testing + codex gpt-5.5 review (applied before commit):
+- **Gate 2's ordering assertion is FALSE for a real model (major, fixed).** The task brief's
+  gate 2 as written ("after loading a model ... via SURGE_GATE_MODEL if set") assumes
+  `phys_footprint > gpu_alloc` generally. Verified live against the real 2B
+  (`SURGE_GATE_MODEL=/Users/macmini/models/qwen35-2b`): immediately after `sg_gpu_load_model`,
+  `gpu_alloc` read 3,768,385,536 bytes (the ~3.5 GiB of `newBufferWithBytesNoCopy`-wrapped bf16
+  weights) while `phys_footprint` read only 10,683,616 bytes -- the OPPOSITE of the assertion.
+  Root cause, confirmed with a standalone 512 MiB mmap+wrap Metal probe outside this codebase:
+  `MTLDevice.currentAllocatedSize` counts a no-copy wrap at its full DECLARED length the instant
+  it is created, regardless of how many pages are actually resident, while `phys_footprint` only
+  charges pages the kernel has actually resident-and-dirty-or-compressed for this process.
+  `phys_footprint_exceeds_gpu_alloc_after_load` is now MINI-FIXTURE-ONLY (weights ~KB, negligible
+  next to baseline footprint, ordering holds reliably); a new, separate, SURGE_GATE_MODEL-gated
+  `gpu_alloc_vs_phys_footprint_real_model_note` test observes the real-model numbers instead,
+  asserting only that both probes are nonzero (no false ordering claim). surge.h's
+  `sg_proc_phys_footprint` doc comment documents the full finding for whoever writes B5 next,
+  since it matters there too: `gpu_alloc` can vastly overstate true resident memory for a model
+  whose weights are still mostly unread.
+- **mach `task_info` short-count risk (minor, fixed).** `sg_proc_phys_footprint` did not check
+  `task_info`'s IN/OUT `count` against `TASK_VM_INFO_REV1_COUNT` before reading `phys_footprint`;
+  confirmed via the SDK header that `TASK_VM_INFO_REV0_COUNT`'s comment literally says "doesn't
+  include phys_footprint". Fixed: zero-init the struct, reject `count < TASK_VM_INFO_REV1_COUNT`.
+  Not reachable on this project's actual target (Apple Silicon, modern macOS), but cheap and
+  matches the codebase's general defensive-read style.
+- **Gate 3 only checked `budget > 0` (minor, fixed).** Now hard-asserts `budget ==
+  300ULL*1024*1024` exactly, so a future drift in the cfg/cap/`sg_kv_bytes` math that silently
+  changed the budget would fail loudly instead of the 90% growth check quietly proving less than
+  it claims.
+- **Cross-test wrapped-memory/model-pointer lifetime hazard (minor, fixed, self-caught after the
+  codex round).** Both gate 2 and the real-model note originally opened/closed their own
+  `sg_gguf`/`sg_st` and used a function-local `sg_model` per test function. `sg_gpu_load_model`
+  stores `g->model = m` (the raw pointer, not a copy) and calls `gpu_unload(g)` at the top of
+  every subsequent load; loading a second model after the first test returned would run
+  `gpu_unload` against buffers wrapping an already-closed mmap, and leaves `g->model` dangling
+  at a since-destroyed stack frame. Neither is dereferenced by anything this file currently
+  calls (gpu_unload only NULLs `g->model`, never reads through it), so this passed live both
+  before and after the fix, but it violated `sg_gpu_wrap`'s documented "wrapped memory must
+  outlive the handle" contract and deviated from test_gpu_fwd.c/test_gpu_prefill.c's established
+  pattern of keeping a loaded model alive for its whole window of use. Fixed by moving the model
+  + checkpoint handles to file-scope statics, freed once in `main()` after `sg_gpu_free`, so no
+  test added later between a load and the final free can trip this by construction.
+
+### Concerns for later tasks
+- B5 (surge-bench CLI) needs to decide how `sg_mem_tracker`'s peak feeds `sg_bench_row.
+  peak_ram_gib`: sampling only right after model load (as this task's gate 2 does) is not
+  representative for a real model, since `gpu_alloc` will read close to the full wrapped
+  checkpoint size before decode has touched most of it. Sampling across the whole run (prefill +
+  decode), not just at load, is what will make the two probes converge on a real peak.

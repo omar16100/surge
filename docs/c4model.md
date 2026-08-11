@@ -42,8 +42,8 @@ optionally Accelerate for the CPU reference path. No third-party libraries.
 | `src/model_qwen.c` | config extraction + weight-name mapping for the hybrid qwen3_5/qwen35 arch (full-attention + gated-DeltaNet layers), from GGUF and safetensors. Carries per-tensor dtype and the source-flags `ssm_a_form` / `v_heads_tiled`. |
 | `src/ref.c` | scalar CPU reference for every op (the correctness oracle), incl. `sg_ref_matvec_q8`, attention, gated-DeltaNet, partial RoPE, and the full forward pass. |
 | `src/kv.c` | (M5.1) fp16 growable KV cache for full-attention layers + fixed-size DeltaNet recurrent state, over opaque GPU-buffer handles; Metal-free (allocation injected). `sg_kv_bytes` = 16 GiB K+V at 262,144. Wired into decode by M5.2 (see below). |
-| `src/bench.c` | (B-series) pure-C benchmark math: decode-by-slope, leaderboard-row/JSON formatters, prompt file read, ingestion/truncation guard, NIAH recall scorer. |
-| `src/metal.m` | Metal device init, weight-buffer wrapping (mmap, no-copy; bf16/f32/Q8_0 sizing), per-weight matvec kernel dispatch (`matmul_kernel_for`), one command buffer per decode token, one command buffer per prefill chunk (`sg_gpu_prefill`, M5.6), kernel registration (KI_ enum + SG_KERNELS table + size/param checks). Registers itself as `sg_kv`'s allocation backend at init. Decode state: the DEFAULT full-attention KV cache is fp16, allocated through `sg_kv` as SEPARATE per-layer K/V buffers (M5.2, `SURGE_KV_DTYPE` env toggle); `SURGE_KV_DTYPE=f32` selects the original combined-buffer f32 path unchanged, kept so the M2 gate's oracle never moves. DeltaNet conv/S state stays on its pre-M5.1 ad hoc allocation for decode; prefill (M5.6) threads DeltaNet state through `sg_kv`'s conv/S carriers (so `g->kv` is now allocated for any DeltaNet model on the f16 path) and bridges the final state back into the ad hoc buffers when it finishes. |
+| `src/bench.c` | (B-series) pure-C benchmark math: decode-by-slope, leaderboard-row/JSON formatters, prompt file read, ingestion/truncation guard, NIAH recall scorer, process `phys_footprint` probe + the `sg_mem_tracker` peak-max tracker (B2). |
+| `src/metal.m` | Metal device init, weight-buffer wrapping (mmap, no-copy; bf16/f32/Q8_0 sizing), per-weight matvec kernel dispatch (`matmul_kernel_for`), one command buffer per decode token, one command buffer per prefill chunk (`sg_gpu_prefill`, M5.6), kernel registration (KI_ enum + SG_KERNELS table + size/param checks), `sg_gpu_current_alloc_bytes` (B2, `MTLDevice.currentAllocatedSize`). Registers itself as `sg_kv`'s allocation backend at init. Decode state: the DEFAULT full-attention KV cache is fp16, allocated through `sg_kv` as SEPARATE per-layer K/V buffers (M5.2, `SURGE_KV_DTYPE` env toggle); `SURGE_KV_DTYPE=f32` selects the original combined-buffer f32 path unchanged, kept so the M2 gate's oracle never moves. DeltaNet conv/S state stays on its pre-M5.1 ad hoc allocation for decode; prefill (M5.6) threads DeltaNet state through `sg_kv`'s conv/S carriers (so `g->kv` is now allocated for any DeltaNet model on the f16 path) and bridges the final state back into the ad hoc buffers when it finishes. |
 | `src/kernels.metal` | deterministic Metal kernels: decode-step ones fold a fixed reduction tree (no atomics/simd_sum) -- bf16/f32/Q8_0 matvec, attention decode (f32-KV `k_attn_decode` and fp16-KV `k_attn_decode_f16`, M5.2), a decode-step fp16 store (`k_kv_store_f16`, M5.2), gated-DeltaNet decode, RoPE, RMSNorm, SwiGLU. Prefill's tiled GEMM (M5.3, `k_matmul_bf16`/`k_matmul_f32`/`k_matmul_q8`, `Y[N,M]=X[N,K]@W[M,K]^T`) uses a different determinism mechanism: one thread per output element of a 16x16 output tile, a private serial K-loop, no cross-thread reduction at all (nothing to fold). Full-attention prefill (M5.4) adds `k_rope_chunk` (partial RoPE over a whole chunk) and `k_attn_prefill` (causal chunk attention over the fp16 KV cache, one threadgroup per (query token, query head), same fixed-tree softmax as `k_attn_decode_f16`). DeltaNet prefill (M5.5) adds `k_conv1d_chunk` / `k_delta_gates_chunk` / `k_delta_chunk` / `k_rmsnorm_gated_chunk`: a whole chunk of N tokens through one DeltaNet layer via a SEQUENTIAL within-chunk scan (per-token loop inside the kernel, threading the conv tail + S matrix), bit-identical to the matching decode kernel looped over the chunk. |
 | `src/cli_*.c` | the four CLI mains. |
 
@@ -153,8 +153,22 @@ optionally Accelerate for the CPU reference path. No third-party libraries.
     (live GPU, env-gated); the C test SKIPs cleanly without `SURGE_GATE_MODEL`, so
     `make check` stays mini-only and hermetic. Public `sg_gpu_used` added so the gate reads
     the used counter without reaching into the opaque `sg_gpu`. M5 COMPLETE.
-  - Bench harness: B1/B3/B4 (pure C) done; B2/B5/B6 (Metal/CLI) and B7 (gated 256K run)
-    pending.
+  - Bench harness: B1/B3/B4 (pure C) and B2 (peak-memory probe) done; B5/B6 (Metal/CLI)
+    and B7 (gated 256K run) pending. B2: `sg_gpu_current_alloc_bytes` (Metal-only,
+    `MTLDevice.currentAllocatedSize`) + `sg_proc_phys_footprint` (pure C, mach
+    `task_info`/`TASK_VM_INFO`) feed a pure-C `sg_mem_tracker` (`peak =
+    max(peak, max(current_alloc, phys_footprint))`), unit-tested deterministically under
+    `make debug` with no Metal/mach in that path. Live-verified: `phys_footprint >
+    current_alloc` after loading the mini fixture (small wrapped weights), and the
+    tracked peak grows to 100% of a computed 300 MiB fp16-KV budget after `sg_kv_new`.
+    Important finding for B5: `sg_gpu_current_alloc_bytes` counts a `newBufferWithBytes
+    NoCopy`-wrapped checkpoint (every matmul weight) at its full declared length the
+    instant it is wrapped, regardless of page residency -- on the real 2B, gpu_alloc read
+    3.5 GiB immediately after load while phys_footprint read only ~10 MiB, so B5 should
+    not treat "right after load" as a representative peak-RAM sample; sampling across a
+    full prefill+decode run (which pages in the weights it actually reads) is what makes
+    the two probes converge on a real number. See `todo.md`'s Task B2 Results for the
+    full writeup.
 - **Not built:** M4 (kernel excellence / beat mlx-lm), server mode, non-Metal platforms,
   MoE, continuous batching, sampling beyond greedy/temp/top-p/top-k.
 

@@ -44,13 +44,24 @@ $(METALLIB): src/kernels.metal
 # these sources compile down to a skip notice, so nothing Metal is built or
 # linked and ASan's MallocStackLogging never meets the driver.
 METAL_TESTS = tests/test_metal_ops.bin tests/test_gpu_fwd.bin tests/test_gpu_prefill.bin
+
+# tests/test_gpu_mem.bin (Task B2) is METAL-AWARE but not METAL-ONLY like the
+# three above: its tier-1 pure-C tracker checks must actually RUN (not skip)
+# under `make debug`, unlike test_metal_ops.c/test_gpu_fwd.c/test_gpu_prefill.c,
+# whose whole file collapses to a bare stub under -DSURGE_NO_METAL. So under
+# `check` it needs metal.m + the frameworks exactly like METAL_TESTS; under
+# `debug` it needs LIB_SRC (for src/bench.c's tracker + sg_proc_phys_footprint)
+# but NOT metal.m/the frameworks, so Metal still stays out of the ASan run.
+METAL_HYBRID_TESTS = tests/test_gpu_mem.bin
 ifeq (,$(findstring SURGE_NO_METAL,$(CFLAGS)))
-$(METAL_TESTS): tests/%.bin: tests/%.c $(LIB_SRC) src/metal.m $(METALLIB)
+$(METAL_TESTS) $(METAL_HYBRID_TESTS): tests/%.bin: tests/%.c $(LIB_SRC) src/metal.m $(METALLIB)
 	$(CC) $(CFLAGS) $(METAL_DEFS) -o $@ src/metal.m $< \
 	  $(LIB_SRC) $(FRAMEWORKS) $(LDLIBS)
 else
 $(METAL_TESTS): tests/%.bin: tests/%.c
 	$(CC) $(CFLAGS) -o $@ $<
+$(METAL_HYBRID_TESTS): tests/%.bin: tests/%.c $(LIB_SRC)
+	$(CC) $(CFLAGS) -o $@ $< $(LIB_SRC) $(LDLIBS)
 endif
 
 # `surge` (Task 10): the Metal decode path, with --ref selecting the scalar

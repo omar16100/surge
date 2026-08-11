@@ -369,14 +369,26 @@ int main(int argc, char **argv) {
     fprintf(stderr, "bench: n_prompt_tokens=%llu (bos=%s)\n",
             (unsigned long long)n_ids, bos_enabled ? "on" : "off");
 
-    /* ---- context cap (M5.7 semantics: --max-ctx is a HARD cap) ---- */
+    /* ---- context cap (M5.7 semantics: --max-ctx is a HARD cap) ----
+     * PREFLIGHT, mirroring cli_metal.c: a prompt (plus the tokens it asks to
+     * generate) that does not fit the cap is HARD-REJECTED here (exit 1, no
+     * gen_ids), never truncated mid-run and then reported DONE. This keeps the
+     * "surge-bench gen_ids == surge" guarantee in B7's regime (prompt near the
+     * 262144 cap, -n 300): both binaries refuse the same runs and generate the
+     * full -n on the ones they accept, so neither ever truncates. B7's recipe
+     * must therefore leave >= n_gen tokens of headroom under --max-ctx. */
     uint32_t max_ctx = max_ctx_arg ? max_ctx_arg : 262144u;
     if (n_ids > max_ctx) {
-        /* Not a hard error: an over-cap prompt is exactly the truncation the
-         * ingestion guard exists to catch, so let it fall through to a VOID
-         * row rather than aborting. Clamp the GPU cache request to the cap. */
-        fprintf(stderr, "surge-bench: prompt is %llu tokens but --max-ctx is %u; row will VOID\n",
+        fprintf(stderr, "surge-bench: prompt is %llu tokens but --max-ctx is %u; "
+                        "the prompt exceeds the context cap\n",
                 (unsigned long long)n_ids, max_ctx);
+        goto done;
+    }
+    if ((uint64_t)n_ids + n_gen > max_ctx) {
+        fprintf(stderr, "surge-bench: %llu prompt + %u generated tokens exceeds "
+                        "--max-ctx %u; raise --max-ctx or lower -n\n",
+                (unsigned long long)n_ids, n_gen, max_ctx);
+        goto done;
     }
 
     /* ---- build the row skeleton + the two gates ---- */
@@ -388,7 +400,7 @@ int main(int argc, char **argv) {
     snprintf(row.engine, sizeof row.engine, "%s", engine);
     if (log_id) snprintf(row.log_id, sizeof row.log_id, "%s", log_id);
     row.n_prompt_tok = n_ids;
-    row.n_gen = n_gen;
+    row.n_gen = 0;               /* set to the ACTUAL produced count after decode */
     row.prefill_tps = -1.0;      /* "-" until measured */
     row.recall_total = 0;
     row.gemm_tflops = gemm_tflops;
@@ -397,9 +409,10 @@ int main(int argc, char **argv) {
     uint64_t emax = has_expect_max ? expect_max : (uint64_t)max_ctx;
     sg_bench_check_ingestion(n_ids, max_ctx, emin, emax, &row.ingestion_ok);
 
-    /* VOID short-circuit: a failed gate costs a tokenize, not a model load. */
-    bool admitted = (row.gemm_tflops > 20.5) && row.ingestion_ok;
-    if (!admitted) {
+    /* VOID short-circuit: a failed gate costs a tokenize, not a model load.
+     * Uses the SAME predicate sg_bench_finalize_status applies, so the pre-load
+     * decision and the final status can never disagree. */
+    if (!sg_bench_admitted(&row)) {
         sg_bench_finalize_status(&row);   /* sets status = "VOID" */
         rc = (emit_row(&row, json_path) == 0) ? 3 : 1;
         goto done;
@@ -470,6 +483,7 @@ int main(int argc, char **argv) {
         if (!quiet) fprintf(stderr, "\n");
     }
     row.wall_s = now_s() - t_run_start;
+    row.n_gen = produced;   /* the ACTUAL number generated (EOS may stop early) */
     sample_mem(gpu, &mt_phys, &mt_alloc);      /* after decode */
 
     /* ---- decode-by-slope + mlx-style average ---- */
@@ -496,7 +510,10 @@ int main(int argc, char **argv) {
         size_t gcap = (size_t)produced * 64 + 1024;
         char *gen_text = malloc(gcap);
         if (gen_text) {
-            int64_t got = sg_tok_decode(tok, gen, produced, gen_text, gcap);
+            /* Pass gcap - 1: sg_tok_decode permits written == its cap exactly,
+             * so bounding it to gcap-1 keeps the gen_text[got]='\0' below inside
+             * the gcap-byte allocation (never one past it). */
+            int64_t got = sg_tok_decode(tok, gen, produced, gen_text, gcap - 1);
             if (got >= 0) {
                 gen_text[got] = '\0';
                 uint32_t rh = 0, ah = 0;

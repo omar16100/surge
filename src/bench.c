@@ -78,9 +78,13 @@ uint32_t sg_bench_default_warmup(uint32_t n_gen) {
     return (uint32_t)w;
 }
 
+bool sg_bench_admitted(const sg_bench_row *row) {
+    return row && (row->gemm_tflops > SG_BENCH_GEMM_MIN_TFLOPS) && row->ingestion_ok;
+}
+
 void sg_bench_finalize_status(sg_bench_row *row) {
     if (!row) return;
-    bool ok = (row->gemm_tflops > 20.5) && row->ingestion_ok;
+    bool ok = sg_bench_admitted(row);
     snprintf(row->status, sizeof row->status, "%s", ok ? "DONE" : "VOID");
     fprintf(stderr, "bench: status=%s (gemm_tflops=%.2f ingestion_ok=%s)\n",
             row->status, row->gemm_tflops, row->ingestion_ok ? "true" : "false");

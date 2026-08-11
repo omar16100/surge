@@ -332,9 +332,19 @@ static void test_finalize_status(void) {
         tt_assert(strcmp(row.status, cases[i].want) == 0,
                   "%s: gemm=%.7f ok=%d -> got %s want %s",
                   cases[i].note, cases[i].gemm, cases[i].ok, row.status, cases[i].want);
+
+        /* sg_bench_admitted is the shared predicate finalize_status and
+         * surge-bench's pre-load short-circuit both use: it must agree with
+         * the status the finalize just wrote, case for case, so the two paths
+         * cannot desync. */
+        bool admitted = sg_bench_admitted(&row);
+        tt_assert(admitted == (strcmp(cases[i].want, "DONE") == 0),
+                  "%s: admitted=%d disagrees with status %s",
+                  cases[i].note, admitted, row.status);
     }
-    /* NULL row must not crash. */
+    /* NULL row must not crash (both entry points). */
     sg_bench_finalize_status(NULL);
+    tt_assert(!sg_bench_admitted(NULL), "NULL row is not admitted");
 }
 
 /* --------------------------------------------------------------------

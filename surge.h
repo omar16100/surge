@@ -942,10 +942,22 @@ void sg_bench_format_md_row(const sg_bench_row *row, char *buf, size_t cap);
  * formatter. */
 void sg_bench_format_json(const sg_bench_row *row, char *buf, size_t cap);
 
-/* Applies the leaderboard admission rule in place: status = "DONE" iff
- * gemm_tflops > 20.5 AND ingestion_ok, else "VOID". This is the ONE place
- * that rule lives; callers (B5's CLI, B7's recipe) must call this rather
- * than setting status themselves. */
+/* The GEMM-gate floor: a row is admissible only when its measured GEMM
+ * throughput clears this (strictly). One named constant so the pre-load
+ * short-circuit in surge-bench and the post-run status can never desync from
+ * a bare literal. */
+#define SG_BENCH_GEMM_MIN_TFLOPS 20.5
+
+/* The leaderboard admission rule, as a pure predicate: true iff
+ * gemm_tflops > SG_BENCH_GEMM_MIN_TFLOPS AND ingestion_ok (false for a NULL
+ * row). This is the ONE place the rule's LOGIC lives; sg_bench_finalize_status
+ * is defined in terms of it, and surge-bench calls it for its pre-load
+ * VOID short-circuit so the two cannot drift. */
+bool sg_bench_admitted(const sg_bench_row *row);
+
+/* Applies the admission rule in place: status = "DONE" iff sg_bench_admitted,
+ * else "VOID". This is the ONE place that WRITES status; callers (B5's CLI,
+ * B7's recipe) must call this rather than setting status themselves. */
 void sg_bench_finalize_status(sg_bench_row *row);
 
 /* ---------------------------------------------------------------------

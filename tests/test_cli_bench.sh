@@ -126,6 +126,37 @@ else
     echo "  ok admit: passing gate -> exit 0, DONE row" >&2
 fi
 
+# (finding 1) row.n_gen reports the ACTUAL produced count, consistent with the
+# gen_ids line: a DONE run of -n 4 must report n_gen==4 in JSON and print 4 ids.
+ncase=$((ncase + 1))
+tmpjson="$(mktemp)"
+ng_out="$("$BENCH" "$GGUF" --ids "$IDS12" -n 4 --max-ctx 512 --gemm-gate-tflops 100 --json "$tmpjson" --quiet 2>/dev/null)"
+gen_count="$(printf '%s' "$ng_out" | sed -n 's/^gen_ids: //p' | awk -F, 'NF{print NF}')"
+json_ng="$(sed -n 's/.*"n_gen":\([0-9][0-9]*\).*/\1/p' "$tmpjson")"
+rm -f "$tmpjson"
+if [ "$json_ng" != "4" ] || [ "$gen_count" != "4" ]; then
+    echo "FAIL n_gen: json n_gen='$json_ng' gen_ids count='$gen_count' (want 4/4)" >&2
+    fail=1
+else
+    echo "  ok n_gen: json n_gen=$json_ng == gen_ids count=$gen_count" >&2
+fi
+
+# (finding 2) prompt + n_gen exceeding --max-ctx must NOT silently DONE: it is
+# hard-rejected (parity with surge), never truncated then reported complete.
+# IDS12 is 12 tokens; -n 10 --max-ctx 12 => 22 > 12.
+ncase=$((ncase + 1))
+of_out="$("$BENCH" "$GGUF" --ids "$IDS12" -n 10 --max-ctx 12 --gemm-gate-tflops 100 --quiet 2>/dev/null)"
+of_rc=$?
+if [ "$of_rc" -eq 0 ]; then
+    echo "FAIL overflow: prompt+gen > max-ctx returned exit 0 (silent DONE)" >&2
+    fail=1
+elif printf '%s' "$of_out" | grep -q "DONE"; then
+    echo "FAIL overflow: emitted a DONE row despite exceeding max-ctx: $of_out" >&2
+    fail=1
+else
+    echo "  ok overflow: prompt+gen > max-ctx refused (rc=$of_rc, no DONE)" >&2
+fi
+
 # ------------------------------------------------------------------
 # (3) BOS toggle (env-gated): --bos vs --no-bos changes n_prompt_tokens by 1.
 # ------------------------------------------------------------------

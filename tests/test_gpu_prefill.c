@@ -315,8 +315,12 @@ static void mini_gguf_prefill(void) {
  * directly, since none of the CLI-level B8 gates (tests/test_cli_bench.sh)
  * ever drive a failing sg_gpu_prefill call: a successful rested prefill must
  * report > 0ms slept, and a SUBSEQUENT prefill call that fails validation
- * before the chunk loop even starts (here: n_tokens == 0, rejected up front)
- * must report exactly 0, not the prior call's stale nonzero value.
+ * must report exactly 0, not the prior call's stale nonzero value -- checked
+ * on TWO distinct early-return paths: n_tokens == 0 (rejected after the
+ * NULL-argument check, before the chunk loop) and a NULL model pointer
+ * (rejected by the m/tokens NULL check itself, the exact path a round-1
+ * coordinator review flagged as returning before the reset in a prior
+ * version of this code).
  */
 static void prefill_rest_reset_on_error(void) {
     size_t n_ids = 0;
@@ -362,6 +366,29 @@ static void prefill_rest_reset_on_error(void) {
                       "time (%llu ms) carried over from the PRIOR successful "
                       "call (%llu ms) instead of resetting to 0",
                       (unsigned long long)rest2, (unsigned long long)rest1);
+
+            /* (Round 1 fix) The pre-fix `if (!g || !m || !tokens) return ...`
+             * returned BEFORE the reset whenever g was valid but m/tokens were
+             * NULL, so a call like the one below would have reported rest3's
+             * stale value instead of 0. Prime a fresh nonzero rest total, then
+             * confirm a NULL-m call (rejected by the m/tokens check, which now
+             * runs strictly AFTER the reset) still zeroes it. */
+            e = sg_gpu_prefill(g_gpu, &m, ids, (uint32_t)n_ids, 1, &lg);
+            tt_assert(!sg_failed(e), "b8: second rested prefill (priming for "
+                      "the NULL-m check): %s", e.msg ? e.msg : "ok");
+            uint64_t rest3 = sg_gpu_prefill_rest_ms(g_gpu);
+            tt_assert(rest3 > 0, "b8: priming rested prefill reported 0ms "
+                      "slept (cannot test the NULL-m reset without a nonzero "
+                      "rest total to clear)");
+
+            e = sg_gpu_prefill(g_gpu, NULL, ids, (uint32_t)n_ids, 1, &lg);
+            tt_assert(sg_failed(e), "b8: NULL m should be rejected, was accepted");
+            uint64_t rest4 = sg_gpu_prefill_rest_ms(g_gpu);
+            tt_assert(rest4 == 0, "b8: a FAILED prefill call (NULL m, rejected "
+                      "by the m/tokens NULL check) reported stale rest time "
+                      "(%llu ms) carried over from the PRIOR successful call "
+                      "(%llu ms) instead of resetting to 0",
+                      (unsigned long long)rest4, (unsigned long long)rest3);
 
             /* Disarm so no later test in this process pays the sleep. */
             sg_gpu_set_prefill_rest(g_gpu, 0, 0);

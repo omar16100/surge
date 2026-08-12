@@ -2820,14 +2820,17 @@ uint64_t sg_gpu_prefill_rest_ms(const sg_gpu *g) {
 sg_err sg_gpu_prefill(sg_gpu *g, const sg_model *m, const int32_t *tokens,
                       uint32_t n_tokens, uint32_t chunk_size,
                       const float **out_last_logits) {
-    if (!g || !m || !tokens) return (sg_err){"gpu: sg_gpu_prefill got a NULL argument"};
-    /* Task B8: reset the rest-time counter FIRST, before any of the argument/
-     * state validation below can return early. sg_gpu_prefill_rest_ms's
-     * contract is "the most recent call", and a failed call (bad args, wrong
-     * KV dtype, oversized chunk, allocation failure) is still a call: without
-     * this early reset it would otherwise still report whatever a PRIOR
+    if (!g) return (sg_err){"gpu: sg_gpu_prefill got a NULL argument"};
+    /* Task B8: reset the rest-time counter as the very first thing once g is
+     * known non-NULL, before ANY other validation (including the m/tokens
+     * NULL check right below) can return early. sg_gpu_prefill_rest_ms's
+     * contract is "the most recent call", and a failed call (NULL m/tokens,
+     * bad args, wrong KV dtype, oversized chunk, allocation failure) is still
+     * a call: without this reset being unconditionally first, a call that
+     * fails validation would otherwise still report whatever a PRIOR
      * successful call slept, which is stale and misleading. */
     g->prefill_rest_total_ms = 0;
+    if (!m || !tokens) return (sg_err){"gpu: sg_gpu_prefill got a NULL argument"};
     if (!g->have_state) return (sg_err){"gpu: call sg_gpu_state_new first"};
     if (m != g->model) return (sg_err){"gpu: this gpu was loaded with a different sg_model"};
     const sg_cfg *c = &g->cfg;

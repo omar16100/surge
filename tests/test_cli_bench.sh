@@ -528,9 +528,85 @@ PYEOF
     rm -rf "$b6_tmpdir"
 fi
 
+# ------------------------------------------------------------------
+# B8: prefill duty-cycle (firmware GPU-clamp mitigation).
+#
+#   (1) RESTS DON'T CHANGE OUTPUT: a forced-rest run (--prefill-work-ms 1
+#       --prefill-rest-ms 50, so the tiny 1ms budget forces a rest at nearly
+#       every chunk boundary) must produce gen_ids BYTE-IDENTICAL to the same
+#       run with the feature off. --chunk 1 on the 12-token IDS12 gives 11
+#       inter-chunk boundaries, so this exercises many rests, not zero or
+#       one. rest_ms stays tiny (50ms) per the task brief so this stays fast
+#       even with 11 rests (~0.55s of sleep, negligible next to the rest of
+#       this script).
+#   (2) REST ACCOUNTING: with IDS12 (12 tokens) and --chunk 1, the prefill
+#       runs exactly 12 chunks, 11 of which have a chunk after them -- so a
+#       correct work_budget_ms=1/rest_ms=50 run rests at EVERY one of those
+#       11 boundaries (each chunk's own GPU-busy time already exceeds the 1ms
+#       budget on this hardware) and NEVER at the 12th (last chunk, no rest
+#       after it). That makes the expected total exact, not just "some rest
+#       happened": prefill_rest_s must land within B8_REST_TOL_S of
+#       B8_EXPECT_RESTS * 0.050s. This is decisive against a buggy
+#       accumulator/threshold/reset (which would rest a different number of
+#       times, landing off by a whole 50ms multiple, well outside the
+#       tolerance) in a way a bare ">0" check is not. prefill_compute_tps
+#       (rest excluded from the denominator) must also exceed prefill_tps
+#       (plain wall-clock, rest included) for the same run.
+# ------------------------------------------------------------------
+B8_CHUNK=1
+B8_EXPECT_RESTS=11     # 12 chunks (12 tokens / chunk 1) - 1 (no rest after the last)
+B8_REST_MS=50
+B8_REST_TOL_S=0.03
+
+ncase=$((ncase + 1))
+b8_off="$(bench_gen "$GGUF" --ids "$IDS12" -n 16 --max-ctx 512 --chunk "$B8_CHUNK")"
+b8_rest="$(bench_gen "$GGUF" --ids "$IDS12" -n 16 --max-ctx 512 --chunk "$B8_CHUNK" \
+    --prefill-work-ms 1 --prefill-rest-ms "$B8_REST_MS")"
+if [ -z "$b8_off" ] || [ -z "$b8_rest" ]; then
+    echo "FAIL b8 rests-dont-change-output: empty gen_ids (off='$b8_off' rest='$b8_rest')" >&2
+    fail=1
+elif [ "$b8_off" != "$b8_rest" ]; then
+    echo "FAIL b8 rests-dont-change-output: forced-rest gen_ids != feature-off gen_ids" >&2
+    echo "  off : $b8_off" >&2
+    echo "  rest: $b8_rest" >&2
+    fail=1
+else
+    echo "  ok b8 rests-dont-change-output: gen_ids=$b8_rest" >&2
+fi
+
+ncase=$((ncase + 1))
+b8_json="$(mktemp)"
+"$BENCH" "$GGUF" --ids "$IDS12" -n 16 --max-ctx 512 --chunk "$B8_CHUNK" \
+    --prefill-work-ms 1 --prefill-rest-ms "$B8_REST_MS" --gemm-gate-tflops 100 \
+    --json "$b8_json" --quiet >/dev/null 2>/dev/null
+b8_rest_s="$(sed -n 's/.*"prefill_rest_s":\([0-9.eE+-]*\).*/\1/p' "$b8_json")"
+b8_wall_tps="$(sed -n 's/.*"prefill_tps":\([0-9.eE+-]*\).*/\1/p' "$b8_json")"
+b8_compute_tps="$(sed -n 's/.*"prefill_compute_tps":\([0-9.eE+-]*\).*/\1/p' "$b8_json")"
+rm -f "$b8_json"
+if [ -z "$b8_rest_s" ] || [ -z "$b8_wall_tps" ] || [ -z "$b8_compute_tps" ]; then
+    echo "FAIL b8 rest-accounting: could not read JSON fields (rest_s='$b8_rest_s' " \
+         "wall_tps='$b8_wall_tps' compute_tps='$b8_compute_tps')" >&2
+    fail=1
+else
+    b8_expect_s="$(awk -v n="$B8_EXPECT_RESTS" -v r="$B8_REST_MS" 'BEGIN { print n * r / 1000.0 }')"
+    b8_ok="$(awk -v got="$b8_rest_s" -v want="$b8_expect_s" -v tol="$B8_REST_TOL_S" \
+        -v w="$b8_wall_tps" -v c="$b8_compute_tps" \
+        'BEGIN { d = got - want; if (d < 0) d = -d;
+                 print (d <= tol && c > w) ? "1" : "0" }')"
+    if [ "$b8_ok" != "1" ]; then
+        echo "FAIL b8 rest-accounting: prefill_rest_s=$b8_rest_s, want $b8_expect_s " \
+             "+/- $B8_REST_TOL_S ($B8_EXPECT_RESTS rests * ${B8_REST_MS}ms); " \
+             "prefill_compute_tps=$b8_compute_tps vs prefill_tps=$b8_wall_tps (want compute > wall)" >&2
+        fail=1
+    else
+        echo "  ok b8 rest-accounting: prefill_rest_s=$b8_rest_s (want $b8_expect_s +/- " \
+             "$B8_REST_TOL_S), prefill_tps=$b8_wall_tps prefill_compute_tps=$b8_compute_tps" >&2
+    fi
+fi
+
 if [ "$fail" -ne 0 ]; then
     echo "test_cli_bench: FAILED ($ncase cases)" >&2
     exit 1
 fi
-echo "test_cli_bench: $ncase cases passed (gen_ids parity, VOID/exit-3, admit, $b6_label)" >&2
+echo "test_cli_bench: $ncase cases passed (gen_ids parity, VOID/exit-3, admit, $b6_label, B8 duty-cycle)" >&2
 exit 0

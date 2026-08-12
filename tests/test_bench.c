@@ -231,6 +231,9 @@ static void test_format_json(void) {
     row.prefill_tps = 46.0;
     row.decode_tps_slope = 3.64;
     row.decode_tps_avg = 3.60123;
+    row.prefill_wall_s = 5700.0;
+    row.prefill_rest_s = 5400.0;         /* Task B8 */
+    row.prefill_compute_tps = 873.13;    /* Task B8 */
     row.peak_ram_gib = 75.5;
     row.gpu_alloc_gib = 70.25;
     row.recall_hits = 2;
@@ -263,6 +266,9 @@ static void test_format_json(void) {
     CHECK_D("\"prefill_tps\":", row.prefill_tps);
     CHECK_D("\"decode_tps_slope\":", row.decode_tps_slope);
     CHECK_D("\"decode_tps_avg\":", row.decode_tps_avg);
+    CHECK_D("\"prefill_wall_s\":", row.prefill_wall_s);
+    CHECK_D("\"prefill_rest_s\":", row.prefill_rest_s);         /* Task B8 */
+    CHECK_D("\"prefill_compute_tps\":", row.prefill_compute_tps); /* Task B8 */
     CHECK_D("\"peak_ram_gib\":", row.peak_ram_gib);
     CHECK_D("\"gpu_alloc_gib\":", row.gpu_alloc_gib);
     CHECK_D("\"wall_s\":", row.wall_s);

@@ -1685,3 +1685,72 @@ Metal-only vs pure-C documented on each), `Makefile` (new `METAL_HYBRID_TESTS` r
   BOS) unaffected -- no existing check was touched, weakened, or reordered. Full measurements and
   the two-run-shape / check-4-redesign rationale are in
   `.superpowers/sdd/2026-08-09-surge-m3-m5/task-B6-report.md`.
+
+## Task B8 Results (metal.m/cli_bench.c: prefill duty-cycle, firmware GPU-clamp mitigation)
+
+- WHY: the B7 27B/256K prefill run HUNG. surge's `sg_gpu_prefill` submits one chunk command
+  buffer after another with no gap, so on a long enough prefill the Mac Studio M3's firmware GPU
+  limiter (clamps to 338 MHz after ~3-4 min of sustained load, recovers only after 60-120s of
+  genuine idle) never gets a chance to release, and a later chunk stalls under the clamp. A
+  diagnostic 1536-token 27B prefill (fits inside the pre-clamp window) completed correctly, so the
+  pipeline itself was right; the fix is purely about letting the GPU go idle periodically.
+- NEW `sg_gpu_set_prefill_rest(sg_gpu *g, uint32_t work_budget_ms, uint32_t rest_ms)` (surge.h /
+  metal.m): arms a duty cycle on `g`. Either argument 0 (the calloc default) is DISABLED --
+  `sg_gpu_prefill` never sleeps and its OUTPUT (gen_ids, logits, KV/decode state, `g->used`) is
+  byte-identical to before this task (the chunk loop's two extra `clock_gettime` reads per chunk
+  still run either way, but feed only rest accounting, nothing output-affecting).
+- In `sg_gpu_prefill`'s chunk loop: `t_gpu0`/`t_gpu1` bracket exactly the `commit`..
+  `waitUntilCompleted` span (the GPU-busy interval, not the host-side encode); after
+  `waitUntilCompleted` returns (GPU idle at that instant), `g->used += n` / `sg_kv_advance`, and
+  the progress log, a local `pf_work_acc_ms` accumulates that span. Once it reaches
+  `work_budget_ms` AND at least one chunk remains (never rests after the final chunk), a new
+  `pf_sleep_ms(uint32_t ms)` helper sleeps `rest_ms` with NO command buffer in flight, then the
+  accumulator resets. `pf_sleep_ms` uses `nanosleep` in an EINTR-retry loop (not bare `usleep`) so
+  a stray signal cannot silently truncate a real 90s rest and quietly defeat the whole mitigation.
+- PURE TIMING, proven not just asserted: the rest/accumulator code reads or writes nothing that
+  feeds the computed output -- only a loop-local `pf_work_acc_ms` and `g->prefill_rest_total_ms`
+  (an accounting-only field). `tests/test_cli_bench.sh`'s new B8 block confirms this empirically: a
+  forced-rest run (`--prefill-work-ms 1 --prefill-rest-ms 50`, `--chunk 1` on the 12-token IDS12
+  fixture, so 11 of 12 chunk boundaries rest) produces gen_ids BYTE-IDENTICAL to the same run with
+  the feature off.
+- `g->prefill_rest_total_ms` is reset to 0 as the FIRST mutation of `g` after the null-argument
+  check, before every other validation/early-return in `sg_gpu_prefill` -- so
+  `sg_gpu_prefill_rest_ms(g)` (the public reader) never reports a stale value from a PRIOR
+  successful call when the current call fails validation (e.g. n_tokens==0) before the chunk loop
+  even starts. Covered by a new pure-C unit test, `prefill_rest_reset_on_error`
+  (`tests/test_gpu_prefill.c`): arms the duty cycle, runs a successful rested prefill (asserts
+  `sg_gpu_prefill_rest_ms > 0`), then calls `sg_gpu_prefill` with `n_tokens=0` and asserts it now
+  reads exactly 0.
+- `src/cli_bench.c`: new `--prefill-work-ms W` / `--prefill-rest-ms R` flags (both must be > 0 to
+  arm). New `sg_bench_row` fields (surge.h, `sg_bench_format_json` in `src/bench.c`):
+  `prefill_rest_s` (the slept SUBSET of `prefill_wall_s`, which stays the TOTAL wall time as
+  before, rests included) and `prefill_compute_tps = n_prompt_tok / (prefill_wall_s -
+  prefill_rest_s)` -- the fair full-clock kernel-speed number with sleep time excluded, as opposed
+  to `prefill_tps` (plain wall-clock, falls when duty-cycling is active). `prefill_rest_s` is
+  forced to 0 when `--no-prefill` is used (the serial `sg_gpu_forward` loop never touches these
+  counters); a fresh `sg_gpu` per process means no stale cross-model/cross-run leakage either.
+- Rest accounting verified against real wall-clock, not just internally self-consistent: a
+  `--chunk 3 --prefill-work-ms 1 --prefill-rest-ms 2000` run on the mini fixture (4 chunks, 3
+  rests) measured 6.111s real (`time`) against a reported `prefill_rest_s: 6` and
+  `prefill_wall_s: 6.07584` -- exact match. The exact B7 retry flags (`--chunk 256
+  --prefill-work-ms 180000 --prefill-rest-ms 90000`) were also smoke-tested against the mini
+  fixture (single chunk, so no rest fires, as expected) to confirm they parse and run cleanly
+  before B7 itself.
+- `tests/test_cli_bench.sh`'s rest-accounting gate checks an EXACT expected total (11 rests *
+  50ms = 0.55s, +/-30ms), not just `prefill_rest_s > 0` -- decisive against a buggy
+  threshold/accumulator/reset (which would land a whole 50ms multiple off, well outside the
+  tolerance), verified to land at exactly 0.55s across 6+ separate real-GPU runs.
+- Two codex review rounds on this diff. Round 1 found 4 real issues (stale `prefill_rest_total_ms`
+  on early-error paths; `usleep`'s EINTR/truncation risk for the real 90s rests; comments
+  overclaiming "exactly the pre-B8 code path" when two `clock_gettime` calls still run
+  unconditionally; the rest-accounting test gate being non-decisive with a bare `>0` check) -- all
+  4 fixed as described above. Round 2 confirmed 3/4 resolved outright and caught 2 leftover stale
+  "byte-identical to before this task" / "exactly as it did before this task" comments (in the
+  `sg_gpu` struct field doc and `sg_gpu_set_prefill_rest`'s doc comment) that still overclaimed
+  literal code-path identity instead of output-equivalence; reworded both, re-verified full green.
+- Gates (all green, GPU idle checked via `pgrep -f "bench_niah_mlx.py|llama-cli|llama-bench"`
+  before every live run): `make check`, `make debug` (SURGE_NO_METAL, ASan/UBSan, no sanitizer
+  diagnostics), `make bench-check` all exit 0 on real Metal hardware (Mac Studio M3 Ultra) after
+  every round of fixes. Existing M5.6/M5.7/B5/B6 assertions unaffected -- no existing check
+  touched, weakened, or reordered. Full report:
+  `.superpowers/sdd/2026-08-09-surge-m3-m5/task-B8-report.md`.

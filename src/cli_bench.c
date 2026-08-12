@@ -3,10 +3,24 @@
  *   surge-bench <model_dir_or_gguf>
  *       [--prompt-file PATH | -p TEXT | --ids LIST]
  *       [--max-ctx 262144] [-n 300] [--chunk N] [--no-prefill]
+ *       [--prefill-work-ms W] [--prefill-rest-ms R]
  *       [--engine STR] [--model STR] [--log-id STR]
  *       [--expect-min N] [--expect-max N] [--bos | --no-bos]
  *       [--gemm-gate-tflops F] [--json PATH] [--emit-timeseries PATH]
  *       [--warmup N] [--quiet]
+ *
+ * PREFILL DUTY-CYCLE (Task B8): --prefill-work-ms W and --prefill-rest-ms R
+ * (both must be > 0 to take effect) arm sg_gpu_set_prefill_rest before the
+ * prefill call, so sg_gpu_prefill sleeps R ms (GPU fully idle) after every
+ * W ms of accumulated chunk GPU-busy time -- the fix for the Mac Studio M3
+ * firmware GPU limiter, which clamps the clock after ~3-4 min of continuous
+ * load and only recovers after 60-120s idle. Duty-cycling is pure timing
+ * (see surge.h); it does not change gen_ids, only wall time. The JSON's
+ * prefill_wall_s stays the TOTAL span (rests included, as always);
+ * prefill_rest_s is the slept subset of it, and prefill_compute_tps =
+ * n_prompt_tok / (prefill_wall_s - prefill_rest_s) is the fair full-clock
+ * kernel-speed number with the sleep excluded -- prefill_tps is the one
+ * that falls when duty-cycling is active, since it is plain wall-clock.
  *
  * This is the harness B7 runs to produce surge's row in the 256K comparison
  * (/Users/macmini/projects/llm-rnd/docs/256k_comparison.md). It wires the
@@ -69,6 +83,7 @@ static void usage(void) {
         "usage: surge-bench <model_dir_or_gguf>\n"
         "         [--prompt-file PATH | -p TEXT | --ids LIST]\n"
         "         [--max-ctx N] [-n N] [--chunk N] [--no-prefill]\n"
+        "         [--prefill-work-ms W] [--prefill-rest-ms R]\n"
         "         [--engine STR] [--model STR] [--log-id STR]\n"
         "         [--expect-min N] [--expect-max N] [--bos | --no-bos]\n"
         "         [--gemm-gate-tflops F] [--json PATH]\n"
@@ -81,6 +96,10 @@ static void usage(void) {
         "  -n N              greedy-decode N tokens (default 300)\n"
         "  --chunk N         prefill chunk size (default 1024)\n"
         "  --no-prefill      serial one-token ingest instead of tiled prefill\n"
+        "  --prefill-work-ms W   duty-cycle work budget before a rest (needs\n"
+        "                        --prefill-rest-ms too; 0/unset = disabled)\n"
+        "  --prefill-rest-ms R   duty-cycle idle sleep, ms, once W ms of GPU work\n"
+        "                        has accumulated (firmware GPU-clamp mitigation)\n"
         "  --engine STR      engine label for the row (default \"surge\")\n"
         "  --model STR       model label for the row (default: basename of path)\n"
         "  --log-id STR      log id recorded in the JSON\n"
@@ -211,6 +230,7 @@ int main(int argc, char **argv) {
     const char *json_path = NULL, *ts_path = NULL;
     uint32_t n_gen = 300, max_ctx_arg = 0, chunk_size = SG_PREFILL_CHUNK_DEFAULT;
     uint32_t warmup_arg = 0;
+    uint32_t prefill_work_ms = 0, prefill_rest_ms = 0;
     bool has_warmup = false, no_prefill = false, quiet = false;
     uint64_t expect_min = 0, expect_max = 0;
     bool has_expect_min = false, has_expect_max = false;
@@ -250,6 +270,8 @@ int main(int argc, char **argv) {
         else if (strcmp(argv[i], "--max-ctx") == 0) PARSE_U32("--max-ctx", max_ctx_arg);
         else if (strcmp(argv[i], "--chunk") == 0) PARSE_U32("--chunk", chunk_size);
         else if (strcmp(argv[i], "--no-prefill") == 0) no_prefill = true;
+        else if (strcmp(argv[i], "--prefill-work-ms") == 0) PARSE_U32("--prefill-work-ms", prefill_work_ms);
+        else if (strcmp(argv[i], "--prefill-rest-ms") == 0) PARSE_U32("--prefill-rest-ms", prefill_rest_ms);
         else if (strcmp(argv[i], "--engine") == 0) { NEED_VALUE("--engine"); engine = argv[++i]; }
         else if (strcmp(argv[i], "--model") == 0) { NEED_VALUE("--model"); model_name = argv[++i]; }
         else if (strcmp(argv[i], "--log-id") == 0) { NEED_VALUE("--log-id"); log_id = argv[++i]; }
@@ -402,6 +424,7 @@ int main(int argc, char **argv) {
     row.n_prompt_tok = n_ids;
     row.n_gen = 0;               /* set to the ACTUAL produced count after decode */
     row.prefill_tps = -1.0;      /* "-" until measured */
+    row.prefill_compute_tps = -1.0;   /* Task B8: "-" until measured */
     row.recall_total = 0;
     row.gemm_tflops = gemm_tflops;
 
@@ -438,6 +461,14 @@ int main(int argc, char **argv) {
     }
 
     /* ---- prefill ---- */
+    /* Task B8: only armed when BOTH are > 0 (sg_gpu_set_prefill_rest's own
+     * disabled rule); harmless to call unconditionally otherwise, since
+     * --no-prefill's serial sg_gpu_forward loop never reads these fields. */
+    if (prefill_work_ms > 0 && prefill_rest_ms > 0) {
+        sg_gpu_set_prefill_rest(gpu, prefill_work_ms, prefill_rest_ms);
+        if (!quiet) fprintf(stderr, "  prefill duty-cycle: work-budget %u ms, "
+                            "rest %u ms\n", prefill_work_ms, prefill_rest_ms);
+    }
     const float *lg = NULL;
     double t_run_start = now_s();
     double t0 = t_run_start;
@@ -455,6 +486,15 @@ int main(int argc, char **argv) {
     double t_prefill = now_s() - t0;
     row.prefill_tps = t_prefill > 0.0 ? (double)n_ids / t_prefill : -1.0;
     row.prefill_wall_s = t_prefill;
+
+    /* Task B8: prefill_rest_s is the slept SUBSET of prefill_wall_s (0 when
+     * disabled, never triggered, or --no-prefill skipped sg_gpu_prefill
+     * entirely); prefill_compute_tps excludes it from the throughput
+     * denominator, the fair full-clock number under duty-cycling. */
+    row.prefill_rest_s = (!no_prefill) ? (double)sg_gpu_prefill_rest_ms(gpu) / 1000.0 : 0.0;
+    double prefill_compute_wall = row.prefill_wall_s - row.prefill_rest_s;
+    row.prefill_compute_tps = (prefill_compute_wall > 0.0)
+        ? (double)n_ids / prefill_compute_wall : -1.0;
 
     /* Own clock for the decode phase's wall span (Task B6): started here, at
      * the exact instant prefill_wall_s's own clock stopped -- BEFORE the

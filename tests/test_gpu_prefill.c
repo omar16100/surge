@@ -308,6 +308,71 @@ static void mini_gguf_prefill(void) {
     free(ids);
 }
 
+/* ============================ Task B8 unit gate ============================ *
+ * sg_gpu_prefill_rest_ms's documented contract (surge.h) is "the total
+ * milliseconds slept during the MOST RECENT sg_gpu_prefill call, reset to 0
+ * at the start of every call, INCLUDING A FAILED ONE". Exercises that
+ * directly, since none of the CLI-level B8 gates (tests/test_cli_bench.sh)
+ * ever drive a failing sg_gpu_prefill call: a successful rested prefill must
+ * report > 0ms slept, and a SUBSEQUENT prefill call that fails validation
+ * before the chunk loop even starts (here: n_tokens == 0, rejected up front)
+ * must report exactly 0, not the prior call's stale nonzero value.
+ */
+static void prefill_rest_reset_on_error(void) {
+    size_t n_ids = 0;
+    int32_t *ids = read_ids_file(MINI_DIR "/ids.txt", &n_ids);
+    tt_assert(ids && n_ids > 1, "b8: read %s/ids.txt", MINI_DIR);
+    if (!ids || n_ids < 2) { free(ids); return; }
+
+    sg_gguf *gg = NULL;
+    sg_err e = sg_gguf_open(MINI_DIR "/model.gguf", &gg);
+    tt_assert(!sg_failed(e), "b8: sg_gguf_open: %s", e.msg ? e.msg : "ok");
+    if (sg_failed(e)) { free(ids); return; }
+
+    sg_model m;
+    e = sg_model_from_gguf(gg, &m);
+    tt_assert(!sg_failed(e), "b8: sg_model_from_gguf: %s", e.msg ? e.msg : "ok");
+    if (sg_failed(e)) { sg_gguf_close(gg); free(ids); return; }
+
+    e = sg_gpu_load_model(g_gpu, &m);
+    tt_assert(!sg_failed(e), "b8: sg_gpu_load_model: %s", e.msg ? e.msg : "ok");
+    if (!sg_failed(e)) {
+        uint32_t max_ctx = (uint32_t)n_ids + N_GEN;
+        e = sg_gpu_state_new(g_gpu, &m, max_ctx);
+        tt_assert(!sg_failed(e), "b8: sg_gpu_state_new: %s", e.msg ? e.msg : "ok");
+        if (!sg_failed(e)) {
+            /* Tiny budget/rest: chunk 1 over n_ids tokens gives n_ids-1 rest
+             * opportunities, and each chunk's own GPU-busy time already
+             * exceeds a 1ms budget on this hardware, so at least one rest
+             * fires without slowing the suite down (5ms each). */
+            sg_gpu_set_prefill_rest(g_gpu, 1, 5);
+            const float *lg = NULL;
+            e = sg_gpu_prefill(g_gpu, &m, ids, (uint32_t)n_ids, 1, &lg);
+            tt_assert(!sg_failed(e), "b8: rested prefill: %s", e.msg ? e.msg : "ok");
+            uint64_t rest1 = sg_gpu_prefill_rest_ms(g_gpu);
+            tt_assert(rest1 > 0, "b8: a successful rested prefill (n_ids=%zu, "
+                      "chunk=1, work_budget=1ms, rest=5ms) reported 0ms slept",
+                      n_ids);
+
+            e = sg_gpu_prefill(g_gpu, &m, ids, 0, 1, &lg);
+            tt_assert(sg_failed(e), "b8: n_tokens==0 should be rejected, was accepted");
+            uint64_t rest2 = sg_gpu_prefill_rest_ms(g_gpu);
+            tt_assert(rest2 == 0, "b8: a FAILED prefill call (n_tokens==0, "
+                      "rejected before the chunk loop) reported stale rest "
+                      "time (%llu ms) carried over from the PRIOR successful "
+                      "call (%llu ms) instead of resetting to 0",
+                      (unsigned long long)rest2, (unsigned long long)rest1);
+
+            /* Disarm so no later test in this process pays the sleep. */
+            sg_gpu_set_prefill_rest(g_gpu, 0, 0);
+        }
+    }
+
+    sg_model_free(&m);
+    sg_gguf_close(gg);
+    free(ids);
+}
+
 /* ============================ M5.7 long-context gate ======================= *
  *
  * A REAL model (SURGE_GATE_MODEL, e.g. /Users/macmini/models/qwen35-2b, the 2B
@@ -579,6 +644,7 @@ int main(void) {
     setenv("SURGE_KV_DTYPE", "f16", 1);
     tt_run("mini_st_prefill", mini_st_prefill);
     tt_run("mini_gguf_prefill", mini_gguf_prefill);
+    tt_run("prefill_rest_reset_on_error", prefill_rest_reset_on_error);
     /* M5.7: the real-model long-context gate. SKIPs cleanly (make check stays
      * mini-only and hermetic) unless SURGE_GATE_MODEL points at a real model. */
     tt_run("gate_real_model", gate_real_model);

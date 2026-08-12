@@ -44,9 +44,9 @@ optionally Accelerate for the CPU reference path. No third-party libraries.
 | `src/kv.c` | (M5.1) fp16 growable KV cache for full-attention layers + fixed-size DeltaNet recurrent state, over opaque GPU-buffer handles; Metal-free (allocation injected). `sg_kv_bytes` = 16 GiB K+V at 262,144. Wired into decode by M5.2 (see below). |
 | `src/bench.c` | (B-series) pure-C benchmark math: decode-by-slope, leaderboard-row/JSON formatters, prompt file read, ingestion/truncation guard, NIAH recall scorer, process `phys_footprint` probe + the `sg_mem_tracker` peak-max tracker (B2). |
 | `src/greedy.c` | the ONE greedy-decode argmax (`sg_argmax_f32`, lowest index wins an exact tie). Pure C in LIB_SRC; `surge` and `surge-bench` both call it so their gen_ids cannot drift (B5). |
-| `src/metal.m` | Metal device init, weight-buffer wrapping (mmap, no-copy; bf16/f32/Q8_0 sizing), per-weight matvec kernel dispatch (`matmul_kernel_for`), one command buffer per decode token, one command buffer per prefill chunk (`sg_gpu_prefill`, M5.6), kernel registration (KI_ enum + SG_KERNELS table + size/param checks), `sg_gpu_current_alloc_bytes` (B2, `MTLDevice.currentAllocatedSize`). Registers itself as `sg_kv`'s allocation backend at init. Decode state: the DEFAULT full-attention KV cache is fp16, allocated through `sg_kv` as SEPARATE per-layer K/V buffers (M5.2, `SURGE_KV_DTYPE` env toggle); `SURGE_KV_DTYPE=f32` selects the original combined-buffer f32 path unchanged, kept so the M2 gate's oracle never moves. DeltaNet conv/S state stays on its pre-M5.1 ad hoc allocation for decode; prefill (M5.6) threads DeltaNet state through `sg_kv`'s conv/S carriers (so `g->kv` is now allocated for any DeltaNet model on the f16 path) and bridges the final state back into the ad hoc buffers when it finishes. |
+| `src/metal.m` | Metal device init, weight-buffer wrapping (mmap, no-copy; bf16/f32/Q8_0 sizing), per-weight matvec kernel dispatch (`matmul_kernel_for`), one command buffer per decode token, one command buffer per prefill chunk (`sg_gpu_prefill`, M5.6), kernel registration (KI_ enum + SG_KERNELS table + size/param checks), `sg_gpu_current_alloc_bytes` (B2, `MTLDevice.currentAllocatedSize`). Registers itself as `sg_kv`'s allocation backend at init. Decode state: the DEFAULT full-attention KV cache is fp16, allocated through `sg_kv` as SEPARATE per-layer K/V buffers (M5.2, `SURGE_KV_DTYPE` env toggle); `SURGE_KV_DTYPE=f32` selects the original combined-buffer f32 path unchanged, kept so the M2 gate's oracle never moves. DeltaNet conv/S state stays on its pre-M5.1 ad hoc allocation for decode; prefill (M5.6) threads DeltaNet state through `sg_kv`'s conv/S carriers (so `g->kv` is now allocated for any DeltaNet model on the f16 path) and bridges the final state back into the ad hoc buffers when it finishes. `sg_gpu_prefill`'s chunk loop also carries the B8 prefill duty-cycle: `sg_gpu_set_prefill_rest` arms an optional idle sleep (`pf_sleep_ms`, `nanosleep`+EINTR-retry) between chunks once accumulated GPU-busy time crosses a work budget, to dodge the Mac Studio M3 firmware GPU clamp on long prefills; disabled by default and pure timing (touches no buffer/state/accumulator), so it never changes computed output. |
 | `src/kernels.metal` | deterministic Metal kernels: decode-step ones fold a fixed reduction tree (no atomics/simd_sum) -- bf16/f32/Q8_0 matvec, attention decode (f32-KV `k_attn_decode` and fp16-KV `k_attn_decode_f16`, M5.2), a decode-step fp16 store (`k_kv_store_f16`, M5.2), gated-DeltaNet decode, RoPE, RMSNorm, SwiGLU. Prefill's tiled GEMM (M5.3, `k_matmul_bf16`/`k_matmul_f32`/`k_matmul_q8`, `Y[N,M]=X[N,K]@W[M,K]^T`) uses a different determinism mechanism: one thread per output element of a 16x16 output tile, a private serial K-loop, no cross-thread reduction at all (nothing to fold). Full-attention prefill (M5.4) adds `k_rope_chunk` (partial RoPE over a whole chunk) and `k_attn_prefill` (causal chunk attention over the fp16 KV cache, one threadgroup per (query token, query head), same fixed-tree softmax as `k_attn_decode_f16`). DeltaNet prefill (M5.5) adds `k_conv1d_chunk` / `k_delta_gates_chunk` / `k_delta_chunk` / `k_rmsnorm_gated_chunk`: a whole chunk of N tokens through one DeltaNet layer via a SEQUENTIAL within-chunk scan (per-token loop inside the kernel, threading the conv tail + S matrix), bit-identical to the matching decode kernel looped over the chunk. |
-| `src/cli_*.c` | the four CLI mains (`cli_info`, `cli_ref`, `cli_metal` = `surge`, `cli_bench` = `surge-bench`). `cli_bench` (B5): raw tokenize (no chat template), `--bos`/`--no-bos` (default `tokenizer.ggml.add_bos_token`), M5 tiled prefill (`--chunk`, default 1024) + shared greedy decode, GEMM gate (`--gemm-gate-tflops F`, need F>20.5) + ingestion guard, whole-run peak-mem sampling, NIAH recall (text input only), decode-by-slope (`--warmup`, `--emit-timeseries`), md row to stdout + `--json`. Exit 0 DONE / 3 VOID / other hard error. |
+| `src/cli_*.c` | the four CLI mains (`cli_info`, `cli_ref`, `cli_metal` = `surge`, `cli_bench` = `surge-bench`). `cli_bench` (B5): raw tokenize (no chat template), `--bos`/`--no-bos` (default `tokenizer.ggml.add_bos_token`), M5 tiled prefill (`--chunk`, default 1024) + shared greedy decode, GEMM gate (`--gemm-gate-tflops F`, need F>20.5) + ingestion guard, whole-run peak-mem sampling, NIAH recall (text input only), decode-by-slope (`--warmup`, `--emit-timeseries`), md row to stdout + `--json`. Exit 0 DONE / 3 VOID / other hard error. `--prefill-work-ms`/`--prefill-rest-ms` (B8) arm the metal.m duty-cycle before prefill; JSON gains `prefill_rest_s` (slept subset of `prefill_wall_s`) and `prefill_compute_tps` (rest excluded, the fair full-clock number). |
 
 ## Level 4: Data flows
 
@@ -155,8 +155,31 @@ optionally Accelerate for the CPU reference path. No third-party libraries.
     `make check` stays mini-only and hermetic. Public `sg_gpu_used` added so the gate reads
     the used counter without reaching into the opaque `sg_gpu`. M5 COMPLETE.
   - Bench harness: B1/B3/B4 (pure C), B2 (peak-memory probe), B5 (`surge-bench` CLI +
-    shared `sg_argmax_f32`), and B6 (offline decode-slope + wall-accounting verification) done;
-    B7 (gated 256K run) pending. B6 adds two additive `sg_bench_row` fields,
+    shared `sg_argmax_f32`), B6 (offline decode-slope + wall-accounting verification), and B8
+    (prefill duty-cycle / firmware-clamp mitigation) done; B7 (gated 256K run) pending, now
+    unblocked by B8. B8: the B7 27B/256K prefill originally HUNG because `sg_gpu_prefill`
+    submits chunk command buffers back-to-back, so the GPU never idles and the Mac Studio M3's
+    firmware GPU limiter (clamps to 338 MHz after ~3-4 min of sustained load, recovers only
+    after 60-120s idle) never releases. `sg_gpu_set_prefill_rest(g, work_budget_ms, rest_ms)`
+    (metal.m, surface in surge.h) arms an optional duty cycle: once accumulated GPU-busy wall
+    time (measured strictly as `commit`..`waitUntilCompleted` per chunk) reaches
+    `work_budget_ms`, and at least one chunk remains, `sg_gpu_prefill` sleeps `rest_ms` (via a
+    `nanosleep`+EINTR-retry helper, `pf_sleep_ms`, not bare `usleep`, so a signal cannot
+    truncate a real 90s rest) with no command buffer in flight, then resumes. Either argument 0
+    (the default) disables it: `sg_gpu_prefill`'s OUTPUT is then byte-identical to before this
+    task. PURE TIMING: proven, not just asserted, by a `tests/test_cli_bench.sh` gate showing a
+    forced-rest run (11 rests over a 12-chunk prefill) produces gen_ids byte-identical to the
+    same run with the feature off; a second gate checks the exact expected total rest time
+    (11 * 50ms, +/-30ms) and that the new `prefill_compute_tps` JSON field (rest excluded)
+    exceeds `prefill_tps` (rest included). `sg_gpu_prefill_rest_ms(g)` is reset to 0 as the
+    FIRST mutation of `g` in every `sg_gpu_prefill` call (including a failed one), gated by a
+    dedicated `tests/test_gpu_prefill.c` unit test (`prefill_rest_reset_on_error`) so a failed
+    call never reports a stale value from a prior successful one. Rest accounting cross-checked
+    against real wall-clock (`time` on a `--chunk 3 --prefill-work-ms 1 --prefill-rest-ms 2000`
+    run: 6.111s real vs `prefill_rest_s:6`/`prefill_wall_s:6.07584`, exact match). Intended B7
+    retry params: `--chunk 256 --prefill-work-ms 180000 --prefill-rest-ms 90000`. Full rationale
+    in `.superpowers/sdd/2026-08-09-surge-m3-m5/task-B8-report.md`.
+  - B6 adds two additive `sg_bench_row` fields,
     `prefill_wall_s`/`decode_wall_s` (own `now_s()` spans around the prefill/decode phases in
     `cli_bench.c`, independent of `wall_s`/the per-token series), plus a `tests/test_cli_bench.sh`
     block (same Metal-guard as the rest of the file) that drives `surge-bench` on the mini fixture

@@ -750,6 +750,44 @@ sg_err sg_gpu_prefill(sg_gpu *g, const sg_model *m, const int32_t *tokens,
                       const float **out_last_logits);
 
 /* ---------------------------------------------------------------------
+ * Prefill duty-cycle: firmware GPU-clamp mitigation (Task B8)
+ * ---------------------------------------------------------------------
+ *
+ * The Mac Studio M3's firmware GPU limiter clamps the GPU clock to 338 MHz
+ * after roughly 3-4 minutes of SUSTAINED load and only releases back to full
+ * clock after 60-120s of IDLE. sg_gpu_prefill normally submits one chunk
+ * command buffer after another with no gap, so on a long enough prefill the
+ * GPU never idles, the clamp never lifts, and a later chunk stalls under it.
+ *
+ * sg_gpu_set_prefill_rest arms a duty cycle on `g`: sg_gpu_prefill accumulates
+ * the GPU-busy wall time of each chunk (commit..waitUntilCompleted), and once
+ * that accumulated time reaches work_budget_ms -- provided at least one chunk
+ * still remains -- sleeps rest_ms with NO command buffer in flight, so the GPU
+ * goes genuinely idle and the firmware limiter can recover, then resumes and
+ * resets the accumulator.
+ *
+ * DISABLED is the default (both fields 0 from sg_gpu_init's calloc) and is
+ * also what either argument being 0 selects: no accumulator ever crosses
+ * work_budget_ms and sg_gpu_prefill never sleeps, so its OUTPUT (gen_ids,
+ * logits, KV/decode state, the used-position counter) is byte-identical to
+ * before this task -- the chunk loop still takes two extra clock_gettime
+ * reads per chunk for the (unused, when disabled) work-time accounting, but
+ * those feed nothing that reaches the computed result. When enabled, the
+ * rest is PURE TIMING the same way: it reads/writes no buffer, model state,
+ * or KV/accumulator that feeds the computed logits, so a rested prefill and
+ * an unrested prefill on the same (model, tokens, chunk_size) produce
+ * byte-identical gen_ids; only wall-clock time differs.
+ *
+ * Settings persist on `g` across calls until changed again; pass either
+ * argument as 0 to disable. sg_gpu_prefill_rest_ms reads back the total
+ * milliseconds actually slept during the MOST RECENT sg_gpu_prefill call
+ * (reset to 0 at the start of every call, including a disabled one), which
+ * callers such as surge-bench use to separate compute time from idle time
+ * in their reported throughput. */
+void sg_gpu_set_prefill_rest(sg_gpu *g, uint32_t work_budget_ms, uint32_t rest_ms);
+uint64_t sg_gpu_prefill_rest_ms(const sg_gpu *g);
+
+/* ---------------------------------------------------------------------
  * Standalone KV-cache + DeltaNet-state module (Task M5.1, src/kv.c)
  * ---------------------------------------------------------------------
  *
@@ -918,6 +956,19 @@ typedef struct {
                                  * own now_s()..now_s() span around the
                                  * decode loop, independent of the per-token
                                  * t_wall_cum series used for the slope fit. */
+    double prefill_rest_s;     /* Task B8: total time slept for the firmware
+                                 * GPU-clamp duty cycle, seconds, INCLUDED in
+                                 * prefill_wall_s (a subset of it, not
+                                 * additional). 0 when the feature is disabled
+                                 * or never triggered. */
+    double prefill_compute_tps; /* Task B8: n_prompt_tok / (prefill_wall_s -
+                                 * prefill_rest_s) -- the fair full-clock
+                                 * kernel-speed number with duty-cycle idle
+                                 * time excluded, as opposed to prefill_tps
+                                 * (which is wall-clock and so falls when
+                                 * duty-cycling is active). < 0 if the
+                                 * denominator is <= 0 (not measured, or the
+                                 * whole prefill was spent resting). */
     double peak_ram_gib;       /* process phys_footprint peak, Task B2 */
     double gpu_alloc_gib;      /* Metal currentAllocatedSize peak, Task B2 */
     uint32_t recall_hits;      /* NIAH direct-retrieval hits, Task B4 */

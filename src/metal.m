@@ -22,6 +22,7 @@
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
 
+#include <errno.h>
 #include <mach-o/dyld.h>
 #include <math.h>
 #include <stdarg.h>
@@ -260,6 +261,21 @@ struct sg_gpu {
      * into g->kv's per-layer half buffers. NULL on the f32 path (matvec
      * writes straight into L->kv there, as before). */
     void *b_k32, *b_v32;
+
+    /* --- Task B8: prefill duty-cycle (firmware GPU-clamp mitigation) ---
+     * Set by sg_gpu_set_prefill_rest; both 0 (the calloc default in
+     * sg_gpu_init) means DISABLED, i.e. sg_gpu_prefill never sleeps and its
+     * OUTPUT (gen_ids, logits, KV/decode state, g->used) is byte-identical to
+     * before this task -- the chunk loop still takes two extra clock_gettime
+     * reads per chunk either way, but they feed only rest accounting, never
+     * anything output-affecting. prefill_rest_total_ms is reset to 0 at the
+     * start of every sg_gpu_prefill call (whether or not the feature is
+     * enabled, and even one that fails validation) and accumulates the wall
+     * time actually slept during that call; read it back with
+     * sg_gpu_prefill_rest_ms after the call returns. */
+    uint32_t prefill_work_budget_ms;
+    uint32_t prefill_rest_ms;
+    uint64_t prefill_rest_total_ms;
 };
 
 /* --------------------------------------------------------------------
@@ -2750,17 +2766,68 @@ static void prefill_free_chunk(sg_gpu *g) {
     g->h_x = g->h_cs = NULL;
 }
 
-/* Monotonic seconds for the long-prefill progress log below. */
+/* Monotonic seconds for the long-prefill progress log below and for the B8
+ * duty-cycle's own GPU-busy accounting. */
 static double pf_now_s(void) {
     struct timespec t;
     clock_gettime(CLOCK_MONOTONIC, &t);
     return (double)t.tv_sec + 1e-9 * (double)t.tv_nsec;
 }
 
+/* Task B8: sleeps ms milliseconds via nanosleep, retrying across EINTR (with
+ * the remaining time nanosleep itself writes back into req) so a stray
+ * signal cannot silently cut a rest short -- load-bearing for the real
+ * 90000ms (90s) rests this feature exists for: a truncated rest could leave
+ * the GPU idle for less than the firmware limiter's 60-120s recovery window,
+ * quietly defeating the whole mitigation. Deliberately nanosleep rather than
+ * usleep: nanosleep takes seconds+nanoseconds directly (no risk of a
+ * uint32_t microsecond product overflowing) and its POSIX contract includes
+ * writing the unslept remainder back on an EINTR return, which is exactly
+ * what the retry loop needs. */
+static void pf_sleep_ms(uint32_t ms) {
+    struct timespec req = { .tv_sec = (time_t)(ms / 1000u),
+                             .tv_nsec = (long)(ms % 1000u) * 1000000L };
+    while (nanosleep(&req, &req) != 0 && errno == EINTR) {
+        /* req now holds the remaining time; loop to finish it out. */
+    }
+}
+
+/* Task B8: arms/disarms the prefill duty-cycle. Either argument 0 disables
+ * it (the calloc default): no accumulator crosses work_budget_ms and
+ * sg_gpu_prefill never sleeps, so its OUTPUT is byte-identical to before this
+ * task (the chunk loop's two clock_gettime reads per chunk still run either
+ * way, but feed only rest accounting). When both are nonzero, sg_gpu_prefill
+ * sleeps rest_ms (GPU fully idle, no command buffer in flight) once the
+ * accumulated GPU-busy wall time across chunks
+ * reaches work_budget_ms, provided at least one chunk still remains; this is
+ * pure timing and touches no buffer, state, or accumulator that feeds the
+ * computed logits or KV state. Settings persist on g until changed again. */
+void sg_gpu_set_prefill_rest(sg_gpu *g, uint32_t work_budget_ms, uint32_t rest_ms) {
+    if (!g) return;
+    g->prefill_work_budget_ms = work_budget_ms;
+    g->prefill_rest_ms = rest_ms;
+}
+
+/* Total time (ms) sg_gpu_prefill actually slept during its most recent call;
+ * 0 if the feature was disabled or never triggered (e.g. every chunk's
+ * GPU-busy time stayed under work_budget_ms). Reset to 0 at the start of
+ * every sg_gpu_prefill call, so this always reflects the LAST call, not a
+ * running total across calls. */
+uint64_t sg_gpu_prefill_rest_ms(const sg_gpu *g) {
+    return g ? g->prefill_rest_total_ms : 0;
+}
+
 sg_err sg_gpu_prefill(sg_gpu *g, const sg_model *m, const int32_t *tokens,
                       uint32_t n_tokens, uint32_t chunk_size,
                       const float **out_last_logits) {
     if (!g || !m || !tokens) return (sg_err){"gpu: sg_gpu_prefill got a NULL argument"};
+    /* Task B8: reset the rest-time counter FIRST, before any of the argument/
+     * state validation below can return early. sg_gpu_prefill_rest_ms's
+     * contract is "the most recent call", and a failed call (bad args, wrong
+     * KV dtype, oversized chunk, allocation failure) is still a call: without
+     * this early reset it would otherwise still report whatever a PRIOR
+     * successful call slept, which is stale and misleading. */
+    g->prefill_rest_total_ms = 0;
     if (!g->have_state) return (sg_err){"gpu: call sg_gpu_state_new first"};
     if (m != g->model) return (sg_err){"gpu: this gpu was loaded with a different sg_model"};
     const sg_cfg *c = &g->cfg;
@@ -2870,6 +2937,19 @@ sg_err sg_gpu_prefill(sg_gpu *g, const sg_model *m, const int32_t *tokens,
      * throttled line every 8th chunk plus the last. */
     bool pf_log = n_tokens >= 8192u;
     double t_pf0 = pf_now_s();
+
+    /* Task B8: prefill duty-cycle. rest_enabled false (either setting 0, the
+     * calloc default) leaves every buffer, KV/accumulator write, and control
+     * flow below untouched -- pf_work_acc_ms stays unread, no sleep ever
+     * runs, and g->prefill_rest_total_ms (already reset to 0 above) stays 0,
+     * so a disabled run's OUTPUT (gen_ids, logits, KV/decode state, g->used)
+     * is byte-identical to before this task. The chunk-loop timing capture
+     * below (t_gpu0/t_gpu1, two extra clock_gettime calls per chunk) does
+     * run either way, but feeds only this accounting, never anything
+     * output-affecting. */
+    bool rest_enabled = (g->prefill_work_budget_ms > 0 && g->prefill_rest_ms > 0);
+    double pf_work_acc_ms = 0.0;
+
     for (uint32_t base = 0; base < n_tokens; base += chunk) {
         uint32_t n = n_tokens - base;
         if (n > chunk) n = chunk;
@@ -2911,6 +2991,14 @@ sg_err sg_gpu_prefill(sg_gpu *g, const sg_model *m, const int32_t *tokens,
         }
 
         __block sg_err rc = SG_OK;
+        /* GPU-busy wall time for this chunk, Task B8 duty-cycle accounting:
+         * set around exactly the commit..waitUntilCompleted span below (the
+         * interval the GPU is actually working), not the host-side encode
+         * loop above. Captured unconditionally (two clock_gettime calls) so
+         * the encode path itself never branches on rest_enabled; only the
+         * accumulate-and-maybe-rest decision after the command buffer
+         * completes does. */
+        double t_gpu0 = 0.0, t_gpu1 = 0.0;
         @autoreleasepool {
             id<MTLCommandBuffer> cb = [g->queue commandBuffer];
             id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
@@ -2957,8 +3045,10 @@ sg_err sg_gpu_prefill(sg_gpu *g, const sg_model *m, const int32_t *tokens,
                            g->b_logits, 0, nil, 0, PARAMS(c->vocab, c->hidden));
                 }
                 [enc endEncoding];
+                t_gpu0 = pf_now_s();
                 [cb commit];
                 [cb waitUntilCompleted];
+                t_gpu1 = pf_now_s();
                 if ([cb error]) {
                     rc = gpu_errf("gpu: prefill chunk failed: %s",
                                   [[[cb error] localizedDescription] UTF8String]);
@@ -2980,6 +3070,27 @@ sg_err sg_gpu_prefill(sg_gpu *g, const sg_model *m, const int32_t *tokens,
                     "%.1fs elapsed\n", base + n, n_tokens,
                     100.0 * (double)(base + n) / (double)n_tokens,
                     el > 0.0 ? (double)(base + n) / el : 0.0, el);
+        }
+
+        /* Task B8 duty-cycle: between THIS chunk's waitUntilCompleted (just
+         * above, GPU idle at that instant) and the NEXT chunk's encode (top of
+         * the next iteration). Pure timing -- no buffer, state, or accumulator
+         * that feeds the computed logits or KV state is touched here, only
+         * pf_work_acc_ms (a local, loop-scoped counter) and g's rest-tracking
+         * fields, so this cannot change gen_ids. Never rests after the final
+         * chunk (nothing left to protect) or when disabled. */
+        if (rest_enabled) {
+            pf_work_acc_ms += (t_gpu1 - t_gpu0) * 1000.0;
+            if (!last && pf_work_acc_ms >= (double)g->prefill_work_budget_ms) {
+                if (pf_log) {
+                    fprintf(stderr, "gpu: prefill duty-cycle resting %u ms "
+                            "(worked %.0f ms since last rest)\n",
+                            g->prefill_rest_ms, pf_work_acc_ms);
+                }
+                pf_sleep_ms(g->prefill_rest_ms);
+                g->prefill_rest_total_ms += g->prefill_rest_ms;
+                pf_work_acc_ms = 0.0;
+            }
         }
     }
 

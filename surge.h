@@ -813,8 +813,31 @@ sg_err sg_gpu_run_attn_prefill(sg_gpu *g, void *q, void *k, void *v, void *out,
  * [seq, n_kv_heads, head_dim] SEPARATE buffers, the sg_kv layout, exactly as
  * sg_gpu_run_attn_decode_f16 takes them; m, s f32 [n_heads, n_splits]; acc f32
  * [n_heads, n_splits, head_dim] (the UNNORMALIZED weighted-V sums); out f32
- * [n_heads, head_dim]. GQA: query head h reads kv head h / (n_heads /
- * n_kv_heads), falling back to kv head 0 when n_heads < n_kv_heads.
+ * [n_heads, head_dim]. GQA: query head h reads kv head
+ * h / (n_heads / n_kv_heads).
+ *
+ * GQA DOMAIN, and which side is authoritative (P2.2 review finding 2). These
+ * entry points REJECT n_heads % n_kv_heads != 0, which includes every
+ * n_heads < n_kv_heads shape (with n_heads > 0, n_heads < n_kv_heads can never
+ * divide evenly). sg_ref_attn_decode / sg_ref_attn_decode_splitk accept that
+ * shape and fall back to kv head 0, so the CPU oracle's domain is a strict
+ * SUPERSET of this pair's. THE METAL DOMAIN IS THE AUTHORITATIVE ONE for
+ * anything that will be dispatched: on every shape these functions accept, the
+ * two agree; on the shapes only the oracle accepts, there is nothing to compare
+ * because the dispatch is refused up front, not silently computed differently.
+ * k_attn_decode_splitk_partial does carry the same `repeat == 0` fallback the
+ * oracle has, so the kernel would compute the oracle's answer, but check_params
+ * makes that branch unreachable through these entry points and it must not be
+ * read as a promise that the shape is supported.
+ *
+ * OCCUPANCY, which is the whole point of splitting (P2.2 review finding 4). A
+ * threadgroup is SG_TG (256) lanes wide and a split's keys are handed out one
+ * per lane, so a split shorter than 256 keys leaves lanes idle: at seq 200 with
+ * n_splits 257 the per-split length is 1 and 255 of 256 lanes do nothing.
+ * Roughly n_splits <= seq / SG_TG keeps every lane fed, and above that the
+ * split count buys threadgroups at the cost of lanes. Whoever picks a default
+ * n_splits when this is wired into decode needs that bound and a measurement,
+ * not just the grid arithmetic; no split-K kernel has been timed yet.
  *
  * ONE params ARRAY SERVES BOTH CALLS: [0]=n_heads [1]=n_kv_heads [2]=head_dim
  * [3]=seq [4]=q_stride [5]=softmax scale bits (f32 bit pattern) [6]=n_splits
@@ -829,7 +852,25 @@ sg_err sg_gpu_run_attn_prefill(sg_gpu *g, void *q, void *k, void *v, void *out,
  * seq == 0 IS ACCEPTED and is NOT the k_attn_decode_f16 divergence sg_ref_
  * attn_decode documents: every split is then empty, so the pair writes the
  * oracle's own out[d] = 0.0 rather than leaving `out` untouched. These kernels
- * therefore match sg_ref_attn_decode_splitk at every seq, including 0. */
+ * therefore match sg_ref_attn_decode_splitk at every seq, including 0.
+ *
+ * SCORE SCRATCH (P2.2 review finding 1, the constraint that matters when this
+ * is wired into decode). The partial kernel needs one private score row of
+ * ceil(seq/n_splits) floats per (query head, split). It does NOT share the
+ * process-wide `sg_gpu.scratch` that k_attn_decode, k_attn_decode_f16,
+ * k_attn_prefill and sg_gpu_forward's encoder all bind at offset 0: it owns a
+ * SEPARATE allocation, grown on demand exactly like that one. That is
+ * deliberate and structural. The shared buffer is grown, never partitioned, and
+ * every user binds it at offset 0, so two different users inside ONE open
+ * command buffer would be addressing the same bytes: split-K's
+ * n_heads*n_splits*span rows against another kernel's n_heads*seq rows. A
+ * separate buffer means the batched decode path can dispatch the partial
+ * alongside anything else without that question arising at all, rather than
+ * relying on a rule someone has to remember. Both scratches are released by
+ * sg_gpu_free and both are counted by sg_gpu_current_alloc_bytes (which reads
+ * the device's own currentAllocatedSize), so the peak-memory probe sees them.
+ * The two split-K kernels themselves never conflict: only the partial touches
+ * scratch, and each (head, split) threadgroup owns a disjoint row. */
 sg_err sg_gpu_run_attn_splitk_partial(sg_gpu *g, void *q, void *k, void *v,
                                       void *m, void *s, void *acc,
                                       const uint32_t params[8]);

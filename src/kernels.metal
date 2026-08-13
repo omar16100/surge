@@ -1352,6 +1352,24 @@ kernel void k_rmsnorm_gated_chunk(device const float *y  [[buffer(0)]],
  * agree with sg_ref_attn_decode_splitk there. (metal.m accepts seq == 0 for
  * exactly this reason, unlike sg_gpu_run_attn_decode_f16, which rejects it.)
  *
+ * OCCUPANCY: n_splits BUYS THREADGROUPS AND SPENDS LANES (P2.2 review finding
+ * 4). A threadgroup is SG_TG == 256 lanes and the partial hands out its
+ * split's keys one per lane (thread `lid` takes keys lid, lid+256, ...), so a
+ * split shorter than 256 keys leaves lanes idle: at seq 200 with n_splits 257
+ * the per-split length is 1 and 255 of the 256 lanes do nothing at all. The
+ * useful band is roughly
+ *
+ *     n_heads * n_splits >= GPU cores      (enough threadgroups to fill them)
+ *     n_splits <= seq / SG_TG              (enough keys to fill each one)
+ *
+ * and the second bound is the one this task's motivation ignores: splitting
+ * past seq/256 keeps adding threadgroups whose lanes are mostly idle, and past
+ * seq it adds threadgroups that do nothing but write the empty encoding. At
+ * seq 262,144 that upper bound is 1024 splits, so the interesting range is
+ * wide, but it IS bounded. Whoever picks a default n_splits when this is wired
+ * into decode needs a measurement inside that band, not just the grid
+ * arithmetic; nothing here has been timed.
+ *
  * NOT WIRED INTO THE DECODE PATH. enc_attn / enc_attn_f16 still dispatch
  * k_attn_decode_f16; switching decode over happens only once these have
  * passed their GPU gates. */
@@ -1381,6 +1399,15 @@ static inline float attn_combine_weight(float mi, float M) {
  * [n_heads, n_splits, head_dim]; scores f32 scratch, one private row of
  * `span` floats per (head, split) where span = ceil(seq / n_splits), sized by
  * metal.m with the IDENTICAL formula.
+ *
+ * THE SCORES BUFFER IS THIS KERNEL'S OWN (P2.2 review finding 1). metal.m
+ * binds sg_gpu.splitk_scratch here, NOT the process-wide sg_gpu.scratch that
+ * k_attn_decode, k_attn_decode_f16, k_attn_prefill and the decode encoder all
+ * bind at offset 0. That shared buffer is grown, never partitioned, so two
+ * different users encoded into ONE command buffer would be writing the same
+ * bytes, and this kernel exists precisely to be dispatched from the batched
+ * encoder next to those. A separate allocation makes the overlap impossible
+ * rather than merely unlikely.
  *
  * params: [0]=n_heads [1]=n_kv_heads [2]=head_dim [3]=seq [4]=q_stride
  * [5]=softmax scale bits [6]=n_splits (params[7] unused).

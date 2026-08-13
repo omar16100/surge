@@ -242,9 +242,32 @@ struct sg_gpu {
     id<MTLComputePipelineState> pipes[SG_N_KERNELS];
     /* k_attn_decode's per-head score row. Owned and grown on demand rather
      * than living in threadgroup memory, which caps out at 32 KB and would
-     * put a ceiling of ~8k tokens on the context length. */
+     * put a ceiling of ~8k tokens on the context length.
+     *
+     * ONE ALLOCATION, SHARED BY EVERY USER, ALWAYS BOUND AT OFFSET 0:
+     * k_attn_decode, k_attn_decode_f16, k_attn_prefill and sg_gpu_forward's
+     * encoder all point at these same bytes. scratch_ensure only ever GROWS
+     * it; it never partitions it and hands nobody a private range. That is
+     * safe today because each of those is either its own commit-and-wait or
+     * the only scratch user in the command buffer it is encoded into, and it
+     * is a real constraint on anything that batches two DIFFERENT scratch
+     * users into ONE open command buffer: their rows would be the same bytes.
+     * The split-K partial (P2.2) therefore does NOT use this buffer, see
+     * splitk_scratch below. */
     id<MTLBuffer> scratch;
     uint64_t scratch_bytes;
+
+    /* k_attn_decode_splitk_partial's per-(head, split) score row (P2.2 review
+     * finding 1). A SEPARATE allocation from `scratch` above, on purpose: the
+     * split-K pair is meant to be dispatched from the batched decode encoder
+     * next to kernels that use `scratch`, and sharing one grown-not-
+     * partitioned buffer between two users in one open command buffer is the
+     * kind of hazard that has to be structural rather than a comment somebody
+     * remembers. Costs one extra device allocation, sized
+     * n_heads * n_splits * ceil(seq/n_splits) floats, which is the same order
+     * as `scratch`'s own n_heads * seq. */
+    id<MTLBuffer> splitk_scratch;
+    uint64_t splitk_scratch_bytes;
 
     /* --- the loaded model (sg_gpu_load_model) --- */
     const sg_model *model;
@@ -349,10 +372,12 @@ void sg_gpu_free(sg_gpu *g) {
         g->pipes[i] = nil;
     }
     [g->scratch release];
+    [g->splitk_scratch release];
     [g->lib release];
     [g->queue release];
     [g->dev release];
     g->scratch = nil;
+    g->splitk_scratch = nil;
     g->lib = nil;
     g->queue = nil;
     g->dev = nil;
@@ -934,6 +959,31 @@ static sg_err scratch_ensure(sg_gpu *g, uint64_t nbytes) {
     return SG_OK;
 }
 
+/* The same grow-on-demand allocator for the split-K partial's OWN score
+ * buffer (P2.2 review finding 1). Deliberately a second function rather than
+ * a refactor of scratch_ensure into a shared (buffer, bytes) helper: that
+ * would have rewritten the allocation path every existing Metal gate runs
+ * through, and the point of the finding was to add isolation, not to churn
+ * the code the isolated-from kernels depend on. The duplication is fifteen
+ * lines and the distinct error text ("split-K score scratch") is what a
+ * failure at 262,144 x n_splits would need to say anyway. */
+static sg_err splitk_scratch_ensure(sg_gpu *g, uint64_t nbytes) {
+    if (g->splitk_scratch && g->splitk_scratch_bytes >= nbytes) return SG_OK;
+    id<MTLBuffer> nb = nil;
+    @autoreleasepool {
+        nb = [g->dev newBufferWithLength:(NSUInteger)nbytes
+                                 options:MTLResourceStorageModePrivate];
+    }
+    if (!nb) {
+        return gpu_errf("gpu: cannot allocate %llu bytes of split-K score scratch",
+                        (unsigned long long)nbytes);
+    }
+    [g->splitk_scratch release];
+    g->splitk_scratch = nb;
+    g->splitk_scratch_bytes = nbytes;
+    return SG_OK;
+}
+
 sg_err sg_gpu_run_op(sg_gpu *g, const char *kernel, void *a, void *b, void *out,
                      const uint32_t params[8]) {
     if (!g || !kernel || !params) return (sg_err){"gpu: sg_gpu_run_op got a NULL argument"};
@@ -1393,7 +1443,15 @@ sg_err sg_gpu_run_attn_splitk_partial(sg_gpu *g, void *q, void *k, void *v,
         }
     }
 
-    e = scratch_ensure(g, need_scratch);
+    /* g->splitk_scratch, NOT the process-wide g->scratch every other attention
+     * kernel binds at offset 0 (P2.2 review finding 1). See the two comments
+     * on struct sg_gpu: the shared buffer is grown and never partitioned, so
+     * two different users encoded into ONE command buffer would be addressing
+     * the same bytes, and this kernel is specifically meant to be dispatched
+     * from the batched decode encoder alongside kernels that use it. Owning a
+     * separate allocation makes that a non-question instead of a rule the next
+     * task has to remember. */
+    e = splitk_scratch_ensure(g, need_scratch);
     if (sg_failed(e)) return e;
 
     __block sg_err rc = SG_OK;
@@ -1410,7 +1468,8 @@ sg_err sg_gpu_run_attn_splitk_partial(sg_gpu *g, void *q, void *k, void *v,
                        atIndex:(NSUInteger)(3 + i)];
             }
             [enc setBytes:params length:8 * sizeof(uint32_t) atIndex:6];
-            [enc setBuffer:g->scratch offset:0 atIndex:7];
+            /* The DEDICATED split-K scratch, not g->scratch (see above). */
+            [enc setBuffer:g->splitk_scratch offset:0 atIndex:7];
             /* The SG_K_HEADS2D grid: x = split, y = query head, matching the
              * kernel's tg.x / tg.y. Both grid attributes are declared uint2
              * there, the same pairing the SG_K_TILES2D dispatch above uses and

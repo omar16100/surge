@@ -2715,8 +2715,23 @@ static void splitk_determinism(void) {
     gbuf ob = gb_new(out_n);
     uint32_t p[8] = {n_heads, n_kv, hd, seq, q_stride, f32_bits(scale), ns, 0};
 
-    float *first = xmalloc(out_n * sizeof *first);
-    uint64_t mism = 0;
+    /* Compare ALL FOUR buffers, and BYTE-WISE (P2.2 review finding 3).
+     * Comparing only the combine's `out` would miss a partial that is
+     * nondeterministic in a way the final num/S division cancels: scale every
+     * split's m by a jitter and s and acc move with it, leaving out[] exactly
+     * where it was. And memcmp rather than float `!=` for the same reason
+     * check_bit_identical above uses it: a stably-NaN output would compare
+     * unequal to itself and report 99 phantom mismatch runs, while a +0.0 to
+     * -0.0 flip (a genuine nondeterminism signal) compares EQUAL and would be
+     * missed entirely. Counted per RUN, not per element, matching det_check's
+     * convention. */
+    size_t ms_bytes = (size_t)n_heads * ns * sizeof(float);
+    size_t acc_bytes = (size_t)n_heads * ns * hd * sizeof(float);
+    size_t out_bytes = (size_t)out_n * sizeof(float);
+    uint8_t *first_m = xmalloc(ms_bytes), *first_s = xmalloc(ms_bytes);
+    uint8_t *first_acc = xmalloc(acc_bytes), *first_out = xmalloc(out_bytes);
+    uint32_t mism_m = 0, mism_s = 0, mism_acc = 0, mism_out = 0;
+
     for (int rep = 0; rep < 100; rep++) {
         gb_poison(&mb); gb_poison(&sb); gb_poison(&ab); gb_poison(&ob);
         sg_err e = sg_gpu_run_attn_splitk_partial(g_gpu, qb.b, kb.b, vb.b,
@@ -2724,16 +2739,28 @@ static void splitk_determinism(void) {
         if (!sg_failed(e)) e = sg_gpu_run_attn_splitk_combine(g_gpu, mb.b, sb.b, ab.b, ob.b, p);
         tt_assert(!sg_failed(e), "splitk determinism rep %d: %s", rep, e.msg ? e.msg : "ok");
         if (sg_failed(e)) break;
-        if (rep == 0) memcpy(first, ob.h, out_n * sizeof(float));
-        else for (uint32_t i = 0; i < out_n; i++) if (ob.h[i] != first[i]) mism++;
+        if (rep == 0) {
+            memcpy(first_m, mb.h, ms_bytes);
+            memcpy(first_s, sb.h, ms_bytes);
+            memcpy(first_acc, ab.h, acc_bytes);
+            memcpy(first_out, ob.h, out_bytes);
+        } else {
+            if (memcmp(first_m, mb.h, ms_bytes) != 0) mism_m++;
+            if (memcmp(first_s, sb.h, ms_bytes) != 0) mism_s++;
+            if (memcmp(first_acc, ab.h, acc_bytes) != 0) mism_acc++;
+            if (memcmp(first_out, ob.h, out_bytes) != 0) mism_out++;
+        }
     }
-    tt_assert(mism == 0, "split-K decode attention: %llu bit-exact mismatches over "
-                         "100 reruns of the same input", (unsigned long long)mism);
-    if (mism == 0) {
-        fprintf(stderr, "   split-K decode attention: bit-identical over 100 reruns\n");
+    tt_assert(mism_m == 0 && mism_s == 0 && mism_acc == 0 && mism_out == 0,
+              "split-K decode attention over 99 reruns: m differed on %u, s on %u, "
+              "acc on %u, out on %u", mism_m, mism_s, mism_acc, mism_out);
+    if (mism_m == 0 && mism_s == 0 && mism_acc == 0 && mism_out == 0) {
+        fprintf(stderr, "   split-K decode attention: m/s/acc/out byte-identical "
+                        "over 100 reruns\n");
     }
 
-    free(first); free(q); free(k16); free(v16);
+    free(first_m); free(first_s); free(first_acc); free(first_out);
+    free(q); free(k16); free(v16);
     gb_free(&qb); gb16_free(&kb); gb16_free(&vb);
     gb_free(&mb); gb_free(&sb); gb_free(&ab); gb_free(&ob);
 }

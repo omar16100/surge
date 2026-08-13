@@ -2293,3 +2293,75 @@ determinism rerun; the empty-split encoding assertions; the `seq == 0` choice; t
 argument-rejection assertions; the 2D `SG_K_HEADS2D` dispatch mapping `tg.x`/`tg.y` to
 the intended (split, head); and any performance claim whatsoever, since no split-K
 kernel has been timed.
+
+### P2.2 fix round 1 (review: APPROVE 9/9 SPEC PASS, 4 items closed, 2 deferred)
+
+Reviewer approved and went well past reading: transcribed both kernels to CPU (256-lane
+threadgroup, the `tg_max`/`tg_sum` schedule, the host grid mapping, buffers sized from
+`splitk_sizes` with bounds checks), linked it against the real `src/ref.c`, and measured
+worst **1.164e-06** vs BOTH oracles across 9 shapes x 6 split counts with zero overruns;
+mutation-proved the gate has teeth (axis swap 149 failures, per-split normalization 72,
+partition off-by-one 80); brute-forced 4,672,296 (seq, n_splits) pairs confirming the
+partition tiles exactly and `span = ceil(seq/n_splits)` is tight (attained 643 times).
+**That is the reviewer's CPU transcription, not this code on a GPU.** The GPU was still
+held for this round (`pgrep -f "surge-bench|bench_niah"` = PIDs 76362 and 98563 before
+and after), so the kernels remain UNVERIFIED on hardware and every deferred gate stays
+deferred. Findings 6 and 7 (combine not rejecting m/s/acc mutual aliasing; redundant
+exp/M/S recomputation in combine pass 3) were acknowledged as DEFERRED and not touched.
+
+1. **MEDIUM, the shared `g->scratch` landmine: fixed STRUCTURALLY rather than by comment.**
+   `sg_gpu.scratch` is ONE process-wide allocation that `k_attn_decode`,
+   `k_attn_decode_f16`, `k_attn_prefill` and `sg_gpu_forward`'s encoder all bind at
+   offset 0, and `scratch_ensure` only GROWS it, never partitions it. The split-K partial
+   bound the same buffer, which is safe only while every call is its own commit-and-wait
+   and would break the moment the next task dispatches the partial inside the batched
+   encoder (its `n_heads*n_splits*span` rows landing on another kernel's `n_heads*seq`
+   rows). Added a DEDICATED `sg_gpu.splitk_scratch` / `splitk_scratch_bytes`, a
+   `splitk_scratch_ensure()`, the bind at index 7, and the release in `sg_gpu_free`; the
+   split-K path now contains no reference to `g->scratch` at all. Deliberately a second
+   15-line function instead of refactoring `scratch_ensure` into a shared (buffer, bytes)
+   helper: the finding asked for isolation, not churn in the allocation path every
+   existing Metal gate runs through, so `scratch_ensure` stays byte-for-byte unchanged.
+   `sg_gpu` is `calloc`'d so the handle starts nil; `sg_gpu_current_alloc_bytes` reads the
+   device's `currentAllocatedSize` so the peak-memory probe counts it with no tracker
+   change. Comments added anyway (the invariant outlives this kernel): on
+   `struct sg_gpu.scratch` itself, on the new field, at the ensure and bind sites, in the
+   kernel header, and in the `surge.h` contract. Honest caveat kept out of the comments'
+   claims: whether two users of one tracked `MTLBuffer` in a single encoder would actually
+   corrupt each other or would be serialized by Metal's default hazard tracking (a
+   performance loss, not a correctness one) could not be tested here; the separate buffer
+   removes both outcomes, so the wording states the sharing fact and the consequence range
+   rather than asserting one.
+2. **LOW, contradictory GQA doc.** `surge.h` promised a "falls back to kv head 0 when
+   n_heads < n_kv_heads" that `check_params` rejects; the kernel code was right, the
+   LAYOUT sentence was wrong, and the fallback is unreachable anyway (`n_heads <
+   n_kv_heads` with `n_heads % n_kv_heads == 0` forces `n_heads == 0`, also rejected).
+   Removed the false clause and added a **GQA DOMAIN** paragraph declaring which side is
+   authoritative: the CPU oracle's domain is a strict SUPERSET, and the METAL domain is
+   authoritative for anything dispatched, since on every shape these entry points accept
+   the two agree and on the shapes only the oracle accepts the dispatch is refused up
+   front rather than silently computed differently. Doc-only; the check stays strict.
+3. **LOW, determinism rerun only compared `out`.** Now captures and `memcmp`s m, s, acc
+   AND out on all 99 comparison reps, so a partial nondeterministic in a way the final
+   `num / S` division cancels (jitter every split's `m`, `s` and `acc` follow) can no
+   longer pass. Switched float `!=` to `memcmp` per the file's own `check_bit_identical` /
+   `det_check`: a stably-NaN output would have reported 99 phantom mismatches, and a
+   `+0.0` to `-0.0` flip (real nondeterminism) compares EQUAL under `!=` and would have
+   been missed. Counted per RUN, matching `det_check`. Gate strengthened, not weakened.
+4. **LOW, occupancy constraint written down** in the kernel header and the `surge.h`
+   contract, with the derivation: a threadgroup is `SG_TG` (256) lanes and the partial
+   hands out keys one per lane, so at seq 200 with n_splits 257 the per-split length is 1
+   and 255 of 256 lanes idle. Useful band: `n_heads * n_splits >= GPU cores` and
+   `n_splits <= seq / SG_TG`, the second being the bound this task's own motivation
+   ignored (1024 splits at seq 262,144). Both places say the next task needs a
+   MEASUREMENT inside that band, since nothing has been timed.
+
+**Verification (compiler and CPU only, GPU still held):** metal compile clean; metallib
+links with both kernels present (built to `/tmp`, `src/kernels.metallib` NOT overwritten);
+`metal.m` clean under `clang -fsyntax-only -std=c11 -Wall -Wextra -Werror`; the test
+compiles clean; `make debug` (SURGE_NO_METAL, ASan/UBSan) **exit 0, 83523 checks, 0
+failures**, no sanitizer diagnostics, identical to both the pre-P2.2 baseline and the
+first P2.2 commit. Every deleted line this round is inside P2.2's own code plus one
+`struct sg_gpu` comment extended in place (original sentence kept verbatim);
+`scratch_ensure`, `k_attn_decode_f16`, `enc_attn`, `enc_attn_f16` and `src/ref.c` remain
+byte-for-byte untouched. **Nothing moved from deferred to verified.**

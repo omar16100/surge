@@ -416,6 +416,158 @@ static void test_degenerate_no_nan(void) {
                       d, (double)out_sentinel[d]);
         }
     }
+
+    /* (d) out == NULL: the very first guard on the function (ref.c:241,
+     * `if (!out || head_dim == 0) return;`), pinned directly rather than
+     * left to whichever other test happens to exercise it under ASan. Must
+     * not crash for any n_parts / m-s-acc combination, since out is checked
+     * before anything is dereferenced. */
+    {
+        float m[3] = { 1.0f, 2.0f, 3.0f };
+        float s[3] = { 1.0f, 1.0f, 1.0f };
+        float acc[3 * 8];
+        for (uint32_t i = 0; i < 3 * head_dim; i++) acc[i] = 0.5f;
+
+        sg_ref_attn_combine(m, s, acc, 3, head_dim, NULL);       /* well-formed, out NULL */
+        sg_ref_attn_combine(NULL, NULL, NULL, 3, head_dim, NULL); /* NULL everything, n_parts>0 */
+        sg_ref_attn_combine(NULL, NULL, NULL, 0, head_dim, NULL); /* NULL everything, n_parts==0 */
+        /* No assertion beyond "did not crash": there is no out buffer for
+         * any of these calls to have written into. ASan/UBSan (this test
+         * runs under make debug) would flag any OOB or null-deref itself;
+         * reaching this line at all is the pass condition. */
+        tt_assert(1, "out==NULL calls completed without crashing");
+    }
+
+    /* (e) head_dim == 0: the same first-line guard's other half. out is
+     * non-NULL here specifically to prove head_dim == 0 alone is sufficient
+     * to no-op (out left byte-for-bit untouched), independent of whatever
+     * m/s/acc/n_parts are -- including NULL m/s/acc with n_parts > 0, which
+     * confirms head_dim == 0 is checked BEFORE the NULL-m/s/acc check further
+     * down, not merely that the end result happens to match. */
+    {
+        float sentinel[4] = { 7.0f, -3.0f, 42.5f, 0.0f };
+        float check[4];
+
+        memcpy(check, sentinel, sizeof sentinel);
+        sg_ref_attn_combine(NULL, NULL, NULL, 5, 0, check);   /* NULL m/s/acc, n_parts>0, head_dim=0 */
+        tt_assert(memcmp(check, sentinel, sizeof sentinel) == 0,
+                  "head_dim==0 with NULL m/s/acc, n_parts>0 must leave out untouched");
+
+        memcpy(check, sentinel, sizeof sentinel);
+        sg_ref_attn_combine(NULL, NULL, NULL, 0, 0, check);   /* NULL m/s/acc, n_parts==0, head_dim=0 */
+        tt_assert(memcmp(check, sentinel, sizeof sentinel) == 0,
+                  "head_dim==0 with n_parts==0 must leave out untouched");
+
+        float m[2] = { 1.0f, 2.0f }, s[2] = { 1.0f, 1.0f }, acc2[2] = { 0.5f, 0.5f };
+        memcpy(check, sentinel, sizeof sentinel);
+        sg_ref_attn_combine(m, s, acc2, 2, 0, check);         /* well-formed inputs, head_dim=0 */
+        tt_assert(memcmp(check, sentinel, sizeof sentinel) == 0,
+                  "head_dim==0 with well-formed m/s/acc must still leave out untouched");
+    }
+}
+
+/* --------------------------------------------------------------------
+ * Review finding (P2.0 round 1): NaN and +INFINITY in m[] must be handled
+ * consistently with sg_ref_softmax's own convention (propagate NaN rather
+ * than manufacture a value; +INFINITY partitions dominate completely, the
+ * same "puts all mass on the +inf entries" limit softmax computes), not
+ * silently laundered into 0.0 by the S > 0.0 division guard. See the
+ * attn_combine_weight comment in ref.c and sg_ref_attn_combine's surge.h
+ * contract for the full reasoning; this pins the four load-bearing cases.
+ * -------------------------------------------------------------------- */
+static void test_nan_and_infinity(void) {
+    const uint32_t head_dim = 4;
+
+    /* (a) NaN at m[0]: caught by the isnan(M) fast path (M is seeded from
+     * m[0], mirroring sg_ref_softmax's own isnan(m) branch). Every output
+     * dimension must be NaN, not a manufactured 0.0. */
+    {
+        float m[3] = { NAN, 2.0f, 3.0f };
+        float s[3] = { 1.0f, 1.0f, 1.0f };
+        float acc[3 * 4] = { 0.1f, 0.2f, 0.3f, 0.4f,  0.5f, 0.6f, 0.7f, 0.8f,
+                              0.9f, 1.0f, 1.1f, 1.2f };
+        float out[4];
+        sg_ref_attn_combine(m, s, acc, 3, head_dim, out);
+        for (uint32_t d = 0; d < head_dim; d++) {
+            tt_assert(isnan(out[d]), "NaN at m[0]: out[%u]=%g must be NaN", d, (double)out[d]);
+        }
+    }
+
+    /* (b) NaN at m[1] (index > 0), mixed with a genuinely empty partition at
+     * m[0]: NOT caught by isnan(M) (M is seeded from m[0] == -INFINITY, and
+     * the max scan's NaN > M comparison is always false, so M correctly
+     * lands on the finite max of the non-NaN entries, mirroring
+     * sg_ref_softmax's own max-scan). Caught instead by the isnan(S) check,
+     * a genuinely different code path than (a). Every output dimension must
+     * still be NaN. */
+    {
+        float m[3] = { -INFINITY, NAN, 5.0f };
+        float s[3] = { 0.0f, 1.0f, 1.0f };
+        float acc[3 * 4] = { 0.0f, 0.0f, 0.0f, 0.0f,  0.5f, 0.6f, 0.7f, 0.8f,
+                              0.9f, 1.0f, 1.1f, 1.2f };
+        float out[4];
+        sg_ref_attn_combine(m, s, acc, 3, head_dim, out);
+        for (uint32_t d = 0; d < head_dim; d++) {
+            tt_assert(isnan(out[d]), "NaN at m[1] (i>0): out[%u]=%g must be NaN", d, (double)out[d]);
+        }
+    }
+
+    /* (c) A single +INFINITY partition among several finite ones: dominates
+     * completely, weight exactly 1.0 for itself and exactly 0.0 for every
+     * other partition, so the result must be BIT-EXACT equal to combining
+     * that one partition alone (an implicit K == 1 identity, same reasoning
+     * as gate 2). */
+    {
+        uint32_t n_parts = 4;
+        float m[4] = { 1.0f, INFINITY, -3.0f, 2.5f };
+        float s[4] = { 2.0f, 5.0f, 3.0f, 4.0f };
+        float acc[4 * 4];
+        for (uint32_t i = 0; i < n_parts; i++) {
+            for (uint32_t d = 0; d < head_dim; d++) {
+                acc[i * head_dim + d] = (float)((i + 1) * 10 + d) * 0.1f;
+            }
+        }
+        float out[4];
+        sg_ref_attn_combine(m, s, acc, n_parts, head_dim, out);
+
+        float winner_m = m[1], winner_s = s[1];
+        float expect[4];
+        sg_ref_attn_combine(&winner_m, &winner_s, acc + 1 * head_dim, 1, head_dim, expect);
+
+        tt_assert(bit_equal(out, expect, head_dim),
+                  "single +INFINITY partition must be bit-exact vs that partition alone");
+    }
+
+    /* (d) TWO partitions tied at +INFINITY, mixed with a finite partition
+     * AND a genuinely empty (-INFINITY) partition: the tied pair must
+     * combine among only themselves, BIT-EXACT equal to a 2-partition
+     * combine of just their own (m, s, acc), with the finite and empty
+     * partitions contributing exactly nothing. */
+    {
+        uint32_t n_parts = 5;
+        float m[5] = { 1.0f, INFINITY, -INFINITY, INFINITY, 2.5f };
+        float s[5] = { 2.0f, 5.0f, 0.0f, 6.0f, 4.0f };
+        float acc[5 * 4];
+        for (uint32_t i = 0; i < n_parts; i++) {
+            for (uint32_t d = 0; d < head_dim; d++) {
+                acc[i * head_dim + d] = (i == 2) ? 0.0f : (float)((i + 1) * 10 + d) * 0.1f;
+            }
+        }
+        float out[4];
+        sg_ref_attn_combine(m, s, acc, n_parts, head_dim, out);
+
+        float tied_m[2] = { m[1], m[3] };
+        float tied_s[2] = { s[1], s[3] };
+        float tied_acc[2 * 4];
+        memcpy(tied_acc + 0 * head_dim, acc + 1 * head_dim, head_dim * sizeof(float));
+        memcpy(tied_acc + 1 * head_dim, acc + 3 * head_dim, head_dim * sizeof(float));
+        float expect[4];
+        sg_ref_attn_combine(tied_m, tied_s, tied_acc, 2, head_dim, expect);
+
+        tt_assert(bit_equal(out, expect, head_dim),
+                  "two tied +INFINITY partitions (plus a finite and an empty partition) "
+                  "must be bit-exact vs combining just the tied pair");
+    }
 }
 
 /* --------------------------------------------------------------------
@@ -534,6 +686,7 @@ int main(void) {
     tt_run("K==1 bit-exact identity", test_k1_bit_exact);
     tt_run("degenerate partitions: no NaN (some/all-but-one/all-empty/NULL)",
            test_degenerate_no_nan);
+    tt_run("NaN/+INFINITY in m[] (review round 1)", test_nan_and_infinity);
     tt_run("large-magnitude (+/-80 and beyond) robustness", test_large_magnitude);
     tt_run("100x determinism, byte-identical", test_determinism_100x);
 

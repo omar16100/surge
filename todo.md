@@ -1930,3 +1930,66 @@ Metal-only vs pure-C documented on each), `Makefile` (new `METAL_HYBRID_TESTS` r
   declaration, additive), `tests/test_attn_combine.c` (new file) touched code-wise. No
   kernel (`src/kernels.metal`), encoder (`src/metal.m`), or existing gate modified.
 - Full report: `.superpowers/sdd/2026-08-09-surge-m3-m5/task-P2.0-report.md`.
+
+### P2.0 fix round 1 (review: APPROVED, 3 Minor findings closed)
+
+Reviewer independently built an all-double gold reference, reproduced the exact
+numbers from the finding above, confirmed `sg_ref_attn_combine` is MORE accurate
+than the direct reference (1.205e-08 vs 1.942e-08 vs gold), extended to 860 stress
+cases, and mutation-tested the atol+rtol bound (a no-rescale mutant fails at
+1.8e5 over threshold, a dropped-partition mutant at 4.5e5) -- 5-6 orders of margin
+to a real defect. Three Minor findings, all closed in one round, no tolerance
+loosened:
+
+1. **The real one**: `sg_ref_attn_combine` had no defined behavior for NaN or
+   +INFINITY in `m[]`, only for the documented all-`-INFINITY` sentinel -- and its
+   neighbor `sg_ref_softmax` (same file, immediately above) explicitly handles
+   exactly those two cases. Worse than merely undefined: the existing `S > 0.0`
+   division guard silently LAUNDERED any NaN that reached `S` into a manufactured
+   `0.0` output (`NaN > 0.0` is false, so the ternary's false-branch fired),
+   exactly the failure mode `sg_ref_softmax`'s own header comment calls out as
+   "the worst possible answer." Fixed with a small `attn_combine_weight(mi, M)`
+   helper (`mi == M` -> exactly `1.0`, else `exp(mi - M)` as before) plus two new
+   early-return checks: `isnan(M)` (catches a NaN at `m[0]`, mirrors
+   `sg_ref_softmax`'s `isnan(m)` fast path) and `isnan(S)` (catches a NaN at any
+   other index, which poisons `S` the same way it poisons `sg_ref_softmax`'s own
+   sum) -- both propagate NaN to every `out[d]` instead of manufacturing zero. The
+   `mi == M` tie is what makes `M == +INFINITY` well-defined without a separate
+   branch: it turns the indeterminate `+INFINITY - +INFINITY` (NaN) into the
+   mathematically correct weight `1.0` for the partition(s) tied at the max, the
+   same "all mass on the +inf entries" limit `sg_ref_softmax`'s own `m == +INFINITY`
+   branch computes by counting hits, reached here through the general log-sum-exp
+   formula instead. Both behaviors now documented in `surge.h`'s contract
+   alongside the all-empty case. Proven not to regress K==1 (the tie-guard computes
+   the identical `1.0` bit pattern `exp(0.0)` already gave) or the existing
+   empty/all-empty paths (neither is reachable through the new code: all-empty
+   still returns via its own earlier check; an individually-empty partition's
+   `m[i] == -INFINITY` against a finite or `+INFINITY` `M` is never a tie, so it
+   still falls to the unchanged `exp(...)` branch).
+2. Added directed coverage for `out == NULL` and `head_dim == 0`, the two
+   conditions on the function's first-line guard that no prior test exercised
+   directly (the NULL-`m`/`s`/`acc` and `n_parts==0` paths already were pinned).
+   `head_dim == 0` is checked specifically WITH `n_parts > 0` and NULL `m`/`s`/`acc`
+   together, pinning that the guard order really does check `head_dim` before
+   dereferencing anything else.
+3. `task-P2.0-report.md` said the first run "failed 6 of 36 gate-1 assertions...
+   plus one Gate-3 sub-case" -- self-contradictory (implies 7) and wrong against
+   the run's own "869 checks, 6 failures" line. Recounted directly from the
+   original FAIL output (still in this session's transcript): 5 of the 36 gate-1
+   cases failed, plus 1 separate gate-3 "some-empty" sub-case (not one of the 36)
+   -- 6 total, matching the summary line. Corrected in the report.
+
+New test `test_nan_and_infinity` (`tests/test_attn_combine.c`): NaN at `m[0]`
+(isnan(M) path) and at `m[1]` (isnan(S) path, mixed with a genuinely empty
+partition) both assert every `out[d]` is NaN; a single `+INFINITY` partition among
+several finite ones is bit-exact vs that partition alone (an implicit K==1); two
+partitions tied at `+INFINITY`, mixed with a finite AND a genuinely empty partition,
+are bit-exact vs combining just the tied pair. Plus 4 new checks in
+`test_degenerate_no_nan` for `out==NULL` (3 call shapes, no-crash) and `head_dim==0`
+(3 call shapes, sentinel-verified untouched). `make debug` (SURGE_NO_METAL,
+ASan/UBSan): 883 checks (869 + 14 new), 0 failures, no sanitizer diagnostics, run
+twice, identical both times. GPU confirmed held throughout by the same 28h B7-retry
+benchmark (`pgrep -f "surge-bench|bench_niah"` non-empty before and after); no
+Metal binary touched. Scope stayed additive: only `src/ref.c`, `surge.h`,
+`tests/test_attn_combine.c` changed; no tolerance loosened, no existing gate
+touched.

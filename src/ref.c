@@ -236,6 +236,32 @@ void sg_ref_softmax(float *x, uint32_t n) {
  * Split-K attention combine (Task P2.0)
  * --------------------------------------------------------------------- */
 
+/* The per-partition rescale weight exp(mi - M), with ONE guard: when mi and M
+ * are the identical value (a tie for the max, checked by == not by
+ * subtracting), the weight is exactly 1.0 by definition, computed without
+ * subtracting at all. This is a no-op for an ordinary finite tie (ordinary
+ * IEEE-754 subtraction already gives exp(0.0) == 1.0 exactly there), but it
+ * is load-bearing for M == +INFINITY: mi == M == +INFINITY makes mi - M the
+ * indeterminate form INF - INF (NaN), even though the two values are
+ * genuinely equal and the weight they represent is unambiguously 1.0. Every
+ * other combination mi can take relative to a finite-or-+INFINITY M (mi <
+ * M, or mi == -INFINITY, i.e. an empty partition) already evaluates
+ * correctly through the subtraction (mi - M is -INFINITY, and
+ * exp(-INFINITY) == 0.0, no special case needed), including
+ * -INFINITY - (+INFINITY), which IEEE-754 defines as -INFINITY, not NaN
+ * (the indeterminate forms are only same-signed-infinity minus itself). A
+ * NaN mi (not caught here, since NaN == anything is always false) still
+ * correctly falls through to exp(NaN - M) == NaN, which is exactly the
+ * signal sg_ref_attn_combine below propagates rather than launders. */
+static double attn_combine_weight(double mi, double M) {
+    if (mi == M) return 1.0;
+    return exp(mi - M);
+}
+
+/* m/s/acc partial results into out. See surge.h for the full contract
+ * (the math, the determinism rule, and every documented degenerate-input
+ * case: n_parts == 0, all-empty, NaN, +/-INFINITY, and the NULL/contract-
+ * violation convention). */
 void sg_ref_attn_combine(const float *m, const float *s, const float *acc,
                          uint32_t n_parts, uint32_t head_dim, float *out) {
     if (!out || head_dim == 0) return;
@@ -258,10 +284,22 @@ void sg_ref_attn_combine(const float *m, const float *s, const float *acc,
      * surge.h / src/kernels.metal:7-27) -- not that max-of-a-sequence can
      * differ by iteration order anyway, but every pass here follows the same
      * fixed order on principle, since a future Metal port copies this shape
-     * verbatim. */
+     * verbatim. A NaN m[i] at i > 0 is never picked up here (NaN > M is
+     * always false), matching sg_ref_softmax's own max-scan above; that is
+     * handled below by the isnan(S) check instead, not here. */
     double M = (double)m[0];
     for (uint32_t i = 1; i < n_parts; i++) {
         if ((double)m[i] > M) M = (double)m[i];
+    }
+
+    /* m[0] itself NaN (the only way M can end up NaN, by the same reasoning
+     * sg_ref_softmax's isnan(m) check above relies on): mirror softmax's
+     * choice exactly -- "there is no defensible distribution to invent, so
+     * propagate rather than manufacture one." Every output dimension gets
+     * the same NaN value M carries, not a silently-manufactured 0.0. */
+    if (isnan(M)) {
+        for (uint32_t d = 0; d < head_dim; d++) out[d] = (float)M;
+        return;
     }
 
     /* All partitions empty (every m[i] == -INFINITY): M is -INFINITY here,
@@ -273,22 +311,49 @@ void sg_ref_attn_combine(const float *m, const float *s, const float *acc,
         return;
     }
 
-    /* Pass 2: S = sum_i s[i] * exp(m[i] - M), strictly increasing i. An
-     * empty partition has m[i] == -INFINITY here (M is finite because of the
-     * check above), so m[i] - M == -INFINITY and exp(...) == 0.0: its s[i]
-     * (0.0 by contract) times that is 0.0, no special case needed. */
+    /* M == +INFINITY (at least one partition reports +INFINITY as its own
+     * max) needs no branch of its own: attn_combine_weight gives every
+     * partition tied at that +INFINITY weight exactly 1.0 and every other
+     * partition weight exactly 0.0 (see its comment), which is precisely
+     * "the partition(s) achieving the max dominate completely" -- the same
+     * log-sum-exp limit sg_ref_softmax's own m == +INFINITY branch computes
+     * by counting hits, just expressed through the general formula instead
+     * of a separate hit-count loop. A single +INFINITY partition reduces
+     * exactly to that partition alone (out[d] = acc_k[d]/s_k, an implicit
+     * K == 1); several tied +INFINITY partitions combine among only
+     * themselves via their own (s_i, acc_i), exactly as if the others did
+     * not exist.
+     *
+     * Pass 2: S = sum_i s[i] * attn_combine_weight(m[i], M), strictly
+     * increasing i. An empty partition has m[i] == -INFINITY here (M is
+     * finite or +INFINITY because of the checks above), so its weight is
+     * 0.0 and its s[i] (0.0 by contract) times that is 0.0, no special case
+     * needed. */
     double S = 0.0;
     for (uint32_t i = 0; i < n_parts; i++) {
-        S += (double)s[i] * exp((double)m[i] - M);
+        S += (double)s[i] * attn_combine_weight((double)m[i], M);
     }
 
-    /* Pass 3: out[d] = ( sum_i acc[i][d] * exp(m[i] - M) ) / S, strictly
-     * increasing i for every d. exp(m[i] - M) does not depend on d and is
-     * recomputed here rather than cached in a scratch array: this file's
-     * policy is accuracy and obvious correctness over speed (the Metal
-     * kernel, a later task, is where performance is actually earned), and
-     * recomputing a pure function of already-fixed inputs changes no bit of
-     * the result.
+    /* A NaN m[i] at i > 0 was not caught by isnan(M) above (see pass 1's
+     * comment); it poisons this sum instead, exactly like sg_ref_softmax's
+     * own sum gets poisoned by a stray NaN score. Catch it HERE rather than
+     * only guarding the final division: S > 0.0 is false for a NaN S (every
+     * comparison with NaN is false), so without this check the division
+     * guard below would silently turn that NaN into a manufactured 0.0 --
+     * the exact failure mode sg_ref_softmax's own header comment calls out
+     * as "the worst possible answer." Propagate instead. */
+    if (isnan(S)) {
+        for (uint32_t d = 0; d < head_dim; d++) out[d] = (float)S;
+        return;
+    }
+
+    /* Pass 3: out[d] = ( sum_i acc[i][d] * attn_combine_weight(m[i], M) ) /
+     * S, strictly increasing i for every d. attn_combine_weight(m[i], M)
+     * does not depend on d and is recomputed here rather than cached in a
+     * scratch array: this file's policy is accuracy and obvious correctness
+     * over speed (the Metal kernel, a later task, is where performance is
+     * actually earned), and recomputing a pure function of already-fixed
+     * inputs changes no bit of the result.
      *
      * S > 0.0 whenever this line is reached under the documented input
      * contract: the partition achieving M is non-empty (M came from a real
@@ -296,11 +361,12 @@ void sg_ref_attn_combine(const float *m, const float *s, const float *acc,
      * exp(score - m[i]) term that equals exactly 1.0 for the key achieving
      * that partition's own max, so s[i] >= 1.0 and S >= 1.0 * exp(0) = 1.0.
      * The guard is defensive only, for a caller that violates that contract
-     * (e.g. a "non-empty" m[i] paired with s[i] == 0). */
+     * (e.g. a "non-empty" m[i] paired with s[i] == 0); S == NaN is ruled out
+     * above, so this comparison is never silently swallowing one. */
     for (uint32_t d = 0; d < head_dim; d++) {
         double num = 0.0;
         for (uint32_t i = 0; i < n_parts; i++) {
-            num += (double)acc[(size_t)i * head_dim + d] * exp((double)m[i] - M);
+            num += (double)acc[(size_t)i * head_dim + d] * attn_combine_weight((double)m[i], M);
         }
         out[d] = (S > 0.0) ? (float)(num / S) : 0.0f;
     }

@@ -421,6 +421,31 @@ void sg_ref_softmax(float *x, uint32_t n);
  * 0.0 for every d. This represents "attention over zero keys", which has no
  * textbook softmax value (0/0); zero is the documented convention.
  *
+ * NaN and +/-INFINITY in m[] are handled the same way sg_ref_softmax (above)
+ * handles a non-finite max, since this function exists specifically to
+ * consume partials from a Metal split-K kernel during bring-up, which is
+ * exactly when a NaN or +INFINITY partition max can show up:
+ *
+ *   - A NaN anywhere in m[] (at any index, not only m[0]) makes every
+ *     out[d] NaN: "there is no defensible distribution to invent, so
+ *     propagate rather than manufacture one" -- the same choice
+ *     sg_ref_softmax makes and for the same reason. A silently-manufactured
+ *     0.0 would be the worse failure, since it looks like a valid answer
+ *     instead of surfacing the corruption.
+ *   - +INFINITY in m[] (at least one partition reports +INFINITY as its own
+ *     max, distinct from -INFINITY, which means empty) makes the
+ *     partition(s) tied at that +INFINITY dominate completely, weight
+ *     exactly 1.0 each, every other partition weight exactly 0.0 -- the
+ *     same "puts all mass on the +inf entries" limit sg_ref_softmax's own
+ *     m == +INFINITY branch computes, just via the general log-sum-exp
+ *     formula instead of a separate hit-count loop (see attn_combine_weight
+ *     in ref.c). A single +INFINITY partition reduces to that partition
+ *     alone (an implicit K == 1: out[d] = acc_k[d]/s_k); several tied
+ *     +INFINITY partitions combine among only themselves via their own
+ *     (s_i, acc_i), exactly as if the other, non-tied partitions were not
+ *     there. Finite: no output is ever NaN or +/-INFINITY from this case
+ *     alone (unlike the NaN case above).
+ *
  * NULL handling mirrors the matvec functions above: a NULL out or head_dim
  * == 0 is a no-op. A NULL m, s or acc with n_parts > 0 is a caller contract
  * violation and is also a no-op (out left untouched) -- NOT the same as the

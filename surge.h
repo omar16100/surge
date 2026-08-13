@@ -133,10 +133,21 @@ typedef struct {
      *
      * The five DeltaNet dims are zero on a model with no linear-attention
      * layer. key_dim = n_k_heads*head_k_dim, value_dim = n_v_heads*head_v_dim
-     * and conv_dim = 2*key_dim + value_dim are derived, not stored. */
+     * and conv_dim = 2*key_dim + value_dim are derived, not stored.
+     *
+     * attn_output_gate (Task P1): true iff a full-attention layer's q_proj is
+     * DOUBLE width (n_heads*head_dim*2) with a sigmoid output gate folded
+     * into the second half, as the qwen3_5/qwen35 hybrid's Qwen3NextAttention
+     * does. Plain dense qwen3 (e.g. Qwen3-4B-Instruct-2507) has NO such gate:
+     * q_proj is single width and o_proj consumes the raw attention output.
+     * This flag makes that difference explicit in the config rather than
+     * hardcoded, so the loader, ref.c and metal.m can all size/dispatch the
+     * q buffer and the gate step from one place instead of assuming every
+     * full-attention layer is gated. */
     uint32_t rope_dim;
     uint32_t full_attn_interval;
     uint32_t n_k_heads, n_v_heads, head_k_dim, head_v_dim, conv_kernel;
+    bool attn_output_gate;
 } sg_cfg;
 
 /* Per-layer weight pointers. Exactly one of the two attention groups is

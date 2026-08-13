@@ -87,6 +87,31 @@ static sg_cfg cfg_small(void) {
     return c;
 }
 
+/* Task P1: a DENSE config, full_attn_interval == 1 so EVERY layer is
+ * full-attention and none is DeltaNet -- the shape a plain qwen3 GGUF (e.g.
+ * Qwen3-4B-Instruct-2507) loads into. Deliberately carries NO DeltaNet dims
+ * (n_k_heads/n_v_heads/head_k_dim/head_v_dim/conv_kernel all left at their
+ * memset 0), matching a real dense model, which has none. This exists to
+ * make concrete the P1 brief's "the downstream machinery already tolerates
+ * this" claim about kv_is_attn and sg_kv_new's n_gdn==0 guard, rather than
+ * leaving it as an unverified reading of kv.c. */
+static sg_cfg cfg_dense(void) {
+    sg_cfg c;
+    memset(&c, 0, sizeof c);
+    c.n_layers = 6;
+    c.n_heads = 4;
+    c.n_kv_heads = 2;
+    c.head_dim = 8;
+    c.hidden = 32;
+    c.vocab = 100;
+    c.rope_dim = 8;          /* full rotary on this fixture's head_dim */
+    c.rope_theta = 5000000.0f;
+    c.rms_eps = 1e-6f;
+    c.full_attn_interval = 1;
+    c.attn_output_gate = false;
+    return c;
+}
+
 /* --------------------------------------------------------------------
  * (1) Pure size math -- the gate numbers, WITHOUT allocating.
  * -------------------------------------------------------------------- */
@@ -324,6 +349,46 @@ static void test_object(void) {
     sg_kv_free(kv);
 }
 
+/* Task P1: full_attn_interval == 1 (dense, every layer full-attention, zero
+ * DeltaNet layers) end to end through sg_kv_new -- kv_is_attn's
+ * (layer+1)%1==0 is true for every layer, and sg_kv_new's n_gdn>0 block
+ * (which would otherwise demand the DeltaNet dims) never runs since n_gdn is
+ * 0. cfg_dense() carries no DeltaNet dims at all, matching a real dense
+ * checkpoint. */
+static void test_dense_all_attention(void) {
+    sg_cfg c = cfg_dense();
+    sg_kv *kv = NULL;
+    sg_err e = sg_kv_new(NULL, &c, 16, SG_T_F16, &kv);
+    tt_assert(!sg_failed(e) && kv, "sg_kv_new dense (interval=1, no DeltaNet dims): %s",
+              e.msg ? e.msg : "ok");
+    if (!kv) return;
+
+    uint32_t n_attn = 0, n_gdn = 0;
+    for (uint32_t l = 0; l < c.n_layers; l++) {
+        bool attn = sg_kv_k(kv, l) != NULL;
+        if (attn) {
+            n_attn++;
+            tt_assert(sg_kv_v(kv, l) != NULL, "dense layer %u has V too", l);
+            tt_assert(!sg_kv_conv(kv, l) && !sg_kv_s(kv, l),
+                      "dense layer %u should have no conv/S", l);
+        } else {
+            n_gdn++;
+        }
+    }
+    tt_assert(n_attn == c.n_layers,
+              "all %u dense layers should classify as full-attention, got %u",
+              c.n_layers, n_attn);
+    tt_assert(n_gdn == 0, "dense ssm/DeltaNet census should be 0, got %u", n_gdn);
+
+    /* The pure size math agrees: nonzero K+V, exactly zero DeltaNet state. */
+    tt_assert(sg_kv_state_bytes(&c) == 0,
+              "a dense (all-attention) config's DeltaNet state size must be 0");
+    tt_assert(sg_kv_bytes(&c, 16, SG_T_F16) > 0,
+              "a dense config's K+V size must be nonzero");
+
+    sg_kv_free(kv);
+}
+
 /* --------------------------------------------------------------------
  * (4) Rejections: cap > max, bad dtype, missing backend.
  * -------------------------------------------------------------------- */
@@ -406,6 +471,7 @@ int main(void) {
 #endif
     tt_run("f16 store/read-back in K buffer", test_f16_store_readback);
     tt_run("sg_kv object (getters/advance/reset)", test_object);
+    tt_run("dense config (full_attn_interval=1, all-attention)", test_dense_all_attention);
     tt_run("rejections (cap/dtype/backend)", test_rejections);
     tt_run("env-gated real-size alloc", test_alloc_gated);
 

@@ -1823,14 +1823,18 @@ static void enc_attn(sg_enc *E, sg_gpu_layer *L, uint32_t layer_idx, uint32_t po
     uint32_t hd = c->head_dim;
     uint32_t used = pos + 1;
     float scale = (float)(1.0 / sqrt((double)hd));
+    /* Task P1: per-head stride into g->b_qg. 2*hd (queries + folded gate) on
+     * the hybrid, hd (queries only) on dense qwen3; must stay consistent
+     * with g->q_width == c->n_heads * q_stride, set at load time. */
+    uint32_t q_stride = c->attn_output_gate ? 2 * hd : hd;
 
     enc_op(E, g->mat_kernel, L->w_q, 0, g->b_h, 0, g->b_qg, 0, nil, 0,
            PARAMS(g->q_width, c->hidden));
     /* q_norm applies to the queries only, never to the gate. */
     enc_op(E, KI_RMSNORM_HEADS, g->b_qg, 0, L->qk_norm, 0, g->b_qg, 0, nil, 0,
-           PARAMS(hd, c->n_heads, fbits(c->rms_eps), 1, 2 * hd));
+           PARAMS(hd, c->n_heads, fbits(c->rms_eps), 1, q_stride));
     enc_op(E, KI_ROPE_HEADS, g->b_qg, 0, g->b_cs, 0, g->b_qg, 0, nil, 0,
-           PARAMS(hd, c->rope_dim, c->n_heads, 2 * hd));
+           PARAMS(hd, c->rope_dim, c->n_heads, q_stride));
 
     if (g->kv_dtype == SG_T_F32) {
         uint64_t koff = (uint64_t)pos * g->kv_width;
@@ -1847,7 +1851,7 @@ static void enc_attn(sg_enc *E, sg_gpu_layer *L, uint32_t layer_idx, uint32_t po
                PARAMS(hd, c->rope_dim, c->n_kv_heads, hd));
 
         enc_op(E, KI_ATTN, g->b_qg, 0, L->kv, 0, g->b_ctx, 0, g->scratch, 0,
-               PARAMS(c->n_heads, c->n_kv_heads, hd, used, 2 * hd,
+               PARAMS(c->n_heads, c->n_kv_heads, hd, used, q_stride,
                       (uint32_t)vbase, fbits(scale)));
     } else {
         void *kbuf = sg_kv_k(g->kv, layer_idx);
@@ -1867,13 +1871,17 @@ static void enc_attn(sg_enc *E, sg_gpu_layer *L, uint32_t layer_idx, uint32_t po
         enc_kv_store(E, g->b_v32, vbuf, (uint64_t)pos * g->kv_width, g->kv_width);
 
         enc_attn_f16(E, g->b_qg, kbuf, vbuf, g->b_ctx,
-                     PARAMS(c->n_heads, c->n_kv_heads, hd, used, 2 * hd, fbits(scale)));
+                     PARAMS(c->n_heads, c->n_kv_heads, hd, used, q_stride, fbits(scale)));
     }
 
     /* The output gate is a sigmoid applied before o_proj -- same for both
-     * dtypes. */
-    enc_op(E, KI_GATE_STRIDED, g->b_ctx, 0, g->b_qg, 0, g->b_ctx, 0, nil, 0,
-           PARAMS(hd, c->n_heads, 2 * hd, hd));
+     * dtypes, and only when the model actually has one (Task P1). Dense
+     * qwen3 has no gate: g->b_ctx already holds the raw attention output, so
+     * o_proj below reads it unmodified. */
+    if (c->attn_output_gate) {
+        enc_op(E, KI_GATE_STRIDED, g->b_ctx, 0, g->b_qg, 0, g->b_ctx, 0, nil, 0,
+               PARAMS(hd, c->n_heads, 2 * hd, hd));
+    }
     enc_op(E, g->mat_kernel, L->w_o, 0, g->b_ctx, 0, g->b_r, 0, nil, 0,
            PARAMS(c->hidden, g->attn_width));
 }
@@ -1897,8 +1905,10 @@ static void enc_attn(sg_enc *E, sg_gpu_layer *L, uint32_t layer_idx, uint32_t po
  *
  * BUFFER SIZING (the caller's contract, since this reuses the decode field
  * names sized for one token): before calling, g->b_h must hold the chunk's
- * post-ln1 hidden [n, hidden]; g->b_qg [n, 2*attn_width], g->b_k32/b_v32
- * [n, kv_width], g->b_ctx [n, attn_width], g->b_r [n, hidden] must be
+ * post-ln1 hidden [n, hidden]; g->b_qg [n, q_width] (q_width == 2*attn_width
+ * when the model has an attention output gate, Task P1, else attn_width;
+ * see cfg.attn_output_gate), g->b_k32/b_v32 [n, kv_width], g->b_ctx
+ * [n, attn_width], g->b_r [n, hidden] must be
  * chunk-sized scratch; g->b_cs must hold the per-token RoPE table
  * [n, rope_dim] (cos half then sin half per absolute position, built in double
  * on the host exactly as sg_gpu_forward builds the one-token table); g->scratch
@@ -1913,19 +1923,23 @@ void enc_attn_prefill(sg_enc *E, sg_gpu_layer *L, uint32_t layer_idx,
     uint32_t eps = fbits(c->rms_eps);
     float scale = (float)(1.0 / sqrt((double)hd));
     int gemm = gemm_kernel_for(g->model->wtype);
+    /* Task P1: per-head stride into g->b_qg, same rule as enc_attn's
+     * decode-step twin. */
+    uint32_t q_stride = c->attn_output_gate ? 2 * hd : hd;
 
     /* Q/K/V projections for the whole chunk in one tiled GEMM each:
      * Y[n, width] = b_h[n, hidden] @ W[width, hidden]^T. */
     enc_matmul(E, gemm, g->b_h, 0, L->w_q, g->b_qg, 0, n, g->q_width, c->hidden);
     /* q_norm on every (token, head) query slice: n*n_heads slices of head_dim
-     * at stride 2*head_dim, weight = qk_norm[0..head_dim). Same in-place
-     * k_rmsnorm_heads the decode path uses, applied across the chunk. */
+     * at stride q_stride (2*head_dim when gated, head_dim when not), weight =
+     * qk_norm[0..head_dim). Same in-place k_rmsnorm_heads the decode path
+     * uses, applied across the chunk. */
     enc_op(E, KI_RMSNORM_HEADS, g->b_qg, 0, L->qk_norm, 0, g->b_qg, 0, nil, 0,
-           PARAMS(hd, n * c->n_heads, eps, 1, 2 * hd));
+           PARAMS(hd, n * c->n_heads, eps, 1, q_stride));
     /* Partial RoPE per token at its absolute position, from the chunk's cos/sin
      * table in g->b_cs. */
     enc_op(E, KI_ROPE_CHUNK, g->b_qg, 0, g->b_cs, 0, g->b_qg, 0, nil, 0,
-           PARAMS(hd, c->rope_dim, c->n_heads, 2 * hd, n));
+           PARAMS(hd, c->rope_dim, c->n_heads, q_stride, n));
 
     enc_matmul(E, gemm, g->b_h, 0, L->w_k, g->b_k32, 0, n, g->kv_width, c->hidden);
     enc_matmul(E, gemm, g->b_h, 0, L->w_v, g->b_v32, 0, n, g->kv_width, c->hidden);
@@ -1949,7 +1963,7 @@ void enc_attn_prefill(sg_enc *E, sg_gpu_layer *L, uint32_t layer_idx,
     {
         id<MTLComputeCommandEncoder> e = E->enc;
         const uint32_t pa[8] = { c->n_heads, c->n_kv_heads, hd, base, n,
-                                 2 * hd, fbits(scale), 0 };
+                                 q_stride, fbits(scale), 0 };
         [e setComputePipelineState:g->pipes[KI_ATTN_PREFILL]];
         [e setBuffer:bufof(g->b_qg) offset:(NSUInteger)offof(g->b_qg) atIndex:0];
         [e setBuffer:bufof(kbuf) offset:(NSUInteger)offof(kbuf) atIndex:1];
@@ -1962,9 +1976,12 @@ void enc_attn_prefill(sg_enc *E, sg_gpu_layer *L, uint32_t layer_idx,
     }
 
     /* Output gate (sigmoid of the second half of each head's q_proj slice),
-     * then o_proj, both chunked. */
-    enc_op(E, KI_GATE_STRIDED, g->b_ctx, 0, g->b_qg, 0, g->b_ctx, 0, nil, 0,
-           PARAMS(hd, n * c->n_heads, 2 * hd, hd));
+     * then o_proj, both chunked -- gate only when the model has one (Task
+     * P1); dense qwen3 feeds g->b_ctx straight to o_proj unmodified. */
+    if (c->attn_output_gate) {
+        enc_op(E, KI_GATE_STRIDED, g->b_ctx, 0, g->b_qg, 0, g->b_ctx, 0, nil, 0,
+               PARAMS(hd, n * c->n_heads, 2 * hd, hd));
+    }
     enc_matmul(E, gemm, g->b_ctx, 0, L->w_o, g->b_r, 0, n, c->hidden, g->attn_width);
 }
 
@@ -2374,7 +2391,9 @@ sg_err sg_gpu_load_model(sg_gpu *g, const sg_model *m) {
     g->value_dim = c->n_v_heads * c->head_v_dim;
     g->conv_dim = 2 * g->key_dim + g->value_dim;
     g->attn_width = c->n_heads * c->head_dim;
-    g->q_width = 2 * g->attn_width;
+    /* Doubled only when the model folds an output gate into q_proj (Task P1;
+     * cfg.attn_output_gate, surge.h). Dense qwen3 has none. */
+    g->q_width = (c->attn_output_gate ? 2u : 1u) * g->attn_width;
     g->kv_width = c->n_kv_heads * c->head_dim;
     g->mat_kernel = matmul_kernel_for(m->wtype);
 

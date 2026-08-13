@@ -476,6 +476,92 @@ static void real_model_forward_smoke(void) {
     sg_st_close(s);
 }
 
+/* Task P1, gate 3: the plain DENSE qwen3 GGUF (e.g.
+ * Qwen3-4B-Instruct-2507-Q8_0.gguf) must be runnable through the CPU
+ * reference, not just loadable -- the loader changes under test (rope_dim,
+ * full_attn_interval, attn_output_gate, the ffn_norm.weight fallback) only
+ * show up once a forward pass actually dereferences every layer, not at
+ * sg_model_from_gguf time. This is a MECHANICAL runnability + finiteness
+ * check over a handful of positions (arbitrary in-range token ids, no real
+ * tokenizer text), not a coherence check -- that needs mlx-lm/llama.cpp
+ * top-1 agreement and is explicitly out of this loader-only task's scope
+ * (deferred to the GPU-kernel task that follows it). The pure-C
+ * double-accumulator ref is slow (~10 s/position on the 64-layer 27B per the
+ * M3.4 report), so this stays at three positions on the smaller 36-layer 4B
+ * rather than a real generation. */
+static void qwen3_dense_real_model_forward_smoke(void) {
+    const char *path = getenv("SURGE_GGUF_QWEN3");
+    if (!path) {
+        fprintf(stderr, "   SKIP: set SURGE_GGUF_QWEN3=/Users/macmini/models/gguf/"
+                        "Qwen3-4B-Instruct-2507-Q8_0.gguf to run a few real dense "
+                        "qwen3 positions through the CPU reference (gate 3)\n");
+        return;
+    }
+    sg_gguf *g = NULL;
+    sg_err e = sg_gguf_open(path, &g);
+    tt_assert(!sg_failed(e), "sg_gguf_open(%s): %s", path, e.msg ? e.msg : "ok");
+    if (sg_failed(e)) return;
+    sg_model m;
+    e = sg_model_from_gguf(g, &m);
+    tt_assert(!sg_failed(e), "sg_model_from_gguf: %s", e.msg ? e.msg : "ok");
+    if (sg_failed(e)) { sg_gguf_close(g); return; }
+
+    tt_assert(m.cfg.rope_dim == 128 && m.cfg.head_dim == 128,
+              "qwen3-dense rope_dim %u of head_dim %u (want full rotary, 128 of 128)",
+              m.cfg.rope_dim, m.cfg.head_dim);
+    tt_assert(m.cfg.full_attn_interval == 1, "qwen3-dense full_attn_interval %u",
+              m.cfg.full_attn_interval);
+    tt_assert(!m.cfg.attn_output_gate, "qwen3-dense should have no output gate");
+    tt_assert(!m.norms_are_residual,
+              "the GGUF converter bakes the +1.0 norm shift in; qwen3-dense norms "
+              "should be absolute like the hybrid GGUF");
+
+    /* Arbitrary in-range token ids: this proves the forward pass runs to
+     * completion and stays numerically sane, not that any particular id
+     * decodes to anything meaningful (no tokenizer is used here). */
+    const int32_t ids[] = { 0, 9419, 1000 };
+    const size_t n_ids = sizeof ids / sizeof *ids;
+
+    sg_ref_state *st = NULL;
+    e = sg_ref_state_new(&m, (uint32_t)n_ids, &st);
+    tt_assert(!sg_failed(e), "sg_ref_state_new on qwen3-dense: %s", e.msg ? e.msg : "ok");
+    if (sg_failed(e)) { sg_model_free(&m); sg_gguf_close(g); return; }
+
+    uint32_t ran = 0;
+    for (uint32_t t = 0; t < n_ids; t++) {
+        tt_assert(ids[t] >= 0 && (uint32_t)ids[t] < m.cfg.vocab,
+                  "test bug: id %d out of vocab range", ids[t]);
+        const float *lg = NULL;
+        e = sg_ref_forward(st, &m, ids[t], t, &lg);
+        tt_assert(!sg_failed(e), "sg_ref_forward pos %u on qwen3-dense: %s",
+                  t, e.msg ? e.msg : "ok");
+        if (sg_failed(e)) break;
+        ran++;
+
+        uint32_t arg = 0;
+        double sum = 0.0;
+        bool finite = true;
+        for (uint32_t i = 0; i < m.cfg.vocab; i++) {
+            if (!isfinite(lg[i])) finite = false;
+            if (lg[i] > lg[arg]) arg = i;
+            sum += (double)lg[i];
+        }
+        tt_assert(finite, "qwen3-dense pos %u: every logit must be finite", t);
+        tt_assert(lg[arg] > -60.0f && lg[arg] < 60.0f,
+                  "qwen3-dense pos %u: top logit should be O(10), got %.4f",
+                  t, (double)lg[arg]);
+        fprintf(stderr,
+                "   qwen3-dense pos %u (id %d): argmax %u, max logit %.4f, mean %.4f\n",
+                t, ids[t], arg, (double)lg[arg], sum / (double)m.cfg.vocab);
+    }
+    tt_assert(ran == n_ids, "qwen3-dense: only %u/%zu positions ran to completion",
+              ran, n_ids);
+
+    sg_ref_state_free(st);
+    sg_model_free(&m);
+    sg_gguf_close(g);
+}
+
 /* The frozen M1 regression fixture.
  *
  * tools/tf_compare.py's full dumps are 1017 MB, so what is committed is
@@ -622,6 +708,7 @@ int main(void) {
     tt_run("ref_forward_rejects_bad_input", ref_forward_rejects_bad_input);
     tt_run("ref_state_rejects_layer_kind_mismatch", ref_state_rejects_layer_kind_mismatch);
     tt_run("real_model_forward_smoke", real_model_forward_smoke);
+    tt_run("qwen3_dense_real_model_forward_smoke", qwen3_dense_real_model_forward_smoke);
     tt_run("m1_frozen_digest_still_reproduces", m1_frozen_digest_still_reproduces);
     return tt_report();
 }

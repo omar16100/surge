@@ -148,6 +148,45 @@
  *    one here (it fires on the real 2B, whose conv1d.weight is [6144,1,4]),
  *    with a probe for the two plausible spellings of the mtp head as a
  *    secondary trigger.
+ *
+ * 13. (Task P1) A second, PLAIN DENSE architecture is now accepted from GGUF:
+ *    general.architecture == "qwen3" (no "5"/"_5"), e.g.
+ *    Qwen3-4B-Instruct-2507-Q8_0.gguf. It is a uniform 36-layer full-attention
+ *    transformer, not a hybrid: zero gated-DeltaNet layers, and every
+ *    full-attention layer has a SINGLE-width q_proj with no folded output
+ *    gate (cfg.attn_output_gate, surge.h). Three real-file corrections found
+ *    while wiring this up, none anticipated by the task brief that scoped it:
+ *
+ *      a. general.architecture == "qwen3" implies dense: it carries no
+ *         qwen3.full_attention_interval key at all (that key is specific to
+ *         the qwen35/qwen3_5 hybrid converter), so a dense checkpoint sets
+ *         cfg.full_attn_interval = 1 outright rather than reading it -- every
+ *         layer is then a full-attention layer by the same
+ *         (L+1)%full_attn_interval==0 rule the hybrid uses.
+ *
+ *      b. It ALSO carries no qwen3.rope.dimension_count key. This is the
+ *         dangerous one: Qwen3 uses FULL rotary (rope_dim == head_dim, 128 of
+ *         128), and rope_dim is even and <= head_dim for every value from 2
+ *         to 128, so a wrong default here passes every downstream validity
+ *         check silently. In particular the safetensors loader's existing
+ *         default (int(head_dim * partial_rotary_factor), 0.25 when the key
+ *         is absent -- correct for the qwen3_5 hybrid, which really is a
+ *         partial-rotary model) would be the WRONG default to copy for dense
+ *         qwen3 and would silently compute rope_dim 32 instead of 128,
+ *         loading and running with wrong output and no error. The dense
+ *         branch below therefore defaults cfg.rope_dim to cfg.head_dim (full
+ *         rotary) and only lets an explicit qwen3.rope.dimension_count
+ *         override it. tests/test_model.c's dense config-extraction test
+ *         asserts rope_dim == 128 specifically to catch a regression to 32.
+ *
+ *      c. The pre-MLP norm tensor is named blk.N.ffn_norm.weight on this
+ *         file, not blk.N.post_attention_norm.weight like the hybrid GGUF
+ *         (note 3 above) -- llama.cpp's standard norm name, confirmed absent/
+ *         present the same way note 3 was originally confirmed. The layer
+ *         loop tries the hybrid name first, then falls back to this one, by
+ *         tensor presence rather than by branching on architecture (same
+ *         convention as notes 2 and 8), so neither path's lookup order
+ *         changes based on which architecture is loaded.
  */
 #include "surge.h"
 
@@ -156,7 +195,19 @@
 #include <string.h>
 
 static bool gguf_arch_recognized(const char *a) {
-    return a && (strcmp(a, "qwen35") == 0 || strcmp(a, "qwen3_5") == 0);
+    return a && (strcmp(a, "qwen35") == 0 || strcmp(a, "qwen3_5") == 0
+                 || strcmp(a, "qwen3") == 0);
+}
+
+/* "qwen3" (bare) is the DENSE Qwen3 family (e.g. Qwen3-4B-Instruct-2507):
+ * full softmax attention on every layer, no gated-DeltaNet/SSM layers, and a
+ * SINGLE-width q_proj with no folded output gate -- confirmed against the
+ * real file's tensor directory (blk.N.attn_q.weight is [hidden, n_heads*
+ * head_dim], not [hidden, 2*n_heads*head_dim], and there are zero blk.N.ssm_*
+ * or blk.N.attn_gate.weight tensors anywhere). "qwen35"/"qwen3_5" stay the
+ * hybrid family the rest of this file's notes describe. */
+static bool gguf_arch_is_dense_qwen3(const char *a) {
+    return a && strcmp(a, "qwen3") == 0;
 }
 
 /* The derived widths every tensor's size is checked against. Computed in
@@ -274,10 +325,17 @@ sg_err sg_model_from_gguf(const sg_gguf *g, sg_model *m) {
 
     const char *arch = NULL;
     if (!sg_gguf_get_str(g, "general.architecture", &arch) || !gguf_arch_recognized(arch)) {
-        return (sg_err){"model: unrecognized gguf architecture (expected qwen35 or qwen3_5)"};
+        return (sg_err){"model: unrecognized gguf architecture "
+                        "(expected qwen35, qwen3_5 or qwen3)"};
     }
+    bool dense = gguf_arch_is_dense_qwen3(arch);
 
     sg_cfg cfg = {0};
+    /* Hybrid: q_proj folds a sigmoid output gate (file header note 5). Dense
+     * qwen3: no gate at all. Set before shapes_of() runs below so every
+     * width derived from it (the q_proj element check here, g->q_width in
+     * metal.m, st->q_width in ref.c) agrees. */
+    cfg.attn_output_gate = !dense;
     char key[160];
 
 #define GGUF_U32(suffix, dst, errmsg) do { \
@@ -324,12 +382,43 @@ sg_err sg_model_from_gguf(const sg_gguf *g, sg_model *m) {
     GGUF_F32("rope.freq_base", cfg.rope_theta, "model: gguf missing <arch>.rope.freq_base");
     GGUF_F32("attention.layer_norm_rms_epsilon", cfg.rms_eps,
              "model: gguf missing <arch>.attention.layer_norm_rms_epsilon");
-    /* The GGUF states the rotated width outright, so there is no
-     * partial_rotary_factor multiplication to round here. */
-    GGUF_U32("rope.dimension_count", cfg.rope_dim,
-             "model: gguf missing <arch>.rope.dimension_count");
-    GGUF_U32("full_attention_interval", cfg.full_attn_interval,
-             "model: gguf missing <arch>.full_attention_interval");
+    if (dense) {
+        /* THE TRAP (Task P1, most important fix in this file). The hybrid
+         * branch below requires <arch>.rope.dimension_count outright, which
+         * is correct there because both real hybrid checkpoints state it
+         * (64 of 256). The real dense Qwen3-4B-Instruct-2507 GGUF carries NO
+         * qwen3.rope.dimension_count key at all (verified against the actual
+         * file), so naively reusing sg_model_from_st's
+         * partial_rotary_factor-0.25-of-head_dim default here would compute
+         * rope_dim = 32 of 128 -- Qwen3 has no partial_rotary_factor concept
+         * and actually uses FULL rotary. rope_dim 32 is even and <= head_dim,
+         * so it passes every validity check in ref.c and metal.m and would
+         * load and run, producing WRONG logits with no error anywhere. The
+         * only safe default for a dense qwen3 file is full rotary
+         * (rope_dim == head_dim); the optional read only OVERRIDES that if a
+         * future dense checkpoint ever states the key explicitly. Covered by
+         * tests/test_model.c's anti-trap regression (asserts 128, not 32). */
+        cfg.rope_dim = cfg.head_dim;
+        GGUF_U32_OPT("rope.dimension_count", cfg.rope_dim);
+
+        /* Real dense qwen3 GGUFs carry no <arch>.full_attention_interval key
+         * either (that key is specific to the qwen35/qwen3_5 hybrid
+         * converter): dense means every layer is a full-attention layer, and
+         * interval 1 makes (L+1) % 1 == 0 true for every L, which is exactly
+         * what kv_is_attn / check_layer_groups / the ref.c and metal.m
+         * layer-kind cross-checks already expect (file header note 2's rule
+         * still decides layer kind by tensor presence; this just makes the
+         * config side of that cross-check agree for every layer). */
+        cfg.full_attn_interval = 1;
+    } else {
+        /* The GGUF states the rotated width outright, so there is no
+         * partial_rotary_factor multiplication to round here. Required, byte-
+         * identical to before Task P1: both real hybrid checkpoints state it. */
+        GGUF_U32("rope.dimension_count", cfg.rope_dim,
+                 "model: gguf missing <arch>.rope.dimension_count");
+        GGUF_U32("full_attention_interval", cfg.full_attn_interval,
+                 "model: gguf missing <arch>.full_attention_interval");
+    }
 
     /* DeltaNet dims: optional (see file header note 10). inner_size is the
      * whole value width, so head_v_dim is a division rather than a key. */
@@ -438,14 +527,33 @@ sg_err sg_model_from_gguf(const sg_gguf *g, sg_model *m) {
         lw->field = _t ? _t->data : NULL; \
     } while (0)
 
+    /* q_proj's element count: DOUBLE width (queries + folded output gate) on
+     * the hybrid, single width on dense qwen3 (Task P1; see cfg.attn_output_gate
+     * above and file header note 5). Computed once, outside the loop: it does
+     * not depend on i. */
+    uint64_t q_mult = cfg.attn_output_gate ? 2 : 1;
+
     for (uint32_t i = 0; i < cfg.n_layers; i++) {
         sg_layer_w *lw = &layers[i];
 
         REQ("blk.%u.attn_norm.weight", ln1, SG_T_F32, sh.hidden,
             "model: gguf missing blk.N.attn_norm.weight");
-        /* post_attention_norm.weight, not ffn_norm.weight (see file header note 3). */
-        REQ("blk.%u.post_attention_norm.weight", ln2, SG_T_F32, sh.hidden,
-            "model: gguf missing blk.N.post_attention_norm.weight");
+        /* The hybrid GGUF spells the pre-MLP norm post_attention_norm.weight
+         * (file header note 3). The real DENSE qwen3 GGUF
+         * (Qwen3-4B-Instruct-2507, Task P1) spells the SAME tensor
+         * ffn_norm.weight instead -- llama.cpp's standard norm name for this
+         * position, confirmed against the real file's tensor directory (it
+         * has no post_attention_norm.weight tensor at all). Try the hybrid
+         * name first (so the hybrid path's lookup order, and therefore its
+         * behavior, is unchanged), then fall back to the dense name, rather
+         * than branching on architecture -- consistent with this file's
+         * tensor-presence-decides convention (notes 2 and 8). */
+        OPT("blk.%u.post_attention_norm.weight", ln2, SG_T_F32, sh.hidden);
+        if (!lw->ln2) {
+            REQ("blk.%u.ffn_norm.weight", ln2, SG_T_F32, sh.hidden,
+                "model: gguf missing blk.N.post_attention_norm.weight or "
+                "blk.N.ffn_norm.weight");
+        }
         REQ("blk.%u.ffn_gate.weight", gate_proj, mat_type, sh.ffn * sh.hidden,
             "model: gguf missing blk.N.ffn_gate.weight");
         REQ("blk.%u.ffn_up.weight", up_proj, mat_type, sh.ffn * sh.hidden,
@@ -454,7 +562,7 @@ sg_err sg_model_from_gguf(const sg_gguf *g, sg_model *m) {
             "model: gguf missing blk.N.ffn_down.weight");
 
         /* Optional: NULL on a linear-attention layer (see file header note 2). */
-        OPT("blk.%u.attn_q.weight", q_proj, mat_type, 2 * sh.attn_w * sh.hidden);
+        OPT("blk.%u.attn_q.weight", q_proj, mat_type, q_mult * sh.attn_w * sh.hidden);
         OPT("blk.%u.attn_k.weight", k_proj, mat_type, sh.kv_w * sh.hidden);
         OPT("blk.%u.attn_v.weight", v_proj, mat_type, sh.kv_w * sh.hidden);
         OPT("blk.%u.attn_output.weight", o_proj, mat_type, sh.hidden * sh.attn_w);
@@ -609,6 +717,15 @@ sg_err sg_model_from_st(const sg_st *s, sg_model *m) {
     if (!s) return (sg_err){"model: invalid arguments"};
 
     sg_cfg cfg = {0};
+    /* This loader only ever maps the qwen3_5/qwen35 hybrid safetensors
+     * checkpoint (see file header note 2): every full-attention layer's
+     * q_proj is double width with a folded sigmoid output gate. Task P1's
+     * dense qwen3 is GGUF-only so far (sg_model_from_gguf derives this from
+     * general.architecture); this stays unconditionally true here so the
+     * hybrid st path is unaffected -- leaving it at {0}'s default false would
+     * silently halve q_proj's expected width and break every full-attention
+     * layer on this path. */
+    cfg.attn_output_gate = true;
     if (!sg_st_config_u32(s, "num_hidden_layers", &cfg.n_layers)) {
         return (sg_err){"model: config.json missing num_hidden_layers"};
     }

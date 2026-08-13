@@ -1754,3 +1754,99 @@ Metal-only vs pure-C documented on each), `Makefile` (new `METAL_HYBRID_TESTS` r
   every round of fixes. Existing M5.6/M5.7/B5/B6 assertions unaffected -- no existing check
   touched, weakened, or reordered. Full report:
   `.superpowers/sdd/2026-08-09-surge-m3-m5/task-B8-report.md`.
+
+## Task P1 Results (model_qwen.c/ref.c/metal.m: load dense qwen3 alongside the hybrid)
+
+- WHY: the llm-rnd 256K comparison found Qwen3-4B-Instruct-2507 is one of only two models that
+  recall 8/8 needles at 262,144 tokens (it decodes at 2.37 tok/s there). surge could not load it
+  at all -- `general.architecture == "qwen3"` (bare, no "5"/"_5") was hard-rejected. This task is
+  the loader work only; making the 4B's decode fast is a later task. HARD CONSTRAINT: a 28-hour
+  B7-retry benchmark (`surge-bench`, 27B 256K) held the GPU the entire time
+  (`pgrep -f "surge-bench|bench_niah"` confirmed non-empty before and throughout) -- `make check`,
+  `surge`, `surge-bench`, and every Metal binary were off-limits; only `make debug`
+  (`-DSURGE_NO_METAL`, ASan/UBSan) and pure-C tests/tools (`surge-info`, `surge-ref`, which link
+  none of `metal.m`/Frameworks) were used.
+- FOUR VERIFIED BLOCKERS, all fixed: (1) `gguf_arch_recognized` (`src/model_qwen.c`) now accepts
+  `qwen3` alongside `qwen35`/`qwen3_5`. (2) NEW `sg_cfg.attn_output_gate` bool (`surge.h`): true for
+  the hybrid (double-width q_proj, folded sigmoid gate), false for dense qwen3 (single-width,
+  no gate). Set explicitly in both loaders (`sg_model_from_gguf` derives it from
+  `general.architecture`; `sg_model_from_st` hardcodes true, since that loader only ever sees the
+  hybrid safetensors checkpoint -- leaving it at the struct's `{0}` default would have silently
+  broken the hybrid path). Makes the q_proj element-count check
+  (`q_mult * sh.attn_w * sh.hidden`), `src/ref.c`'s `attn_layer` (`q_stride` local replaces the
+  hardcoded `2 * hd` at every one of its 3 use sites; the gate-extraction memcpy and the final
+  `sg_ref_gate_sigmoid` call are now `if (c->attn_output_gate)`), and `src/metal.m`'s `enc_attn` /
+  `enc_attn_prefill` (same `q_stride` pattern at 7 combined sites; the `KI_GATE_STRIDED` dispatch in
+  both is wrapped `if (c->attn_output_gate)`, its own body left byte-for-bit since it only runs when
+  the gate exists) all conditional. `g->q_width` at load time in `metal.m` is now
+  `(attn_output_gate?2:1) * attn_width`. (3) `full_attn_interval` defaulted to 4 and required
+  `<arch>.full_attention_interval`, which a real dense file does not carry at all; the dense branch
+  now sets it to 1 outright (every layer full-attention by the existing `(L+1)%interval==0` rule).
+  (4) THE TRAP, MOST IMPORTANT: `rope.dimension_count` was similarly required, and a real dense
+  file carries no such key either. `rope_dim` is even and <= head_dim for every value from 2 to
+  128, so a wrong default (e.g. naively reusing the safetensors loader's existing
+  `partial_rotary_factor`-0.25-of-head_dim fallback, correct there but wrong here) would pass every
+  validity check in `ref.c`/`metal.m` and load a model that RUNS with WRONG output, no error
+  anywhere. Fix: dense defaults `rope_dim = head_dim` (full rotary) and only lets an explicit
+  `qwen3.rope.dimension_count` override it. Covered by an explicit regression test asserting 128,
+  not 32.
+- A FIFTH FIX, found empirically (not among the brief's four, which the task brief had already
+  verified against the file): the real 4B's pre-MLP norm tensor is `blk.N.ffn_norm.weight`, not
+  `blk.N.post_attention_norm.weight` like the hybrid GGUF (confirmed via `surge-info` and a
+  standalone GGUF tensor-directory dump -- `blk.0.*` has no `post_attention_norm.weight` at all).
+  Without this, the loader would still hard-fail on every real dense file even with all four brief
+  blockers fixed. Fixed by tensor presence, not architecture branching (consistent with this file's
+  existing convention, notes 2/8): try `post_attention_norm.weight` first (unchanged hybrid lookup
+  order), fall back to `ffn_norm.weight`.
+- EMPIRICAL RECON (via `surge-info`, built and run Metal-free -- `cli_info.c` links only
+  `sg_gguf_*`, no Metal/Foundation -- against the real, already-downloaded, `chflags uchg`-protected
+  `/Users/macmini/models/gguf/Qwen3-4B-Instruct-2507-Q8_0.gguf`): confirmed `general.architecture =
+  "qwen3"`; 36 layers, 32 heads, 8 kv heads, head_dim 128 (`attention.key_length` ==
+  `attention.value_length`), hidden 2560, ffn 9728, vocab 151936, rope_theta 5e6, rms_eps 1e-6,
+  context_length 262144; `qwen3.rope.dimension_count` and `qwen3.full_attention_interval` BOTH
+  absent (the exact trap); `blk.0.attn_q.weight` is `[2560,4096]` (single-width, 4096 ==
+  32*128, not 8192); zero `ssm_*`/`attn_gate.weight`/`attn_qkv.weight` tensors anywhere (398 total
+  tensors == 36*11 + 2, exactly accounted for); no `output.weight` (tied embeddings).
+- TESTS (new, all pass): `tests/test_model.c` `model_from_gguf_dense_qwen3_real` (env-gated
+  `SURGE_GGUF_QWEN3`, a NEW env var -- a different real file/architecture from `SURGE_GGUF`'s
+  hybrid 27B, so it needed its own rather than overloading that one): asserts the config
+  (36/32/8/128/2560/9728/151936/5e6, `full_attn_interval==1`, `attn_output_gate==false`), the
+  ANTI-TRAP `rope_dim==128` specifically, all 36 layers full-attention with a 0 ssm census (looped
+  over every layer, not a sample), the single-width q_proj factor and the `ffn_norm.weight`
+  fallback cross-checked directly against the tensor directory. `tests/test_ref_fwd.c`
+  `qwen3_dense_real_model_forward_smoke` (same env var, gate 3): 3 arbitrary in-range token ids
+  through `sg_ref_forward` on the real 4B, asserts every logit finite and the top logit O(10) --
+  runs in ~10s at `-O2`, ~70s under ASan/UBSan (`-O0`), so "a few positions" was well within
+  budget, not "impractical". `tests/test_kv.c` `test_dense_all_attention` (hermetic, no real file
+  needed): a synthetic `full_attn_interval==1` config with NO DeltaNet dims set at all proves
+  `sg_kv_new` accepts it and every layer gets K/V and no conv/S, making concrete the brief's "the
+  downstream machinery already tolerates this" claim about `kv_is_attn`/`n_gdn==0`.
+- HYBRID REGRESSION, verified BYTE-IDENTICAL, not just "still passes": ran the existing
+  `model_from_st_real` / `real_model_forward_smoke` / `m1_frozen_digest_still_reproduces` against
+  the real hybrid 2B safetensors (`SURGE_ST=/Users/macmini/models/qwen35-2b`, a file completely
+  separate from the 27B the live benchmark holds, so zero I/O contention risk) under BOTH `-O2` and
+  the full ASan/UBSan `-O0` debug build: 173 + 129 checks, 0 failures, and the frozen M1 digest
+  (32 positions across 16 prompts, tight 1e-5 tolerance) landed at IDENTICAL max delta 2.218e-07 in
+  both builds -- the exact same number recorded before this task's `ref.c` changes (per the M5.7/B*
+  reports' established digest-comparison method). The real hybrid 27B GGUF (the file the live
+  benchmark is reading) was deliberately NOT opened concurrently during this task, out of caution
+  for the 28-hour run, even though the loader only reads small header/tensor-directory bytes, not
+  the weight payloads -- deferred to when the GPU is free; the mini hybrid GGUF fixture
+  (`mini_fwd_gguf_matches_mlx`, small synthetic file, exercises the same `post_attention_norm.weight`
+  lookup and 2x q_proj GGUF code path) ran clean under `make debug` throughout regardless.
+- GATES: `make debug` (SURGE_NO_METAL, ASan/UBSan) exits 0, 14 suites, 0 failures, no sanitizer
+  diagnostics (hermetic, no env vars). All real-file runs above (dense 4B gates 2+3, hybrid 2B
+  regression) also exit 0 clean under both `-O2` and the ASan/UBSan debug build. `src/metal.m`
+  could not be compiled with the real Metal frameworks or linked/run at all (excluded from every
+  pure-C target by `LIB_SRC`, and `make debug`'s `SURGE_NO_METAL` branch never touches it either) --
+  verified instead with `xcrun clang -fsyntax-only -Wall -Wextra -Werror` (clean, 0 warnings) plus
+  the strong indirect evidence that `src/ref.c`'s CPU twin, which implements the EXACT SAME
+  `q_stride`/conditional-gate pattern, is proven byte-identical on the hybrid path above. DEFERRED
+  (document, do not attempt, per the brief): `make check`, the Metal forward on either architecture,
+  byte-exact Metal-vs-ref greedy, and top-1 agreement vs mlx-lm -- all need the GPU B7 is holding.
+- Docs: `docs/c4model.md` (Level 1 context, the `model_qwen.c` component row, and a new
+  Architecture-status bullet under M3+M5, all updated). No new dated doc created (P1 is loader-only,
+  no new gate to script; `.superpowers/sdd/2026-08-09-surge-m3-m5/task-P1-report.md` is the
+  detailed writeup per this project's SDD convention). `docs/index.md` unchanged (no new doc path to
+  register).
+- Full report: `.superpowers/sdd/2026-08-09-surge-m3-m5/task-P1-report.md`.

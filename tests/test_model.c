@@ -9,11 +9,16 @@
  * ran two null-argument assertions and nothing else.
  *
  * The real-model tests stay env-gated on SURGE_GGUF and SURGE_ST (there is
- * no synthetic substitute for a multi-GB checkpoint), and SURGE_GGUF_TWIN
- * gates the GGUF-vs-HF cross-check. Skipped gates are recorded and reported
- * as a loud banner at the end of the run rather than a line scrolling past,
- * because "0 failures" from a run where the gates never executed is exactly
- * the kind of green that hides a problem.
+ * no synthetic substitute for a multi-GB checkpoint), SURGE_GGUF_TWIN gates
+ * the GGUF-vs-HF cross-check, and SURGE_GGUF_QWEN3 (Task P1) gates the
+ * DENSE qwen3 GGUF (e.g. Qwen3-4B-Instruct-2507-Q8_0.gguf) -- a different
+ * real file and a different architecture family (uniform full-attention,
+ * no hybrid DeltaNet layers, no folded q_proj output gate) from the other
+ * three, so it gets its own env var rather than overloading SURGE_GGUF.
+ * Skipped gates are recorded and reported as a loud banner at the end of the
+ * run rather than a line scrolling past, because "0 failures" from a run
+ * where the gates never executed is exactly the kind of green that hides a
+ * problem.
  *
  * Real-file correction pinned by these tests, discovered during
  * reconnaissance and NOT anticipated by the original task brief: both real
@@ -354,6 +359,166 @@ static void model_from_gguf_real(void) {
     g_gguf_rms_eps = m.cfg.rms_eps;
     g_gguf_vocab = m.cfg.vocab;
     g_gguf_ran = true;
+
+    sg_model_free(&m);
+    sg_gguf_close(g);
+}
+
+/* Task P1: the plain DENSE qwen3 GGUF family (general.architecture ==
+ * "qwen3", no "5"/"_5"), e.g. Qwen3-4B-Instruct-2507-Q8_0.gguf. Unlike the
+ * hybrid above, this is a UNIFORM 36-layer full-attention transformer: no
+ * gated-DeltaNet layers, and a SINGLE-width q_proj with no folded output
+ * gate. Gated on SURGE_GGUF_QWEN3 rather than SURGE_GGUF (a different real
+ * file, and reusing SURGE_GGUF would collide with model_from_gguf_real's
+ * hybrid-shaped assertions above). */
+static void model_from_gguf_dense_qwen3_real(void) {
+    const char *path = getenv("SURGE_GGUF_QWEN3");
+    if (!path || !*path) {
+        note_skip("SURGE_GGUF_QWEN3",
+                  "dense qwen3 GGUF config extraction, all-attention layer "
+                  "census, single-width q_proj, and the rope_dim anti-trap "
+                  "regression (~50 checks)",
+                  "SURGE_GGUF_QWEN3=/Users/macmini/models/gguf/"
+                  "Qwen3-4B-Instruct-2507-Q8_0.gguf");
+        return;
+    }
+
+    sg_gguf *g = NULL;
+    sg_err e = sg_gguf_open(path, &g);
+    tt_assert(!sg_failed(e), "open %s should succeed: %s", path, e.msg ? e.msg : "");
+    if (!g) return;
+
+    /* general.architecture must be the bare "qwen3" string on this file
+     * (Task P1 blocker 1: gguf_arch_recognized must accept it). */
+    const char *arch = NULL;
+    tt_assert(sg_gguf_get_str(g, "general.architecture", &arch) && arch
+                  && strcmp(arch, "qwen3") == 0,
+              "general.architecture should be \"qwen3\", got %s", arch ? arch : "(missing)");
+
+    /* Confirms this real file IS the trap the loader must not fall into:
+     * neither key exists, so the dense defaults below (not a
+     * partial_rotary_factor-style fallback) are what make this file load at
+     * all, and what this test is actually exercising. If this ever starts
+     * failing because the file changed to carry these keys, the assertions
+     * further down still hold (the loader prefers an explicit key when
+     * present); only this early warning would go away. */
+    uint32_t raw_rope_dim = 0, raw_interval = 0;
+    tt_assert(!sg_gguf_get_u32(g, "qwen3.rope.dimension_count", &raw_rope_dim),
+              "qwen3.rope.dimension_count should be ABSENT on the real dense "
+              "qwen3 file -- the anti-trap default path below would not be "
+              "exercised otherwise");
+    tt_assert(!sg_gguf_get_u32(g, "qwen3.full_attention_interval", &raw_interval),
+              "qwen3.full_attention_interval should be ABSENT on the real "
+              "dense qwen3 file, for the same reason");
+    uint32_t ctx_len = 0;
+    tt_assert(sg_gguf_get_u32(g, "qwen3.context_length", &ctx_len) && ctx_len == 262144,
+              "qwen3.context_length should be 262144, got %u", ctx_len);
+
+    sg_model m;
+    e = sg_model_from_gguf(g, &m);
+    tt_assert(!sg_failed(e), "sg_model_from_gguf (dense qwen3) should succeed: %s",
+              e.msg ? e.msg : "");
+    if (sg_failed(e)) { sg_gguf_close(g); return; }
+
+    assert_cfg_sane(&m.cfg, "qwen3-dense");
+
+    /* Real Qwen3-4B-Instruct-2507-Q8_0.gguf dims (recon'd against the actual
+     * file with surge-info; see task-P1-report.md). */
+    tt_assert(m.cfg.n_layers == 36, "qwen3-dense n_layers should be 36, got %u", m.cfg.n_layers);
+    tt_assert(m.cfg.n_heads == 32, "qwen3-dense n_heads should be 32, got %u", m.cfg.n_heads);
+    tt_assert(m.cfg.n_kv_heads == 8, "qwen3-dense n_kv_heads should be 8, got %u",
+              m.cfg.n_kv_heads);
+    tt_assert(m.cfg.head_dim == 128, "qwen3-dense head_dim should be 128, got %u",
+              m.cfg.head_dim);
+    tt_assert(m.cfg.hidden == 2560, "qwen3-dense hidden should be 2560, got %u", m.cfg.hidden);
+    tt_assert(m.cfg.ffn_hidden == 9728, "qwen3-dense ffn_hidden should be 9728, got %u",
+              m.cfg.ffn_hidden);
+    tt_assert(m.cfg.vocab == 151936, "qwen3-dense vocab should be 151936, got %u", m.cfg.vocab);
+    tt_assert(nearly_eq(m.cfg.rope_theta, 5e6f, 1.0f),
+              "qwen3-dense rope_theta should be 5e6, got %f", (double)m.cfg.rope_theta);
+    tt_assert(m.cfg.tied_embeddings,
+              "qwen3-dense has no output.weight, embeddings should be tied");
+    tt_assert(m.wtype == SG_T_Q8_0, "qwen3-dense wtype should be SG_T_Q8_0, got %d",
+              (int)m.wtype);
+    tt_assert(m.lm_head == m.tok_emb, "qwen3-dense lm_head should alias tok_emb when tied");
+
+    /* Blocker 2: single-width q_proj, no folded output gate. */
+    tt_assert(!m.cfg.attn_output_gate,
+              "qwen3-dense attn_output_gate should be false (no folded output gate)");
+
+    /* Blocker 3: full_attn_interval == 1 so every layer is a full-attention
+     * layer (the key itself is confirmed absent from the file above). */
+    tt_assert(m.cfg.full_attn_interval == 1,
+              "qwen3-dense full_attn_interval should be 1, got %u", m.cfg.full_attn_interval);
+
+    /* Blocker 4 (MOST IMPORTANT): the anti-trap regression. rope_dim must be
+     * the FULL head_dim (128), never 32 (== int(128*0.25), the safetensors
+     * loader's partial_rotary_factor default -- the wrong default to have
+     * copied here). A regression to 32 would still pass every OTHER
+     * assertion in this test (32 is even and <= head_dim, which is the whole
+     * danger), so this check exists on its own rather than folded into
+     * assert_cfg_sane. */
+    tt_assert(m.cfg.rope_dim == 128,
+              "ANTI-TRAP: qwen3-dense rope_dim should be 128 (full rotary), got %u -- "
+              "a value of 32 means the loader silently fell back to the "
+              "partial_rotary_factor-0.25 default and would run with WRONG output",
+              m.cfg.rope_dim);
+
+    /* Every layer classified as full-attention (q_proj non-NULL, all 6
+     * attention pointers set, all 9 ssm pointers NULL), and the ssm/DeltaNet
+     * census is exactly 0 -- checked over ALL 36 layers, not a sample. */
+    uint32_t n_attn_census = 0, n_ssm_census = 0;
+    for (uint32_t i = 0; i < m.cfg.n_layers; i++) {
+        assert_layer_full_attn(&m.layers[i], i, "qwen3-dense");
+        if (m.layers[i].q_proj) n_attn_census++;
+        if (m.layers[i].ssm_in_qkv) n_ssm_census++;
+    }
+    tt_assert(n_attn_census == m.cfg.n_layers,
+              "qwen3-dense: all %u layers should classify as full-attention, got %u",
+              m.cfg.n_layers, n_attn_census);
+    tt_assert(n_ssm_census == 0,
+              "qwen3-dense: ssm/DeltaNet census should be 0, got %u", n_ssm_census);
+
+    /* Cross-check the mapping's wiring directly against the tensor
+     * directory, and the SINGLE-width q_proj factor in particular (the
+     * inverse of model_from_gguf_real's 2x assertion on the hybrid), plus
+     * the ffn_norm.weight vs post_attention_norm.weight naming discovery. */
+    const sg_tensor *q0 = sg_gguf_tensor(g, "blk.0.attn_q.weight");
+    const sg_tensor *k0 = sg_gguf_tensor(g, "blk.0.attn_k.weight");
+    const sg_tensor *ln2_0 = sg_gguf_tensor(g, "blk.0.ffn_norm.weight");
+    tt_assert(q0 != NULL && k0 != NULL, "blk.0.attn_q/k.weight should be found directly");
+    tt_assert(ln2_0 != NULL,
+              "blk.0.ffn_norm.weight should be found directly (this file's pre-MLP "
+              "norm name, NOT post_attention_norm.weight)");
+    tt_assert(sg_gguf_tensor(g, "blk.0.post_attention_norm.weight") == NULL,
+              "blk.0.post_attention_norm.weight should be absent on this file "
+              "(confirms the ffn_norm.weight fallback path is actually exercised)");
+    if (q0 && k0) {
+        tt_assert(m.layers[0].q_proj == q0->data,
+                  "qwen3-dense layer 0 q_proj should point at blk.0.attn_q.weight's data");
+        tt_assert(m.layers[0].k_proj == k0->data,
+                  "qwen3-dense layer 0 k_proj should point at blk.0.attn_k.weight's data");
+        uint64_t q_out = q0->dims[q0->n_dims - 1];
+        uint64_t k_out = k0->dims[k0->n_dims - 1];
+        tt_assert(q_out == (uint64_t)m.cfg.n_heads * m.cfg.head_dim,
+                  "qwen3-dense q_proj out rows (%llu) should be n_heads*head_dim (%llu), "
+                  "SINGLE width -- no output gate on this architecture",
+                  (unsigned long long)q_out,
+                  (unsigned long long)((uint64_t)m.cfg.n_heads * m.cfg.head_dim));
+        tt_assert(k_out == (uint64_t)m.cfg.n_kv_heads * m.cfg.head_dim,
+                  "qwen3-dense k_proj out rows (%llu) should be n_kv_heads*head_dim (%llu)",
+                  (unsigned long long)k_out,
+                  (unsigned long long)((uint64_t)m.cfg.n_kv_heads * m.cfg.head_dim));
+    }
+    if (ln2_0) {
+        tt_assert(m.layers[0].ln2 == ln2_0->data,
+                  "qwen3-dense layer 0 ln2 should point at blk.0.ffn_norm.weight's data");
+    }
+
+    fprintf(stderr,
+            "   qwen3-dense: %u layers all full-attention, 0 ssm, q_proj single-width, "
+            "rope_dim %u/%u (anti-trap OK)\n",
+            m.cfg.n_layers, m.cfg.rope_dim, m.cfg.head_dim);
 
     sg_model_free(&m);
     sg_gguf_close(g);
@@ -838,6 +1003,7 @@ int main(void) {
     tt_run("model_from_st_mini_fixture", model_from_st_mini_fixture);
     tt_run("model_from_st_rejects_partial_group", model_from_st_rejects_partial_group);
     tt_run("model_from_gguf_real", model_from_gguf_real);
+    tt_run("model_from_gguf_dense_qwen3_real", model_from_gguf_dense_qwen3_real);
     tt_run("model_from_st_real", model_from_st_real);
     tt_run("model_loaders_agree_where_comparable", model_loaders_agree_where_comparable);
     tt_run("gguf_ssm_a_and_head_order_vs_hf_twin", gguf_ssm_a_and_head_order_vs_hf_twin);

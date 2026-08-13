@@ -9,11 +9,15 @@ dependencies beyond what macOS ships. Public: github.com/omar16100/surge (MIT).
 
 surge takes a model on disk (GGUF or safetensors) and a prompt, and generates tokens on
 the Apple Silicon GPU (Metal). It is a single-process, single-user, greedy-first engine
-built to run one hybrid `qwen3_5`/`qwen35` family model end to end and, per the M3+M5
+built to run the hybrid `qwen3_5`/`qwen35` family model end to end and, per the M3+M5
 plan, to run the same Qwen3.6-27B-Q8_0 GGUF the mlx-lm and llama.cpp engines are compared
-on at 262,144-token context. Correctness is validated against a CPU reference and against
-mlx-lm; speed against mlx-lm on the same weights (that comparison lives in the llm-rnd
-project's `256k_comparison.md` and `leaderboard.md`).
+on at 262,144-token context. Task P1 (loader-only) adds the plain DENSE `qwen3` GGUF
+family alongside it (e.g. Qwen3-4B-Instruct-2507), motivated by the llm-rnd 256K
+comparison: Qwen3-4B-Instruct-2507 is one of only two models that recall 8/8 needles at
+262,144 tokens, so making it fast is the next milestone's goal; P1 only makes it loadable.
+Correctness is validated against a CPU reference and against mlx-lm; speed against mlx-lm
+on the same weights (that comparison lives in the llm-rnd project's `256k_comparison.md`
+and `leaderboard.md`).
 
 External dependencies: only Metal.framework, Foundation (for the one .m file), and
 optionally Accelerate for the CPU reference path. No third-party libraries.
@@ -39,7 +43,7 @@ optionally Accelerate for the CPU reference path. No third-party libraries.
 | `src/gguf.c` | mmap GGUF v3 reader: metadata table, tensor directory, Q8_0/bf16/f16/f32 tensor views. Bounds-checked; no copies. |
 | `src/st.c` | read-only safetensors bf16 loader + minimal config.json JSON scanner. Handles unaligned data sections (mlx repacks) via a copying accessor. |
 | `src/tok.c` | byte-level BPE tokenizer built from `tokenizer.ggml.*` GGUF metadata; fixture-exact vs the real tokenizer. |
-| `src/model_qwen.c` | config extraction + weight-name mapping for the hybrid qwen3_5/qwen35 arch (full-attention + gated-DeltaNet layers), from GGUF and safetensors. Carries per-tensor dtype and the source-flags `ssm_a_form` / `v_heads_tiled`. |
+| `src/model_qwen.c` | config extraction + weight-name mapping for the hybrid qwen3_5/qwen35 arch (full-attention + gated-DeltaNet layers) and, since Task P1, the plain dense `qwen3` arch (uniform full-attention, no DeltaNet, single-width q_proj), from GGUF and safetensors (dense is GGUF-only so far). Carries per-tensor dtype, the source-flags `ssm_a_form` / `v_heads_tiled`, and `cfg.attn_output_gate` (P1: true for the hybrid's folded sigmoid gate, false for dense). |
 | `src/ref.c` | scalar CPU reference for every op (the correctness oracle), incl. `sg_ref_matvec_q8`, attention, gated-DeltaNet, partial RoPE, and the full forward pass. |
 | `src/kv.c` | (M5.1) fp16 growable KV cache for full-attention layers + fixed-size DeltaNet recurrent state, over opaque GPU-buffer handles; Metal-free (allocation injected). `sg_kv_bytes` = 16 GiB K+V at 262,144. Wired into decode by M5.2 (see below). |
 | `src/bench.c` | (B-series) pure-C benchmark math: decode-by-slope, leaderboard-row/JSON formatters, prompt file read, ingestion/truncation guard, NIAH recall scorer, process `phys_footprint` probe + the `sg_mem_tracker` peak-max tracker (B2). |
@@ -214,8 +218,55 @@ optionally Accelerate for the CPU reference path. No third-party libraries.
     full prefill+decode run (which pages in the weights it actually reads) is what makes
     the two probes converge on a real number. See `todo.md`'s Task B2 Results for the
     full writeup.
-- **Not built:** M4 (kernel excellence / beat mlx-lm), server mode, non-Metal platforms,
-  MoE, continuous batching, sampling beyond greedy/temp/top-p/top-k.
+  - Task P1 (loader-only, `src/model_qwen.c` + conditional plumbing in `src/ref.c` and
+    `src/metal.m`): surge now LOADS the plain dense `qwen3` GGUF family (e.g.
+    Qwen3-4B-Instruct-2507-Q8_0.gguf) alongside the hybrid, unblocking the next milestone
+    (making that specific model's long-context decode fast; it is one of only two models
+    that recall 8/8 needles at 262,144 tokens in the llm-rnd 256K comparison, but decodes
+    at 2.37 tok/s there today). Four real-file blockers fixed, all verified against the
+    actual downloaded 4B GGUF via `surge-info`/a standalone GGUF-header parse (kept
+    GPU-free while B7 held the device): (1) `general.architecture == "qwen3"` (bare, no
+    "5"/"_5") is now accepted, alongside the existing `qwen35`/`qwen3_5`. (2) A new
+    `sg_cfg.attn_output_gate` flag (true for the hybrid, false for dense) makes the
+    q_proj double-width expectation, the sigmoid output-gate dispatch, and the q-norm/RoPE
+    per-head stride CONDITIONAL in both `src/ref.c`'s `attn_layer` and `src/metal.m`'s
+    `enc_attn`/`enc_attn_prefill` (a `q_stride` local replaces the hardcoded `2*head_dim`
+    in both; the hybrid's literal `2 * hd` stays byte-for-bit where the gate dispatch
+    itself is skipped, i.e. only reached when the gate exists). (3) A dense file carries no
+    `<arch>.full_attention_interval` key at all, so the dense branch sets
+    `full_attn_interval = 1` outright (every layer a full-attention layer by the same
+    `(L+1)%interval==0` rule `kv_is_attn`/`check_layer_groups` already use). (4) THE TRAP
+    (most important): a dense file ALSO carries no `<arch>.rope.dimension_count` key, and
+    Qwen3 uses FULL rotary (rope_dim == head_dim, 128 of 128) -- copying the safetensors
+    loader's existing `partial_rotary_factor`-0.25 default here would have silently
+    computed rope_dim 32 (even and <= head_dim, so it passes every existing validity
+    check) and loaded a model that RUNS with WRONG output and no error. The dense branch
+    instead defaults `rope_dim` to `head_dim` and only lets an explicit
+    `qwen3.rope.dimension_count` override it; a regression to 32 is covered by an explicit
+    test. A FIFTH fix, found empirically (not in the original four, which the task brief
+    had already verified) and necessary for the loader to reach any of the above: the real
+    dense file's pre-MLP norm tensor is `blk.N.ffn_norm.weight`, not
+    `blk.N.post_attention_norm.weight` like the hybrid GGUF -- the loader now tries the
+    hybrid name first (tensor presence, not architecture, decides, consistent with this
+    file's existing convention), falling back to `ffn_norm.weight`. Scope was loader/config
+    only, per the task brief: no kernel touched, the hybrid path re-verified BYTE-IDENTICAL
+    (real hybrid 2B safetensors frozen-digest regression, 32/32 argmax, max delta 2.2e-07,
+    unchanged from before this task). GATES: `make debug` (SURGE_NO_METAL, ASan/UBSan)
+    clean; new pure-C tests assert the real 4B's config (36 layers, 32 heads, 8 kv,
+    head_dim 128, hidden 2560, `full_attn_interval==1`, `attn_output_gate==false`, and the
+    anti-trap `rope_dim==128`), all 36 layers classify full-attention with a 0 ssm census,
+    and a CPU-reference forward runs 3 positions on the real 4B producing finite in-range
+    logits. `src/metal.m`'s conditional-gate changes could not be built with the real Metal
+    frameworks or run (a 28-hour B7-retry benchmark held the GPU for this whole task) --
+    verified instead by `clang -fsyntax-only` (clean, no warnings under
+    `-Wall -Wextra -Werror`) and by the fact that `src/ref.c`'s CPU twin, which follows the
+    exact same `q_stride`/conditional-gate pattern, is proven byte-identical on the hybrid
+    path; the Metal-side numeric gate (byte-exact Metal-vs-ref greedy on the dense 4B, and
+    top-1 vs mlx-lm) is deferred to when the GPU frees. Full report:
+    `.superpowers/sdd/2026-08-09-surge-m3-m5/task-P1-report.md`.
+- **Not built:** M4 (kernel excellence / beat mlx-lm), the dense-qwen3 GPU forward's own
+  numeric gate (P1 is loader-only; deferred until the GPU is free), server mode,
+  non-Metal platforms, MoE, continuous batching, sampling beyond greedy/temp/top-p/top-k.
 
 ## Design constraints
 

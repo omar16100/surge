@@ -567,7 +567,8 @@ struct sg_ref_state {
 
     /* derived widths */
     uint32_t key_dim, value_dim, conv_dim;
-    uint32_t q_width;          /* n_heads * head_dim * 2 (queries + gate) */
+    uint32_t q_width;          /* attn_width, doubled when cfg.attn_output_gate
+                                 * (queries + folded output gate) */
     uint32_t kv_width;         /* n_kv_heads * head_dim */
     uint32_t attn_width;       /* n_heads * head_dim */
 
@@ -748,7 +749,9 @@ sg_err sg_ref_state_new(const sg_model *m, uint32_t max_ctx, sg_ref_state **out)
     uint64_t value_dim = (uint64_t)c->n_v_heads * c->head_v_dim;
     uint64_t conv_dim = 2 * key_dim + value_dim;
     uint64_t attn_width = (uint64_t)c->n_heads * c->head_dim;
-    uint64_t q_width = attn_width * 2;
+    /* Doubled only when the model actually folds an output gate into q_proj
+     * (Task P1; see cfg.attn_output_gate in surge.h). Dense qwen3 has none. */
+    uint64_t q_width = c->attn_output_gate ? attn_width * 2 : attn_width;
     uint64_t kv_width = (uint64_t)c->n_kv_heads * c->head_dim;
     if (key_dim > width_max || value_dim > width_max || conv_dim > width_max
         || q_width > width_max || kv_width > width_max
@@ -873,20 +876,30 @@ static void attn_layer(sg_ref_state *st, const sg_layer_w *w, sg_ref_layer *L,
                        const float *in, float *out, uint32_t pos) {
     const sg_cfg *c = &st->cfg;
     uint32_t hd = c->head_dim;
+    /* Task P1: per-head stride into st->qg. Double width (queries + folded
+     * gate) on the hybrid, single width on dense qwen3 -- see
+     * cfg.attn_output_gate (surge.h) and st->q_width above, which this must
+     * stay consistent with (st->q_width == c->n_heads * q_stride always). */
+    uint32_t q_stride = c->attn_output_gate ? 2 * hd : hd;
 
-    /* q_proj is DOUBLE width: mlx reshapes to [n_heads, 2*head_dim] and
-     * splits on the LAST axis, so head h's gate sits immediately after head
-     * h's queries rather than in one block after all of them. */
+    /* q_proj is DOUBLE width on the hybrid: mlx reshapes to [n_heads,
+     * 2*head_dim] and splits on the LAST axis, so head h's gate sits
+     * immediately after head h's queries rather than in one block after all
+     * of them. Dense qwen3 has no gate at all: q_proj is single width and
+     * q_stride collapses to hd, so every access below reads exactly the
+     * queries and nothing past them. */
     wmatvec(w->q_proj, st->mat_type, in, st->qg, st->q_width, c->hidden);
     wmatvec(w->k_proj, st->mat_type, in, st->kbuf, st->kv_width, c->hidden);
     wmatvec(w->v_proj, st->mat_type, in, st->vbuf, st->kv_width, c->hidden);
 
     for (uint32_t h = 0; h < c->n_heads; h++) {
-        float *qh = st->qg + (size_t)h * 2 * hd;
+        float *qh = st->qg + (size_t)h * q_stride;
         /* q_norm applies to the queries only, never to the gate. */
         sg_ref_rmsnorm(qh, L->q_norm_w, hd, c->rms_eps);
         sg_ref_rope_partial(qh, hd, c->rope_dim, pos, c->rope_theta);
-        memcpy(st->gate + (size_t)h * hd, qh + hd, (size_t)hd * sizeof(float));
+        if (c->attn_output_gate) {
+            memcpy(st->gate + (size_t)h * hd, qh + hd, (size_t)hd * sizeof(float));
+        }
     }
     for (uint32_t h = 0; h < c->n_kv_heads; h++) {
         float *kh = st->kbuf + (size_t)h * hd;
@@ -904,7 +917,7 @@ static void attn_layer(sg_ref_state *st, const sg_layer_w *w, sg_ref_layer *L,
     uint32_t repeat = c->n_heads / c->n_kv_heads;
     for (uint32_t h = 0; h < c->n_heads; h++) {
         uint32_t hk = h / repeat;      /* GQA: mlx repeats the kv head axis */
-        const float *qh = st->qg + (size_t)h * 2 * hd;
+        const float *qh = st->qg + (size_t)h * q_stride;
         for (uint32_t t = 0; t < used; t++) {
             const float *kt = L->k_cache + ((size_t)t * c->n_kv_heads + hk) * hd;
             double dot = 0.0;
@@ -924,8 +937,12 @@ static void attn_layer(sg_ref_state *st, const sg_layer_w *w, sg_ref_layer *L,
         for (uint32_t i = 0; i < hd; i++) ch[i] = (float)st->dacc[i];
     }
 
-    /* The output gate is a SIGMOID applied before o_proj. */
-    sg_ref_gate_sigmoid(st->ctx, st->gate, st->attn_width);
+    /* The output gate is a SIGMOID applied before o_proj -- only when the
+     * model actually has one (Task P1). Dense qwen3 feeds the raw attention
+     * output straight to o_proj. */
+    if (c->attn_output_gate) {
+        sg_ref_gate_sigmoid(st->ctx, st->gate, st->attn_width);
+    }
     wmatvec(w->o_proj, st->mat_type, st->ctx, out, c->hidden, st->attn_width);
 }
 

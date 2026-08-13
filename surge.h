@@ -377,6 +377,59 @@ void sg_ref_matvec_bf16(const uint16_t *w, const float *x, float *y,
 void sg_ref_matvec_q8(const void *w, const float *x, float *y,
                       uint32_t rows, uint32_t cols);
 void sg_ref_softmax(float *x, uint32_t n);
+
+/* Split-K attention combine (Task P2.0): log-sum-exp rescaling that merges
+ * n_parts partial attention results over disjoint, contiguous key ranges into
+ * the same result a single-pass softmax-then-weighted-V-sum would produce.
+ * This is the CPU correctness oracle for the flash-decoding-style Metal
+ * kernel that will later dispatch many threadgroups per head instead of one;
+ * that kernel is a later task, this is pure C and proves the math first.
+ *
+ * Each partition i reports:
+ *   m[i]      max score in that partition (-INFINITY if it has zero keys)
+ *   s[i]      sum of exp(score - m[i]) over the partition's keys (0.0 if
+ *             empty)
+ *   acc[i][d] sum of exp(score - m[i]) * v[key][d] over the partition's keys
+ *             (all zero if empty); acc is laid out [n_parts][head_dim]
+ *             row-major
+ *
+ * Combine:
+ *   M      = max_i m[i]
+ *   S      = sum_i s[i] * exp(m[i] - M)
+ *   out[d] = ( sum_i acc[i][d] * exp(m[i] - M) ) / S
+ *
+ * DETERMINISM: partitions are folded in strictly increasing index order in
+ * every one of the three passes above (no sort, no reassociation), matching
+ * kernels.metal's fixed-shape reduction rule (src/kernels.metal:7-27) so the
+ * eventual Metal kernel this proves out has a byte-identical CPU oracle. All
+ * accumulation is double precision with one round to float at the end,
+ * matching this file's precision policy.
+ *
+ * K == 1 IS AN IDENTITY: with one partition, M == m[0] exactly, so
+ * exp(m[0]-M) == exp(0.0) == 1.0 exactly (an IEEE-754 exact special case) and
+ * out[d] reduces to acc[0][d]/s[0] bit-for-bit -- no rounding is introduced
+ * by the combine itself.
+ *
+ * EMPTY PARTITIONS need no special case as long as at least one partition is
+ * non-empty: m[i] - M is -INFINITY - finite == -INFINITY (never NaN), and
+ * exp(-INFINITY) == 0.0, so an empty partition's s[i]*0.0 and acc[i][d]*0.0
+ * terms vanish cleanly on their own.
+ *
+ * ALL-EMPTY is the one genuine special case (every partition empty, or
+ * n_parts == 0): M would be -INFINITY and M - M would be NaN, so this is
+ * detected up front and DEFINED rather than left to produce a NaN: out[d] =
+ * 0.0 for every d. This represents "attention over zero keys", which has no
+ * textbook softmax value (0/0); zero is the documented convention.
+ *
+ * NULL handling mirrors the matvec functions above: a NULL out or head_dim
+ * == 0 is a no-op. A NULL m, s or acc with n_parts > 0 is a caller contract
+ * violation and is also a no-op (out left untouched) -- NOT the same as the
+ * documented all-empty case, which requires valid (possibly all-degenerate)
+ * arrays. n_parts == 0 needs no valid m/s/acc at all (nothing is ever
+ * indexed) and always writes the defined zero output. */
+void sg_ref_attn_combine(const float *m, const float *s, const float *acc,
+                         uint32_t n_parts, uint32_t head_dim, float *out);
+
 void sg_ref_swiglu(float *gate, const float *up, uint32_t n); /* gate = silu(gate)*up */
 void sg_ref_silu(float *x, uint32_t n);
 /* Attention output gate: x[i] *= sigmoid(gate[i]) (Qwen3NextAttention

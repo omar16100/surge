@@ -44,7 +44,7 @@ optionally Accelerate for the CPU reference path. No third-party libraries.
 | `src/st.c` | read-only safetensors bf16 loader + minimal config.json JSON scanner. Handles unaligned data sections (mlx repacks) via a copying accessor. |
 | `src/tok.c` | byte-level BPE tokenizer built from `tokenizer.ggml.*` GGUF metadata; fixture-exact vs the real tokenizer. |
 | `src/model_qwen.c` | config extraction + weight-name mapping for the hybrid qwen3_5/qwen35 arch (full-attention + gated-DeltaNet layers) and, since Task P1, the plain dense `qwen3` arch (uniform full-attention, no DeltaNet, single-width q_proj), from GGUF and safetensors (dense is GGUF-only so far). Carries per-tensor dtype, the source-flags `ssm_a_form` / `v_heads_tiled`, and `cfg.attn_output_gate` (P1: true for the hybrid's folded sigmoid gate, false for dense). |
-| `src/ref.c` | scalar CPU reference for every op (the correctness oracle), incl. `sg_ref_matvec_q8`, attention, gated-DeltaNet, partial RoPE, and the full forward pass. |
+| `src/ref.c` | scalar CPU reference for every op (the correctness oracle), incl. `sg_ref_matvec_q8`, attention, gated-DeltaNet, partial RoPE, the full forward pass, and (Task P2.0) `sg_ref_attn_combine`, the split-K attention combine (log-sum-exp rescaling that merges per-partition partial attention results), the CPU-proven math for the not-yet-built split-K decode-attention Metal kernel. |
 | `src/kv.c` | (M5.1) fp16 growable KV cache for full-attention layers + fixed-size DeltaNet recurrent state, over opaque GPU-buffer handles; Metal-free (allocation injected). `sg_kv_bytes` = 16 GiB K+V at 262,144. Wired into decode by M5.2 (see below). |
 | `src/bench.c` | (B-series) pure-C benchmark math: decode-by-slope, leaderboard-row/JSON formatters, prompt file read, ingestion/truncation guard, NIAH recall scorer, process `phys_footprint` probe + the `sg_mem_tracker` peak-max tracker (B2). |
 | `src/greedy.c` | the ONE greedy-decode argmax (`sg_argmax_f32`, lowest index wins an exact tie). Pure C in LIB_SRC; `surge` and `surge-bench` both call it so their gen_ids cannot drift (B5). |
@@ -264,9 +264,38 @@ optionally Accelerate for the CPU reference path. No third-party libraries.
     path; the Metal-side numeric gate (byte-exact Metal-vs-ref greedy on the dense 4B, and
     top-1 vs mlx-lm) is deferred to when the GPU frees. Full report:
     `.superpowers/sdd/2026-08-09-surge-m3-m5/task-P1-report.md`.
-- **Not built:** M4 (kernel excellence / beat mlx-lm), the dense-qwen3 GPU forward's own
-  numeric gate (P1 is loader-only; deferred until the GPU is free), server mode,
-  non-Metal platforms, MoE, continuous batching, sampling beyond greedy/temp/top-p/top-k.
+  - Task P2.0 (`src/ref.c` + `surge.h`, pure C, no kernel/encoder touched): the split-K
+    (flash-decoding) attention COMBINE math, proven in pure C ahead of the Metal kernel
+    that will use it. Why: decode attention today dispatches exactly `n_heads`
+    threadgroups (`src/metal.m`'s `enc_attn`/`k_attn_decode_f16`), so on a 32-head model
+    48 of this machine's 80 GPU cores sit idle while one threadgroup walks the whole KV
+    sequence -- measured 1.25 tok/s at 262,144 context. The fix is to split the KV
+    sequence across many threadgroups (each emitting a partial max/sum-exp/weighted-V-sum
+    triple) and combine the partials by log-sum-exp rescaling; `sg_ref_attn_combine(m, s,
+    acc, n_parts, head_dim, out)` is that combine step, built and gated exactly as
+    `src/kv.c` (M5.1) and `src/bench.c` (B1/B3/B4) were: pure C first, Metal later.
+    Partitions are folded in strictly increasing index order in every pass (no sort, no
+    reassociation), matching `src/kernels.metal:7-27`'s fixed-shape determinism rule, so
+    this is a byte-identical CPU oracle for the eventual kernel. Degenerate partitions
+    (empty, all-but-one-empty, all-empty, `n_parts==0`) are handled without NaN via an
+    explicitly documented zero-output convention rather than left to divide by zero.
+    GATES (`tests/test_attn_combine.c`, new): equivalence to a direct single-pass
+    softmax-then-weighted-V-sum reference for K in {1,2,3,7,64,257} against ragged
+    (non-dividing) partition counts, via a combined absolute+relative tolerance
+    (`atol=1e-6, rtol=1e-6`; a bare relative-error ratio is not meaningful when an output
+    dimension's true value is coincidentally near zero from softmax cross-key
+    cancellation -- measured worst absolute diff 5.96e-08, about one float32 ULP);
+    K==1 bit-exact (a true identity: `exp(0.0)==1.0` exactly); 100 repeated calls
+    byte-identical; large-magnitude (+/-80 and beyond) scores stay finite. `make debug`
+    (SURGE_NO_METAL, ASan/UBSan) exits 0, 869 checks, 0 failures, no sanitizer
+    diagnostics. The Metal kernel that dispatches multiple threadgroups per head and
+    calls this combine is NOT built yet (a later task); nothing in the live decode path
+    changed. Full report: `.superpowers/sdd/2026-08-09-surge-m3-m5/task-P2.0-report.md`.
+- **Not built:** M4 (kernel excellence / beat mlx-lm, incl. the split-K decode-attention
+  Metal kernel that Task P2.0's combine math is the CPU-proven prerequisite for), the
+  dense-qwen3 GPU forward's own numeric gate (P1 is loader-only; deferred until the GPU
+  is free), server mode, non-Metal platforms, MoE, continuous batching, sampling beyond
+  greedy/temp/top-p/top-k.
 
 ## Design constraints
 

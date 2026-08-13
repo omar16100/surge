@@ -233,6 +233,80 @@ void sg_ref_softmax(float *x, uint32_t n) {
 }
 
 /* ---------------------------------------------------------------------
+ * Split-K attention combine (Task P2.0)
+ * --------------------------------------------------------------------- */
+
+void sg_ref_attn_combine(const float *m, const float *s, const float *acc,
+                         uint32_t n_parts, uint32_t head_dim, float *out) {
+    if (!out || head_dim == 0) return;
+    /* NULL m/s/acc with n_parts > 0 is a caller contract violation, not the
+     * documented all-empty case: leave out untouched, matching the matvec
+     * functions' NULL convention above. */
+    if (n_parts > 0 && (!m || !s || !acc)) return;
+
+    /* n_parts == 0: no partitions at all. m/s/acc are never indexed below,
+     * so they may legitimately be NULL for this call. Same "attention over
+     * zero keys" convention as the all-empty branch further down: write a
+     * defined zero rather than leaving out whatever the caller's buffer
+     * previously held. */
+    if (n_parts == 0) {
+        for (uint32_t d = 0; d < head_dim; d++) out[d] = 0.0f;
+        return;
+    }
+
+    /* Pass 1: M = max_i m[i]. Strictly increasing i (determinism rule, see
+     * surge.h / src/kernels.metal:7-27) -- not that max-of-a-sequence can
+     * differ by iteration order anyway, but every pass here follows the same
+     * fixed order on principle, since a future Metal port copies this shape
+     * verbatim. */
+    double M = (double)m[0];
+    for (uint32_t i = 1; i < n_parts; i++) {
+        if ((double)m[i] > M) M = (double)m[i];
+    }
+
+    /* All partitions empty (every m[i] == -INFINITY): M is -INFINITY here,
+     * and M - M below would be -INFINITY - -INFINITY = NaN. Caught up front
+     * and defined instead: out[d] = 0.0 for every d, the same documented
+     * convention as n_parts == 0 above. */
+    if (M == -INFINITY) {
+        for (uint32_t d = 0; d < head_dim; d++) out[d] = 0.0f;
+        return;
+    }
+
+    /* Pass 2: S = sum_i s[i] * exp(m[i] - M), strictly increasing i. An
+     * empty partition has m[i] == -INFINITY here (M is finite because of the
+     * check above), so m[i] - M == -INFINITY and exp(...) == 0.0: its s[i]
+     * (0.0 by contract) times that is 0.0, no special case needed. */
+    double S = 0.0;
+    for (uint32_t i = 0; i < n_parts; i++) {
+        S += (double)s[i] * exp((double)m[i] - M);
+    }
+
+    /* Pass 3: out[d] = ( sum_i acc[i][d] * exp(m[i] - M) ) / S, strictly
+     * increasing i for every d. exp(m[i] - M) does not depend on d and is
+     * recomputed here rather than cached in a scratch array: this file's
+     * policy is accuracy and obvious correctness over speed (the Metal
+     * kernel, a later task, is where performance is actually earned), and
+     * recomputing a pure function of already-fixed inputs changes no bit of
+     * the result.
+     *
+     * S > 0.0 whenever this line is reached under the documented input
+     * contract: the partition achieving M is non-empty (M came from a real
+     * m[i]), and a non-empty partition's s[i] sums at least one
+     * exp(score - m[i]) term that equals exactly 1.0 for the key achieving
+     * that partition's own max, so s[i] >= 1.0 and S >= 1.0 * exp(0) = 1.0.
+     * The guard is defensive only, for a caller that violates that contract
+     * (e.g. a "non-empty" m[i] paired with s[i] == 0). */
+    for (uint32_t d = 0; d < head_dim; d++) {
+        double num = 0.0;
+        for (uint32_t i = 0; i < n_parts; i++) {
+            num += (double)acc[(size_t)i * head_dim + d] * exp((double)m[i] - M);
+        }
+        out[d] = (S > 0.0) ? (float)(num / S) : 0.0f;
+    }
+}
+
+/* ---------------------------------------------------------------------
  * RoPE
  * --------------------------------------------------------------------- */
 

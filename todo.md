@@ -1850,3 +1850,83 @@ Metal-only vs pure-C documented on each), `Makefile` (new `METAL_HYBRID_TESTS` r
   detailed writeup per this project's SDD convention). `docs/index.md` unchanged (no new doc path to
   register).
 - Full report: `.superpowers/sdd/2026-08-09-surge-m3-m5/task-P1-report.md`.
+
+## Task P2.0 Results (ref.c/surge.h: split-K attention combine math, pure C)
+
+- Why: surge's decode attention dispatches exactly `n_heads` threadgroups (`src/metal.m`
+  `enc_attn`/`k_attn_decode_f16`), so on a 32-head model 48 of this machine's 80 GPU
+  cores sit idle while a single threadgroup per head walks the whole KV sequence --
+  measured 1.25 tok/s at 262,144 context. The fix (a later task) is split-K/
+  flash-decoding: partition the KV sequence across many threadgroups, each emitting a
+  partial (max, sum-exp, weighted-V-sum) triple, then combine the partials. This task
+  builds and proves ONLY the combine math, in pure C, exactly as `src/kv.c` (M5.1) and
+  `src/bench.c` (B1/B3/B4) were built and gated before any Metal touched them.
+- GPU constraint: a 28-hour B7-retry benchmark held the GPU for this task's entire
+  duration (confirmed non-empty via `pgrep -f "surge-bench|bench_niah"` at task start
+  and again immediately before committing). `make debug` (SURGE_NO_METAL, ASan/UBSan)
+  and pure-C test binaries only; `make check`, `surge`, `surge-bench`, and every other
+  Metal binary were never built or run.
+- `src/ref.c` + `surge.h`: new `sg_ref_attn_combine(m, s, acc, n_parts, head_dim, out)`.
+  Log-sum-exp rescaling: `M = max_i m[i]`, `S = sum_i s[i]*exp(m[i]-M)`,
+  `out[d] = (sum_i acc[i][d]*exp(m[i]-M)) / S`, `acc` laid out `[n_parts][head_dim]`
+  row-major. Partitions folded in STRICTLY INCREASING index order in all three passes
+  (no sort, no reassociation), matching `src/kernels.metal:7-27`'s fixed-shape
+  determinism rule verbatim, so this is a byte-identical CPU oracle for the eventual
+  kernel. Every reduction accumulates in double (this file's existing precision policy),
+  one round to float at the end. Two explicit degenerate-input conventions, both
+  documented in `surge.h` rather than left to produce NaN: `n_parts==0` and "every
+  partition empty" (`m[i]==-INFINITY` for all i) both write `out[d]=0.0` for every d
+  ("attention over zero keys" has no textbook softmax value); a NULL m/s/acc with
+  `n_parts>0` is a caller contract violation and is a no-op (out left untouched),
+  mirroring the existing matvec functions' NULL convention. Individually-empty
+  partitions (`m[i]==-INFINITY`, `s[i]==0`, `acc[i][*]==0`) need no special case at all
+  when at least one partition is non-empty: `m[i]-M` is `-INFINITY - finite ==
+  -INFINITY` (never NaN) and `exp(-INFINITY)==0.0`, so they vanish on their own.
+- `tests/test_attn_combine.c` (new, picked up automatically by the Makefile's
+  `tests/test_*.c` wildcard + generic pattern rule, no Makefile edit needed): built a
+  "direct" single-pass softmax-then-weighted-V-sum reference and a ragged
+  (non-dividing) partition splitter, both from the SAME `range_summary()` primitive so
+  the K==1 case's arithmetic is literally identical in shape to the direct reference (an
+  actual identity, not a tolerance that happens to be tight).
+  - Gate 1 (equivalence): K in {1,2,3,7,64,257} x ragged n_keys in {37,101,500} x
+    head_dim in {8,32}, 36 cases. FINDING while building the gate: a bare per-element
+    relative-error ratio is not a sound metric here -- a softmax-weighted V sum can have
+    near-total cross-key cancellation in one output dimension by chance, landing that
+    dimension's true value coincidentally near zero, where `|diff|/|a|` explodes even
+    though the absolute difference is float32 noise. Diagnosed with a throwaway
+    standalone probe (`/tmp/diag_attn*.c`, not committed) that replayed the exact RNG
+    sequence and cross-checked both the "direct" reference AND the combine against an
+    all-double "gold" value with zero intermediate float32 rounding: combine's error
+    against gold was AS SMALL AS OR SMALLER than the direct reference's own error in
+    every case checked, and the worst ABSOLUTE difference across the whole 36-case
+    matrix is 5.960464e-08 (about one float32 ULP). Fixed the test (not the math) to use
+    a standard combined absolute+relative tolerance (numpy.allclose-style,
+    `|diff| <= atol + rtol*|direct|`, `atol=rtol=1e-6`), which is what "max relative
+    error < 1e-6" has to mean once some output elements can be near zero.
+  - Gate 2 (K==1 bit-exact): 4 configs, bit-identical (`memcpy`+`uint32_t` compare) in
+    every case -- `exp(0.0)==1.0` exactly is the load-bearing IEEE-754 fact.
+  - Gate 3 (degenerate, no NaN): some-empty (2 of 6 partitions), all-but-one-empty (1 of
+    5 real, bit-exact vs the lone real partition), all-empty (`n_parts` in {1,3,10},
+    `out[d]==0.0` exactly, not just finite), `n_parts==0` with NULL arrays, and the
+    NULL-with-`n_parts>0` contract-violation no-op -- all pass.
+  - Gate 4 (large-magnitude): hand-built partitions with `m` spanning +80/-80 (cross-
+    checked against an independently-written log-sum-exp calc, not the function under
+    test) plus a realistic pipeline with `attn_scale=40` driving raw scores well past
+    +/-80; both finite and within tolerance.
+  - Gate 5 (determinism): 100 repeated calls on identical inputs, byte-identical every
+    time (fully deterministic RNG seed + no threading, so this is not flaky by
+    construction).
+  - `make debug` (SURGE_NO_METAL, ASan/UBSan): exits 0, 869 checks in
+    `test_attn_combine.bin`, 0 failures, no sanitizer diagnostics anywhere in the run.
+    Confirmed twice (two independent full `make debug` runs, byte-identical results
+    apart from an unrelated test's PID-suffixed temp filename).
+- Docs: `docs/c4model.md` (the `ref.c` component row + a new built-status bullet under
+  M3+M5, both updated: this is prerequisite math for the not-yet-built split-K
+  decode-attention Metal kernel, nothing in the live decode path changed). No new dated
+  doc (this is the per-task writeup; `.superpowers/sdd/2026-08-09-surge-m3-m5/
+  task-P2.0-report.md` is the detailed report per this project's SDD convention).
+  `docs/index.md` unchanged (no new doc path to register).
+- Scope discipline: only `src/ref.c` (new function, additive), `surge.h` (new
+  declaration, additive), `tests/test_attn_combine.c` (new file) touched code-wise. No
+  kernel (`src/kernels.metal`), encoder (`src/metal.m`), or existing gate modified.
+- Full report: `.superpowers/sdd/2026-08-09-surge-m3-m5/task-P2.0-report.md`.

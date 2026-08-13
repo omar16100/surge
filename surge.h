@@ -455,6 +455,80 @@ void sg_ref_softmax(float *x, uint32_t n);
 void sg_ref_attn_combine(const float *m, const float *s, const float *acc,
                          uint32_t n_parts, uint32_t head_dim, float *out);
 
+/* Decode-attention CPU oracle (Task P2.1): the per-op reference for the
+ * coming Metal split-K decode kernel, isolating exactly the attention core
+ * `k_attn_decode_f16` computes (src/kernels.metal:483-537). `attn_layer`
+ * (src/ref.c, static) cannot serve this role: it is a whole hybrid-layer
+ * function (projections, qk-norm, RoPE, KV write, attention, gate, o_proj),
+ * not a standalone attention-core primitive.
+ *
+ * LAYOUT (matches sg_gpu_run_attn_decode_f16 above exactly, just f32 kc/vc
+ * in place of f16, since this is the pure-C oracle, not a GPU dispatch):
+ *   q       [n_heads, q_stride] -- only q[h][0 .. head_dim) is the query.
+ *           When q_stride == 2*head_dim (the hybrid model's attention output
+ *           gate, Task P1) q[h][head_dim .. q_stride) is the gate and is
+ *           NEVER read by this function. q_stride == head_dim (dense qwen3)
+ *           has no gate at all.
+ *   kc, vc  [seq, n_kv_heads, head_dim], head-interleaved (the sg_kv
+ *           layout, see the sg_kv section below), already widened to f32.
+ *   out     [n_heads, head_dim].
+ *
+ * GQA: query head h reads kv head h / (n_heads / n_kv_heads), matching
+ * src/kernels.metal:499-500 exactly, including its fallback to kv head 0
+ * when n_heads < n_kv_heads (repeat == 0).
+ *
+ * NUMERICS: max-subtracted softmax, double accumulation, one round to float
+ * at the end -- the same convention sg_ref_attn_combine (above) and the rest
+ * of this file use. sg_ref_attn_decode is exactly the n_parts == 1 case of
+ * sg_ref_attn_decode_splitk below: a single partition spanning the whole
+ * [0, seq) range IS a single pass over every key, so both share one static
+ * core in ref.c rather than risk two independently written implementations
+ * disagreeing by a rounding bit.
+ *
+ * NULL/degenerate handling mirrors sg_ref_attn_combine: `out == NULL` or
+ * `head_dim == 0` or `n_heads == 0` is a no-op (out untouched); `n_kv_heads
+ * == 0` is also a no-op (matches k_attn_decode_f16's own dispatch guard,
+ * which returns before doing anything when n_kv == 0). NULL q, kc or vc
+ * while n_heads > 0 is a caller contract violation, out left untouched.
+ * `seq == 0` is well-defined, NOT a no-op: every head then attends over zero
+ * keys, sg_ref_attn_combine's documented all-empty convention, so out[d] ==
+ * 0.0 for every d. */
+void sg_ref_attn_decode(const float *q, const float *kc, const float *vc,
+                        uint32_t n_heads, uint32_t n_kv_heads, uint32_t head_dim,
+                        uint32_t seq, uint32_t q_stride, float scale, float *out);
+
+/* Split-K sibling of sg_ref_attn_decode above: partitions [0, seq) into
+ * n_parts contiguous, disjoint ranges by the FIXED, data-independent rule
+ * `t0 = i*seq/n_parts, t1 = (i+1)*seq/n_parts` (integer division, i in
+ * [0, n_parts), computed with a 64-bit intermediate to avoid overflow --
+ * the same rule Task P2.0's test file used for its own partition splitter).
+ * This tiles the sequence exactly (partition i's t1 equals partition i+1's
+ * t0, and the last partition's t1 is exactly seq, so there is no gap and no
+ * overlap) and produces a ragged last partition whenever n_parts does not
+ * divide seq evenly. A partition can be empty (t0 == t1, guaranteed for the
+ * higher-index partitions whenever n_parts > seq); its triple is
+ * sg_ref_attn_combine's documented m=-INFINITY/s=0/acc=0 encoding, not a
+ * special case here.
+ *
+ * Per (head, partition), in strictly increasing head order and then
+ * strictly increasing partition order (the determinism rule,
+ * src/kernels.metal:7-27), computes the partial triple (m, s, acc[head_dim])
+ * exactly as sg_ref_attn_combine's own contract defines it, then combines
+ * that head's n_parts triples with ONE call to sg_ref_attn_combine (reused,
+ * never reimplemented). n_parts == 1 covers [0, seq) in a single partition,
+ * which is why sg_ref_attn_decode (n_parts hardcoded to 1 internally) is
+ * bit-identical to this function called with n_parts == 1.
+ *
+ * Same layout, GQA rule, numerics and out/head_dim/n_heads/n_kv_heads/NULL
+ * conventions as sg_ref_attn_decode above, plus: `n_parts == 0` is also
+ * well-defined, not a no-op (sg_ref_attn_combine's own n_parts==0
+ * convention: out[d] == 0.0 for every d, since every head then has zero
+ * partitions to combine). */
+void sg_ref_attn_decode_splitk(const float *q, const float *kc, const float *vc,
+                               uint32_t n_heads, uint32_t n_kv_heads, uint32_t head_dim,
+                               uint32_t seq, uint32_t q_stride, float scale,
+                               uint32_t n_parts, float *out);
+
 void sg_ref_swiglu(float *gate, const float *up, uint32_t n); /* gate = silu(gate)*up */
 void sg_ref_silu(float *x, uint32_t n);
 /* Attention output gate: x[i] *= sigmoid(gate[i]) (Qwen3NextAttention

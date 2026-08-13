@@ -44,7 +44,7 @@ optionally Accelerate for the CPU reference path. No third-party libraries.
 | `src/st.c` | read-only safetensors bf16 loader + minimal config.json JSON scanner. Handles unaligned data sections (mlx repacks) via a copying accessor. |
 | `src/tok.c` | byte-level BPE tokenizer built from `tokenizer.ggml.*` GGUF metadata; fixture-exact vs the real tokenizer. |
 | `src/model_qwen.c` | config extraction + weight-name mapping for the hybrid qwen3_5/qwen35 arch (full-attention + gated-DeltaNet layers) and, since Task P1, the plain dense `qwen3` arch (uniform full-attention, no DeltaNet, single-width q_proj), from GGUF and safetensors (dense is GGUF-only so far). Carries per-tensor dtype, the source-flags `ssm_a_form` / `v_heads_tiled`, and `cfg.attn_output_gate` (P1: true for the hybrid's folded sigmoid gate, false for dense). |
-| `src/ref.c` | scalar CPU reference for every op (the correctness oracle), incl. `sg_ref_matvec_q8`, attention, gated-DeltaNet, partial RoPE, the full forward pass, and (Task P2.0) `sg_ref_attn_combine`, the split-K attention combine (log-sum-exp rescaling that merges per-partition partial attention results), the CPU-proven math for the not-yet-built split-K decode-attention Metal kernel. |
+| `src/ref.c` | scalar CPU reference for every op (the correctness oracle), incl. `sg_ref_matvec_q8`, attention, gated-DeltaNet, partial RoPE, the full forward pass, (Task P2.0) `sg_ref_attn_combine`, the split-K attention combine (log-sum-exp rescaling that merges per-partition partial attention results), and (Task P2.1) `sg_ref_attn_decode` / `sg_ref_attn_decode_splitk`, the direct and split-K decode-attention-core oracles built on top of it -- together the CPU-proven math for the not-yet-built split-K decode-attention Metal kernel. |
 | `src/kv.c` | (M5.1) fp16 growable KV cache for full-attention layers + fixed-size DeltaNet recurrent state, over opaque GPU-buffer handles; Metal-free (allocation injected). `sg_kv_bytes` = 16 GiB K+V at 262,144. Wired into decode by M5.2 (see below). |
 | `src/bench.c` | (B-series) pure-C benchmark math: decode-by-slope, leaderboard-row/JSON formatters, prompt file read, ingestion/truncation guard, NIAH recall scorer, process `phys_footprint` probe + the `sg_mem_tracker` peak-max tracker (B2). |
 | `src/greedy.c` | the ONE greedy-decode argmax (`sg_argmax_f32`, lowest index wins an exact tie). Pure C in LIB_SRC; `surge` and `surge-bench` both call it so their gen_ids cannot drift (B5). |
@@ -291,11 +291,40 @@ optionally Accelerate for the CPU reference path. No third-party libraries.
     diagnostics. The Metal kernel that dispatches multiple threadgroups per head and
     calls this combine is NOT built yet (a later task); nothing in the live decode path
     changed. Full report: `.superpowers/sdd/2026-08-09-surge-m3-m5/task-P2.0-report.md`.
+  - Task P2.1 (`src/ref.c` + `surge.h`, pure C, no kernel/encoder touched): the direct and
+    split-K decode-attention-CORE oracles, isolating exactly what
+    `k_attn_decode_f16` computes (`src/kernels.metal:483-537`) -- `attn_layer`
+    (`src/ref.c`, static) cannot serve this role, since it is a whole hybrid-layer
+    function (projections, qk-norm, RoPE, KV write, attention, gate, o_proj), not a
+    standalone attention-core primitive. `sg_ref_attn_decode(q, kc, vc, n_heads,
+    n_kv_heads, head_dim, seq, q_stride, scale, out)` is the single-pass reference (`q`
+    `[n_heads, q_stride]`, only `q[h][0..head_dim)` is the query, matching P1's
+    gate/query split; `kc`/`vc` `[seq, n_kv_heads, head_dim]` head-interleaved, the
+    `sg_kv` layout; GQA `hk = h/(n_heads/n_kv_heads)` matching
+    `src/kernels.metal:499-500`). `sg_ref_attn_decode_splitk(..., n_parts, out)`
+    partitions `[0, seq)` into `n_parts` contiguous ranges by the fixed rule
+    `t0=i*seq/n_parts`, computes each `(head, partition)`'s `(m, s, acc)` triple, and
+    combines each head's triples with ONE call to `sg_ref_attn_combine` (P2.0, reused
+    not reimplemented). Both share one static core in `src/ref.c`
+    (`attn_decode_core`), with `sg_ref_attn_decode` calling it at `n_parts==1` --
+    making the direct-vs-split-K identity at `n_parts==1` structural rather than
+    coincidental. GATES (`tests/test_attn_decode.c`, new): split-K equals direct
+    (max ABSOLUTE error < 1e-6) for `n_parts` in {1,2,3,7,64,257} against ragged seq
+    and `n_parts > seq` (forced empty partitions), across three shapes incl. the real
+    Qwen3-4B-Instruct-2507 32/8/128 GQA shape; `n_parts==1` bit-exact; GQA MAPPING
+    proven (not just numerically close) via an identical-query trick at both
+    repeat=4 and repeat=1; both `q_stride` variants, with the hybrid gate half
+    NaN-poisoned to prove it is never read as query data; 100x determinism for both
+    functions. `make debug` (SURGE_NO_METAL, ASan/UBSan) exits 0, 81536 checks, 0
+    failures, no sanitizer diagnostics, worst observed error 1.192e-07. The Metal
+    kernel itself remains a later, not-yet-started task; nothing in the live decode
+    path changed. Full report:
+    `.superpowers/sdd/2026-08-09-surge-m3-m5/task-P2.1-report.md`.
 - **Not built:** M4 (kernel excellence / beat mlx-lm, incl. the split-K decode-attention
-  Metal kernel that Task P2.0's combine math is the CPU-proven prerequisite for), the
-  dense-qwen3 GPU forward's own numeric gate (P1 is loader-only; deferred until the GPU
-  is free), server mode, non-Metal platforms, MoE, continuous batching, sampling beyond
-  greedy/temp/top-p/top-k.
+  Metal kernel that Task P2.0's combine math and Task P2.1's decode-attention-core
+  oracles are the CPU-proven prerequisites for), the dense-qwen3 GPU forward's own
+  numeric gate (P1 is loader-only; deferred until the GPU is free), server mode,
+  non-Metal platforms, MoE, continuous batching, sampling beyond greedy/temp/top-p/top-k.
 
 ## Design constraints
 

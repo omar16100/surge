@@ -373,6 +373,151 @@ void sg_ref_attn_combine(const float *m, const float *s, const float *acc,
 }
 
 /* ---------------------------------------------------------------------
+ * Decode attention: direct + split-K CPU oracle (Task P2.1)
+ * --------------------------------------------------------------------- */
+
+/* One (head, key-range) partial-attention triple: m/s/acc exactly as
+ * sg_ref_attn_combine's contract defines them (see surge.h). Computed over
+ * [t0, t1) of one kv head. Empty range (t0 >= t1) writes the documented
+ * m=-INFINITY/s=0/acc=0 encoding.
+ *
+ * Two passes over the range (max, then sum-exp/weighted-V), EACH recomputing
+ * the q.k dot product rather than caching a scores[seq] array -- this file's
+ * established "recomputing a pure function of already-fixed inputs changes
+ * no bit of the result" policy (see attn_combine_weight's comment above),
+ * which keeps this helper allocation-free regardless of seq. The two passes
+ * compute bit-for-bit the same per-key score, since both run the identical
+ * dot-product -> scale -> round-to-float sequence on the same qh/kt.
+ *
+ * qh already points at this head's own q_stride-sized row; only
+ * qh[0 .. head_dim) is ever read here, so a q_stride > head_dim gate half
+ * (Task P1) is never touched. dacc[head_dim] is caller-owned double scratch,
+ * overwritten on every call (not read beforehand). */
+static void attn_partial(const float *qh, const float *kc, const float *vc,
+                         uint32_t n_kv_heads, uint32_t hk, uint32_t head_dim,
+                         double scale, uint32_t t0, uint32_t t1, double *dacc,
+                         float *m_out, float *s_out, float *acc_out) {
+    if (t0 >= t1) {
+        *m_out = -INFINITY;
+        *s_out = 0.0f;
+        for (uint32_t d = 0; d < head_dim; d++) acc_out[d] = 0.0f;
+        return;
+    }
+
+    /* Pass 1: m = max score, strictly increasing t. */
+    float m = -INFINITY;
+    for (uint32_t t = t0; t < t1; t++) {
+        const float *kt = kc + ((size_t)t * n_kv_heads + hk) * head_dim;
+        double dot = 0.0;
+        for (uint32_t i = 0; i < head_dim; i++) dot += (double)qh[i] * (double)kt[i];
+        float score = (float)(dot * scale);
+        if (score > m) m = score;
+    }
+
+    /* Pass 2: s = sum exp(score-m); acc[d] = sum exp(score-m)*v[d], strictly
+     * increasing t. */
+    for (uint32_t d = 0; d < head_dim; d++) dacc[d] = 0.0;
+    double s = 0.0;
+    for (uint32_t t = t0; t < t1; t++) {
+        const float *kt = kc + ((size_t)t * n_kv_heads + hk) * head_dim;
+        const float *vt = vc + ((size_t)t * n_kv_heads + hk) * head_dim;
+        double dot = 0.0;
+        for (uint32_t i = 0; i < head_dim; i++) dot += (double)qh[i] * (double)kt[i];
+        float score = (float)(dot * scale);
+        double e = exp((double)score - (double)m);
+        s += e;
+        for (uint32_t d = 0; d < head_dim; d++) dacc[d] += e * (double)vt[d];
+    }
+
+    *m_out = m;
+    *s_out = (float)s;
+    for (uint32_t d = 0; d < head_dim; d++) acc_out[d] = (float)dacc[d];
+}
+
+/* Shared core of sg_ref_attn_decode and sg_ref_attn_decode_splitk below (see
+ * their surge.h contracts for the full documented behavior, including every
+ * degenerate-input convention). Partitions [0, seq) into n_parts contiguous
+ * ranges by the fixed rule t0=i*seq/n_parts, t1=(i+1)*seq/n_parts (i in
+ * [0,n_parts), 64-bit intermediate to avoid overflow), iterates head then
+ * partition in strictly increasing index order (determinism rule,
+ * src/kernels.metal:7-27), and combines each head's n_parts triples with ONE
+ * call to sg_ref_attn_combine. n_parts == 1 makes the single partition
+ * exactly [0, seq), which is why sg_ref_attn_decode (n_parts hardcoded to 1)
+ * is bit-identical to this function at n_parts==1: sharing this core, rather
+ * than two independently written loops, is what makes that bit-exactness
+ * structural instead of coincidental. */
+static void attn_decode_core(const float *q, const float *kc, const float *vc,
+                             uint32_t n_heads, uint32_t n_kv_heads, uint32_t head_dim,
+                             uint32_t seq, uint32_t q_stride, float scale,
+                             uint32_t n_parts, float *out) {
+    if (!out || head_dim == 0) return;
+    if (n_heads == 0) return;
+    if (!q || !kc || !vc) return;
+    if (n_kv_heads == 0) return;   /* mirrors k_attn_decode_f16's own n_kv==0 no-op */
+
+    double dscale = (double)scale;
+    uint32_t repeat = n_heads / n_kv_heads;   /* n_kv_heads > 0 guaranteed above */
+    size_t np = (size_t)n_parts, hd = (size_t)head_dim;
+
+    /* m[n_parts]/s[n_parts]/acc[n_parts][head_dim]: sg_ref_attn_combine's
+     * own contract needs all n_parts triples materialized before its one
+     * call per head. Heap-allocated rather than a VLA: n_parts is an
+     * uncapped caller argument (a future large split-K sweep must not risk a
+     * stack overflow), reused across every head. Left NULL when n_parts ==
+     * 0 (malloc(0)'s return value is implementation-defined, so it is never
+     * called at all here; sg_ref_attn_combine's own n_parts==0 case
+     * tolerates NULL m/s/acc). dacc[head_dim] is attn_partial's scratch,
+     * bounded by the model's own head_dim (never uncapped like n_parts) but
+     * heap-allocated anyway to keep this function's stack frame free of any
+     * size tied to a caller argument. Allocation failure leaves `out`
+     * entirely untouched -- the same contract-violation convention
+     * sg_ref_attn_combine documents for its own NULL-array case, rather than
+     * a partial write across some heads but not others. */
+    float *fbuf = NULL;
+    if (n_parts > 0) {
+        fbuf = malloc((np * 2 + np * hd) * sizeof(float));
+        if (!fbuf) return;
+    }
+    double *dacc = malloc(hd * sizeof(double));
+    if (!dacc) { free(fbuf); return; }
+
+    float *m = fbuf;
+    float *s = fbuf ? fbuf + np : NULL;
+    float *acc = fbuf ? fbuf + 2 * np : NULL;
+
+    for (uint32_t h = 0; h < n_heads; h++) {
+        const float *qh = q + (size_t)h * q_stride;
+        uint32_t hk = repeat ? (h / repeat) : 0u;
+
+        for (uint32_t i = 0; i < n_parts; i++) {
+            uint32_t t0 = (uint32_t)((uint64_t)i * seq / n_parts);
+            uint32_t t1 = (uint32_t)((uint64_t)(i + 1) * seq / n_parts);
+            attn_partial(qh, kc, vc, n_kv_heads, hk, head_dim, dscale, t0, t1,
+                        dacc, &m[i], &s[i], acc + (size_t)i * hd);
+        }
+        sg_ref_attn_combine(m, s, acc, n_parts, head_dim, out + (size_t)h * hd);
+    }
+
+    free(fbuf);
+    free(dacc);
+}
+
+void sg_ref_attn_decode(const float *q, const float *kc, const float *vc,
+                        uint32_t n_heads, uint32_t n_kv_heads, uint32_t head_dim,
+                        uint32_t seq, uint32_t q_stride, float scale, float *out) {
+    attn_decode_core(q, kc, vc, n_heads, n_kv_heads, head_dim, seq, q_stride,
+                     scale, 1, out);
+}
+
+void sg_ref_attn_decode_splitk(const float *q, const float *kc, const float *vc,
+                               uint32_t n_heads, uint32_t n_kv_heads, uint32_t head_dim,
+                               uint32_t seq, uint32_t q_stride, float scale,
+                               uint32_t n_parts, float *out) {
+    attn_decode_core(q, kc, vc, n_heads, n_kv_heads, head_dim, seq, q_stride,
+                     scale, n_parts, out);
+}
+
+/* ---------------------------------------------------------------------
  * RoPE
  * --------------------------------------------------------------------- */
 

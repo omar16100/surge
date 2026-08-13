@@ -1993,3 +1993,102 @@ benchmark (`pgrep -f "surge-bench|bench_niah"` non-empty before and after); no
 Metal binary touched. Scope stayed additive: only `src/ref.c`, `surge.h`,
 `tests/test_attn_combine.c` changed; no tolerance loosened, no existing gate
 touched.
+
+## Task P2.1 Results (ref.c/surge.h: split-K decode-attention oracle, pure C)
+
+- Why: P2.0 built and gated only the split-K COMBINE step. The coming Metal split-K
+  decode kernel also needs a per-op oracle for the PARTIAL-production side, exactly as
+  every other kernel in surge has one (`k_matvec_q8` vs `sg_ref_matvec_q8`,
+  `k_attn_decode_f16` vs the whole-layer `attn_layer`). `attn_layer` (`src/ref.c:1015`,
+  static) cannot serve that role: it is a whole hybrid-layer function (projections,
+  qk-norm, RoPE, KV write, attention, gate, o_proj), not a standalone attention-core
+  primitive. Without a dedicated oracle, the Metal kernel's only check would conflate
+  two independent differences at once (split-K math AND Metal execution); with one,
+  bring-up splits cleanly: CPU-splitK vs CPU-direct proves the math, Metal-splitK vs
+  CPU-splitK proves the kernel.
+- GPU constraint: the same 28-hour B7-retry benchmark (PID 98563,
+  `ctx256k_qwen27b_surge_20260813_151809`) held the GPU for this task's entire duration
+  too, confirmed non-empty via `pgrep -f "surge-bench|bench_niah"` at task start and
+  again immediately before committing. `make debug` (SURGE_NO_METAL, ASan/UBSan) and
+  pure-C test binaries only; `make check`, `surge`, `surge-bench`, and every other Metal
+  binary were never built or run.
+- `src/ref.c` + `surge.h`: two new functions, both declared and fully documented in
+  `surge.h`. `sg_ref_attn_decode(q, kc, vc, n_heads, n_kv_heads, head_dim, seq,
+  q_stride, scale, out)` is the direct, single-pass oracle -- what the current
+  `k_attn_decode_f16` computes. `sg_ref_attn_decode_splitk(..., n_parts, out)`
+  partitions `[0, seq)` into `n_parts` contiguous ranges by the fixed, data-independent
+  rule `t0=i*seq/n_parts, t1=(i+1)*seq/n_parts` (64-bit intermediate, no gap/overlap,
+  ragged last partition, empty partitions when `n_parts>seq`), computes each `(head,
+  partition)`'s `(m, s, acc[head_dim])` triple, then combines each head's `n_parts`
+  triples with ONE call to `sg_ref_attn_combine` (P2.0, reused not reimplemented).
+  Layout: `q` is `[n_heads, q_stride]` (only `q[h][0..head_dim)` is the query, matching
+  P1's gate/query split -- the gate half at `[head_dim, q_stride)` on the hybrid is
+  NEVER read); `kc`/`vc` are `[seq, n_kv_heads, head_dim]` head-interleaved (the `sg_kv`
+  layout); GQA is `hk = h/(n_heads/n_kv_heads)`, matching `src/kernels.metal:499-500`
+  exactly including its repeat==0 fallback. Numerics: max-subtracted softmax, double
+  accumulation, one round to float at the end (this file's existing precision policy).
+  Both public functions are thin wrappers over one static core, `attn_decode_core`
+  (which in turn calls a static `attn_partial` helper for each `(head, partition)`
+  triple), with `sg_ref_attn_decode` calling the core at `n_parts==1` hardcoded -- so
+  the direct-vs-split-K identity at `n_parts==1` (gate 2) is structural, not
+  coincidental, the same design P2.0's own test file used for its `range_summary()`
+  primitive, taken one step further into the production code itself. `attn_partial`
+  recomputes the q.k dot product once per pass (max pass, then sum-exp/weighted-V pass)
+  rather than caching a `scores[seq]` array, matching this file's established
+  "recomputing a pure function of already-fixed inputs changes no bit of the result"
+  policy (`attn_combine_weight`'s own comment) and keeping the helper allocation-free
+  regardless of `seq`. `attn_decode_core` heap-allocates (not a VLA) the `m`/`s`/`acc`
+  scratch sized by `n_parts` and `head_dim` -- both runtime, uncapped caller
+  arguments -- reused across the head loop; allocation failure leaves `out` entirely
+  untouched, matching `sg_ref_attn_combine`'s own contract-violation convention.
+- `tests/test_attn_decode.c` (new, picked up automatically by the Makefile's
+  `tests/test_*.c` wildcard + generic pattern rule, no Makefile edit needed):
+  - Gate 1 (split-K equals direct): max ABSOLUTE error < 1e-6 (the brief's literal
+    bound, not P2.0's own combined-tolerance workaround -- P2.0's own measured noise
+    floor was ~6e-8 absolute, so a plain absolute bound holds with margin here too) for
+    `n_parts` in {1,2,3,7,64,257} x ragged seq in {37,101,500} x three shapes (a small
+    heavy-GQA shape, a 1:1 shape, and the real Qwen3-4B-Instruct-2507 32/8/128 shape),
+    54 cases. Worst observed: 1.192e-07 (about 2 float32 ULPs, well under the 1e-6
+    bound). `n_parts>seq` (forced empty partitions) exercised repeatedly (e.g. seq=37
+    vs n_parts=64/257).
+  - Gate 2 (`n_parts==1` bit-exact): 4 shapes x 4 seq values, `memcpy`+`uint32_t`
+    compare, 0 mismatches.
+  - Gate 3 (GQA actually exercised, mapping PROVEN not just numerically close): real
+    32/8 shape (repeat 4) -- heads sharing a kv head, given an IDENTICAL query, are
+    bit-exact; a head on a DIFFERENT kv head, given the same query, differs (the
+    vacuity guard: catches a hk-hardcoded-to-0 bug the first check alone would miss).
+    Repeat-1 shape (`n_heads==n_kv_heads==6`) -- every head given the SAME query,
+    every PAIR of the 6 outputs asserted different (proves `hk==h` for every h, no
+    collapsing/off-by-one/reversal).
+  - Gate 4 (`q_stride` both ways): dense (`q_stride==head_dim`) vs hybrid
+    (`q_stride==2*head_dim`) with the gate half NaN-POISONED -- bit-identical output
+    (a leaked NaN would poison everything and fail this immediately), proven through
+    both direct and split-K (n_parts in {2,7,23}).
+  - Gate 5 (100x determinism): both functions, byte-identical every time.
+  - Bonus (not a numbered gate, matches house style): `seq==0`'s documented all-zero
+    output; NULL/zero-dimension inputs' documented no-op/no-crash behavior.
+  - `make debug` (SURGE_NO_METAL, ASan/UBSan): exits 0, 81536 checks in
+    `test_attn_decode.bin`, 0 failures, no sanitizer diagnostics anywhere in the run.
+    Confirmed twice (two independent full `make debug` runs, byte-identical apart from
+    an unrelated test's PID-suffixed temp filename). Compiled clean under
+    `-Wall -Wextra -Werror`, no em dashes.
+- Docs: `docs/c4model.md` (the `ref.c` component row + a new built-status bullet under
+  M3+M5, both updated; the "Not built: M4" line's parenthetical now credits both P2.0
+  and P2.1 as the CPU-proven prerequisites). No new dated doc (this is the per-task
+  writeup; `.superpowers/sdd/2026-08-09-surge-m3-m5/task-P2.1-report.md` is the detailed
+  report, per this project's SDD convention). `docs/index.md` unchanged (no new doc path
+  to register, same as P2.0).
+- Scope discipline: only `src/ref.c` (two new functions + two static helpers,
+  additive), `surge.h` (two new declarations, additive), `tests/test_attn_decode.c`
+  (new file) touched code-wise. `git diff --stat`: `src/ref.c` +145/-0, `surge.h`
+  +74/-0, no existing line modified or deleted anywhere. No kernel
+  (`src/kernels.metal`), encoder (`src/metal.m`), or existing gate touched;
+  `sg_ref_attn_combine` untouched, no tolerance changed.
+- Full report: `.superpowers/sdd/2026-08-09-surge-m3-m5/task-P2.1-report.md`.
+- Minor (flagged, not acted on): this task's addition pushes `todo.md` slightly past
+  the project's ~2000-line file-size guideline (1995 lines before this section). Kept
+  appending in the established per-task format (16 prior tasks all did the same, and
+  this is the project's own committed changelog convention) rather than unilaterally
+  restructuring the historical record inside an otherwise narrowly-scoped, additive
+  task; an archive split (e.g. moving pre-P1 entries to a dated archive file) is a
+  reasonable follow-up if this file's growth becomes a real problem.

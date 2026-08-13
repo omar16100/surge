@@ -343,9 +343,40 @@ optionally Accelerate for the CPU reference path. No third-party libraries.
     `out` unwritten there; this oracle writes an explicit 0.0), now documented
     explicitly in both functions' `surge.h` contracts so the future Metal-vs-oracle
     gate does not spuriously disagree at that boundary.
-- **Not built:** M4 (kernel excellence / beat mlx-lm, incl. the split-K decode-attention
-  Metal kernel that Task P2.0's combine math and Task P2.1's decode-attention-core
-  oracles are the CPU-proven prerequisites for), the dense-qwen3 GPU forward's own
+  - Task P2.2 (`src/kernels.metal` + `src/metal.m` + `surge.h` + `tests/test_metal_ops.c`,
+    purely additive): the METAL twin of those oracles, WRITTEN AND COMPILED ONLY. A
+    28-hour benchmark owned the GPU (PID 98563, `pgrep -f "surge-bench|bench_niah"`
+    non-empty before and after), so EVERY numeric gate is DEFERRED and nothing in this
+    entry is a measured correctness result. Two kernels: `k_attn_decode_splitk_partial`
+    (one threadgroup per (query head, split), emitting the m/s/acc triple per partition
+    over its own `[t0, t1)`) and `k_attn_decode_splitk_combine` (one threadgroup per
+    query head, folding that head's splits in strictly increasing index order by
+    log-sum-exp rescaling). Partition rule, empty-split `-INFINITY`/0/0 encoding, GQA
+    mapping, KV indexing and q_stride handling are `sg_ref_attn_decode_splitk` /
+    `k_attn_decode_f16` verbatim; determinism is the file's existing fixed-tree
+    `tg_max`/`tg_sum` in the partial and a per-thread strictly-increasing serial fold
+    (no cross-thread reduction at all) in the combine. Registered in `src/metal.m` as
+    `KI_ATTN_SPLITK_PARTIAL`/`KI_ATTN_SPLITK_COMBINE` with a NEW `SG_K_HEADS2D` grid
+    class (the second kind after `SG_K_TILES2D` needing two group dimensions, since
+    `SG_K_ATTN` carries a single `*groups` count), `check_params` rules shared by both,
+    a `check_sizes` routing rule, and `splitk_sizes()` guarding every byte count through
+    the existing `mul_ck`/`add_ck`. `seq == 0` DELIBERATELY matches the oracle here
+    (every split empty, `out[d] = 0.0`) rather than inheriting `k_attn_decode_f16`'s
+    unwritten-`out` divergence, so this pair agrees with `sg_ref_attn_decode_splitk` at
+    every `seq`. NOT wired into decode: `enc_attn`/`enc_attn_f16` are byte-for-byte
+    untouched and still dispatch `k_attn_decode_f16`. Verified: the Metal compile
+    (`-fno-fast-math -Wall`), the `metallib` link (both kernels present), `metal.m`
+    under `clang -fsyntax-only -std=c11 -Wall -Wextra -Werror`, the new test compiling
+    under the same flags, and `make debug` (SURGE_NO_METAL, ASan/UBSan) exit 0 at 83523
+    checks / 0 failures / 0 sanitizer diagnostics, unchanged from the pre-task baseline.
+    UNVERIFIED (needs the GPU): every numeric comparison against both oracles, the 100x
+    determinism rerun, the empty-split encoding assertions, the argument-rejection
+    assertions, and whether the kernels run at all. Gate written and registered as
+    `metal_attn_splitk_matches_ref` in `tests/test_metal_ops.c`, ready to run. Full
+    report: `.superpowers/sdd/2026-08-09-surge-m3-m5/task-P2.2-report.md`.
+- **Not built:** M4 (kernel excellence / beat mlx-lm; Task P2.2's split-K decode-attention
+  Metal kernels are now WRITTEN but UNGATED, and nothing dispatches them from the decode
+  path yet), the dense-qwen3 GPU forward's own
   numeric gate (P1 is loader-only; deferred until the GPU is free), server mode,
   non-Metal platforms, MoE, continuous batching, sampling beyond greedy/temp/top-p/top-k.
 

@@ -73,7 +73,17 @@ enum {
      * params[0]*params[2]*params[4] = head_dim*heads*n_tok threads, non-uniform
      * threadgroups. An elementwise kernel with no reduction, dispatched through
      * gpu_grid's *elems path like SG_K_ELEM but with a 3-factor count. */
-    SG_K_ROPE_CHUNK
+    SG_K_ROPE_CHUNK,
+    /* P2.2: the split-K decode-attention partial kernel's grid, a 2D
+     * params[6] x params[0] (split, query head) block of threadgroups of
+     * SG_TG. The SECOND kind after SG_K_TILES2D that needs two group
+     * dimensions and for the same reason SG_K_ATTN cannot be reused: that
+     * class carries exactly one *groups count (see gpu_grid below), so it can
+     * express "one threadgroup per head" and nothing wider. Computed by hand
+     * in sg_gpu_run_attn_splitk_partial, which is the only path that reaches
+     * the kernel at all (it takes six device buffers, so sg_gpu_run_op's
+     * (a, b, out) shape cannot). */
+    SG_K_HEADS2D
 };
 
 #define SG_TG 256u
@@ -105,6 +115,7 @@ enum {
     KI_MATMUL_BF16, KI_MATMUL_F32, KI_MATMUL_Q8,
     KI_ROPE_CHUNK, KI_ATTN_PREFILL,
     KI_CONV1D_CHUNK, KI_DELTA_GATES_CHUNK, KI_DELTA_CHUNK, KI_RMSNORM_GATED_CHUNK,
+    KI_ATTN_SPLITK_PARTIAL, KI_ATTN_SPLITK_COMBINE,
     KI_COUNT
 };
 
@@ -167,6 +178,17 @@ static const sg_kernel_desc SG_KERNELS[] = {
     { "k_delta_gates_chunk",   SG_K_ELEM    },
     { "k_delta_chunk",         SG_K_GROUPS2 },
     { "k_rmsnorm_gated_chunk", SG_K_GATED   },
+    /* P2.2: split-K decode attention. The partial kernel takes SIX device
+     * buffers (q, k, v, m, s, acc) plus a score scratch and the combine FOUR
+     * (m, s, acc, out), so neither fits sg_gpu_run_op's (a, b, out) shape;
+     * both are dispatched by hand from their own one-shot entry points
+     * (sg_gpu_run_attn_splitk_partial / _combine) and are listed here only so
+     * sg_gpu_init builds their pipelines and checks their threadgroup width.
+     * The partial's SG_K_HEADS2D is the real shape of its grid; the combine's
+     * SG_K_ROWS is literally right too (params[0] = n_heads threadgroups),
+     * though neither `kind` is read outside that init width check. */
+    { "k_attn_decode_splitk_partial", SG_K_HEADS2D },
+    { "k_attn_decode_splitk_combine", SG_K_ROWS    },
 };
 #define SG_N_KERNELS ((int)(sizeof SG_KERNELS / sizeof SG_KERNELS[0]))
 _Static_assert(SG_N_KERNELS == KI_COUNT, "SG_KERNELS and the KI_ enum disagree");
@@ -707,6 +729,20 @@ static sg_err check_sizes(const char *kernel, const sg_gpu_buf *a, const sg_gpu_
              mul_ck(t1, f, &need_a) &&
              mul_ck((uint64_t)p[4], p[1], &t2) && mul_ck(t2, f, &need_b);
         need_o = need_a;
+    } else if (strcmp(kernel, "k_attn_decode_splitk_partial") == 0 ||
+               strcmp(kernel, "k_attn_decode_splitk_combine") == 0) {
+        /* P2.2. A ROUTING rule rather than a size rule: the partial kernel
+         * binds six device buffers (q, k, v, m, s, acc) plus a score scratch
+         * and the combine four (m, s, acc, out), so the (a, b, o) triple this
+         * function is handed cannot describe either and sg_gpu_run_op has no
+         * way to dispatch them. Named here rather than left to the generic
+         * fall-through below so the error points at the entry points that do
+         * work. Their real byte counts go through splitk_sizes(), which both
+         * one-shots call and which guards every product with mul_ck exactly
+         * as the rules above do. */
+        return gpu_errf("gpu: %s binds more device buffers than sg_gpu_run_op's "
+                        "(a, b, out); use sg_gpu_run_attn_splitk_partial/_combine",
+                        kernel);
     } else {
         return gpu_errf("gpu: no size rule for kernel '%s'", kernel);
     }
@@ -810,6 +846,38 @@ static sg_err check_params(const char *kernel, const uint32_t *p) {
         if (rc_slices > UINT32_MAX || rc_slices * p[0] > UINT32_MAX) {
             return (sg_err){"gpu: k_rope_chunk head_dim*heads*n_tok exceeds the 32-bit grid range"};
         }
+    } else if (strcmp(kernel, "k_attn_decode_splitk_partial") == 0 ||
+               strcmp(kernel, "k_attn_decode_splitk_combine") == 0) {
+        /* P2.2. ONE params array serves both dispatches (surge.h documents it
+         * that way, and the test fills it once), so both kernels get ONE rule:
+         * a caller must not be able to get an array past the partial only to
+         * have the combine reject it, or the pair would be dispatchable
+         * half-way. The combine ignores n_kv_heads and q_stride, but they are
+         * still validated here for that reason.
+         * [0]=n_heads [1]=n_kv_heads [2]=head_dim [3]=seq [4]=q_stride
+         * [5]=scale bits [6]=n_splits.
+         *
+         * seq (p[3]) is deliberately NOT required to be nonzero, unlike
+         * sg_gpu_run_attn_decode_f16's own guard: seq == 0 makes every split
+         * empty, and these two kernels DEFINE that case (every triple is the
+         * m=-INFINITY/s=0/acc=0 encoding and the combine writes out[d] = 0.0,
+         * matching sg_ref_attn_decode_splitk) instead of leaving `out`
+         * unwritten the way k_attn_decode_f16 does. */
+        if (p[0] == 0) return gpu_errf("gpu: %s n_heads must be nonzero", kernel);
+        if (p[1] == 0 || p[0] % p[1] != 0) {
+            return gpu_errf("gpu: %s n_heads %u is not a multiple of n_kv_heads %u",
+                            kernel, p[0], p[1]);
+        }
+        if (p[2] == 0) return gpu_errf("gpu: %s head_dim must be nonzero", kernel);
+        if (p[4] < p[2]) {
+            return gpu_errf("gpu: %s q_stride %u is smaller than head_dim %u",
+                            kernel, p[4], p[2]);
+        }
+        /* Zero splits would be a zero-length grid dimension (a Metal API
+         * violation that aborts the process) and, on the combine side, the
+         * oracle's n_parts == 0 case, which has no partial triples to fold at
+         * all. Rejected rather than improvised. */
+        if (p[6] == 0) return gpu_errf("gpu: %s n_splits must be nonzero", kernel);
     }
     return SG_OK;
 }
@@ -835,11 +903,13 @@ static void gpu_grid(int kind, const uint32_t *p, uint64_t *groups, uint64_t *el
      * either at any real chunk size (head_dim*heads*n_tok is far under 2^64).
      * check_sizes re-guards the byte counts with mul_ck regardless. */
     case SG_K_ROPE_CHUNK: *elems = (uint64_t)p[0] * p[2] * p[4]; break;
-    /* SG_K_TILES2D needs two group dimensions, which this function's (groups,
-     * elems) pair cannot carry; sg_gpu_run_op computes both by hand instead
-     * (see the SG_K_TILES2D case there). Left at the default *groups = 1 so
-     * a caller that ignored this comment gets an obviously-wrong single
-     * threadgroup rather than a plausible-looking wrong number. */
+    /* SG_K_TILES2D and SG_K_HEADS2D each need two group dimensions, which this
+     * function's (groups, elems) pair cannot carry; their dispatchers compute
+     * both by hand instead (sg_gpu_run_op's SG_K_TILES2D case, and
+     * sg_gpu_run_attn_splitk_partial for SG_K_HEADS2D). Left at the default
+     * *groups = 1 so a caller that ignored this comment gets an
+     * obviously-wrong single threadgroup rather than a plausible-looking wrong
+     * number. */
     default:           *groups = 1; break;
     }
 }
@@ -1185,6 +1255,240 @@ sg_err sg_gpu_run_attn_prefill(sg_gpu *g, void *q, void *k, void *v, void *out,
             [cb waitUntilCompleted];
             if ([cb error]) {
                 rc = gpu_errf("gpu: k_attn_prefill failed: %s",
+                              [[[cb error] localizedDescription] UTF8String]);
+            }
+        }
+    }
+    return rc;
+}
+
+/* =====================================================================
+ * P2.2: split-K decode attention one-shots
+ * =====================================================================
+ *
+ * The host side of k_attn_decode_splitk_partial / _combine. Full contract
+ * (layout, the shared params array, the partition rule, the seq == 0
+ * decision) is in surge.h next to the two declarations. Neither kernel is
+ * reachable through sg_gpu_run_op -- six and four device buffers against its
+ * (a, b, out) triple -- so these are their only entry points, and the decode
+ * path is untouched: enc_attn / enc_attn_f16 still dispatch
+ * k_attn_decode_f16. */
+
+/* One buffer-size check with the standard message. Factored out because the
+ * partial dispatch below has six of them and the combine four, and six
+ * copy-pasted gpu_errf calls are six chances to name the wrong buffer. */
+static sg_err splitk_need(const char *kernel, const char *what,
+                          const sg_gpu_buf *b, uint64_t need) {
+    if (buf_big_enough(b, need)) return SG_OK;
+    return gpu_errf("gpu: %s %s is %llu bytes, needs %llu", kernel, what,
+                    (unsigned long long)(b ? b->nbytes : 0), (unsigned long long)need);
+}
+
+/* Every byte count the split-K pair needs, from the shared params array.
+ * Each `need_*` may be NULL when that size is not wanted (the combine has no
+ * q, k, v or scratch; the partial has no out). An overflow in ANY of them
+ * fails the whole call even for a caller that did not ask for that size: the
+ * params array is contracted (surge.h) to be valid for BOTH dispatches, so a
+ * q/k/v extent that cannot exist is a bad array rather than a bad question.
+ *
+ * Guarded end to end with mul_ck for the reason stated above it: these are
+ * products of up to three caller uint32 params (n_heads * n_splits * head_dim
+ * is the largest), and a wrapped `need` would be SMALL, so an undersized
+ * buffer would pass the checks below and the kernel would then index with the
+ * original, unwrapped dimensions.
+ *
+ * `span` is ceil(seq / n_splits), the exact upper bound on one split's length
+ * under the t0 = i*seq/n_splits partition rule (t1 - t0 <= floor(seq/n_splits)
+ * + 1 for every i, with equality reachable), and it is computed here with the
+ * IDENTICAL 64-bit expression k_attn_decode_splitk_partial uses to find its
+ * private score row, so host sizing and kernel indexing cannot drift apart. */
+static bool splitk_sizes(const uint32_t *p, uint64_t *need_q, uint64_t *need_kv,
+                         uint64_t *need_ms, uint64_t *need_acc, uint64_t *need_out,
+                         uint64_t *need_scratch) {
+    const uint64_t f = 4;   /* sizeof(float) */
+    uint64_t n_heads = p[0], n_kv = p[1], hd = p[2], seq = p[3];
+    uint64_t q_stride = p[4], n_splits = p[6];
+    uint64_t q = 0, kv = 0, ms = 0, acc = 0, out = 0, scratch = 0, parts = 0, t = 0;
+
+    /* check_params rejects this first; guarded again here because the span
+     * division below would be a divide by zero. */
+    if (n_splits == 0) return false;
+    uint64_t span = (seq + n_splits - 1) / n_splits;   /* both u32-derived, cannot wrap u64 */
+
+    bool ok = mul_ck(n_heads, q_stride, &t) && mul_ck(t, f, &q)
+           && mul_ck(seq, n_kv, &t) && mul_ck(t, hd, &t) && mul_ck(t, 2, &kv)
+           && mul_ck(n_heads, n_splits, &parts) && mul_ck(parts, f, &ms)
+           && mul_ck(parts, hd, &t) && mul_ck(t, f, &acc)
+           && mul_ck(n_heads, hd, &t) && mul_ck(t, f, &out)
+           && mul_ck(parts, span, &t) && mul_ck(t, f, &scratch);
+    if (!ok) return false;
+
+    /* Metal rejects a zero-length buffer, and the partial kernel's `scores`
+     * argument has to be BOUND even in the one case where no thread touches
+     * it (seq == 0 makes every split empty, so span is 0). Ask for one float
+     * rather than nothing, so the binding stays valid. */
+    if (scratch == 0) scratch = f;
+
+    if (need_q) *need_q = q;
+    if (need_kv) *need_kv = kv;
+    if (need_ms) *need_ms = ms;
+    if (need_acc) *need_acc = acc;
+    if (need_out) *need_out = out;
+    if (need_scratch) *need_scratch = scratch;
+    return true;
+}
+
+sg_err sg_gpu_run_attn_splitk_partial(sg_gpu *g, void *q, void *k, void *v,
+                                      void *m, void *s, void *acc,
+                                      const uint32_t params[8]) {
+    const char *kn = "k_attn_decode_splitk_partial";
+    if (!g || !q || !k || !v || !m || !s || !acc || !params) {
+        return (sg_err){"gpu: sg_gpu_run_attn_splitk_partial got a NULL argument"};
+    }
+    sg_err e = check_params(kn, params);
+    if (sg_failed(e)) return e;
+
+    uint32_t n_heads = params[0], n_splits = params[6];
+    uint64_t need_q = 0, need_kv = 0, need_ms = 0, need_acc = 0, need_scratch = 0;
+    if (!splitk_sizes(params, &need_q, &need_kv, &need_ms, &need_acc, NULL, &need_scratch)) {
+        return gpu_errf("gpu: %s params describe a region that overflows 64 bits", kn);
+    }
+
+    sg_gpu_buf *ins[3] = {(sg_gpu_buf *)q, (sg_gpu_buf *)k, (sg_gpu_buf *)v};
+    sg_gpu_buf *outs[3] = {(sg_gpu_buf *)m, (sg_gpu_buf *)s, (sg_gpu_buf *)acc};
+    static const char *const in_name[3] = {"q", "k", "v"};
+    static const char *const out_name[3] = {"m", "s", "acc"};
+    const uint64_t in_need[3] = {need_q, need_kv, need_kv};
+    const uint64_t out_need[3] = {need_ms, need_ms, need_acc};
+
+    for (int i = 0; i < 3; i++) {
+        e = splitk_need(kn, in_name[i], ins[i], in_need[i]);
+        if (sg_failed(e)) return e;
+        e = splitk_need(kn, out_name[i], outs[i], out_need[i]);
+        if (sg_failed(e)) return e;
+    }
+
+    /* surge.h forbids an output overlapping an input for the reason
+     * sg_gpu_run_op states: a threadgroup that has already written its
+     * partial would be changing an input another threadgroup has not read
+     * yet, which is both wrong and NONDETERMINISTIC. The three OUTPUTS must
+     * also be disjoint from each other here, which the (a, b, out) kernels
+     * never have to say: m, s and acc are written by different threadgroups
+     * at different strides, so an overlap between two of them is the same
+     * race with a different name. */
+    for (int i = 0; i < 3; i++) {
+        for (int j = 0; j < 3; j++) {
+            if (bufs_overlap(ins[i], outs[j])) {
+                return gpu_errf("gpu: %s output %s overlaps input %s", kn,
+                                out_name[j], in_name[i]);
+            }
+        }
+    }
+    for (int i = 0; i < 3; i++) {
+        for (int j = i + 1; j < 3; j++) {
+            if (bufs_overlap(outs[i], outs[j])) {
+                return gpu_errf("gpu: %s outputs %s and %s overlap", kn,
+                                out_name[i], out_name[j]);
+            }
+        }
+    }
+
+    e = scratch_ensure(g, need_scratch);
+    if (sg_failed(e)) return e;
+
+    __block sg_err rc = SG_OK;
+    @autoreleasepool {
+        id<MTLCommandBuffer> cb = [g->queue commandBuffer];
+        id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+        if (!cb || !enc) {
+            rc = (sg_err){"gpu: could not open a compute encoder"};
+        } else {
+            [enc setComputePipelineState:g->pipes[KI_ATTN_SPLITK_PARTIAL]];
+            for (int i = 0; i < 3; i++) {
+                [enc setBuffer:ins[i]->buf offset:(NSUInteger)ins[i]->offset atIndex:(NSUInteger)i];
+                [enc setBuffer:outs[i]->buf offset:(NSUInteger)outs[i]->offset
+                       atIndex:(NSUInteger)(3 + i)];
+            }
+            [enc setBytes:params length:8 * sizeof(uint32_t) atIndex:6];
+            [enc setBuffer:g->scratch offset:0 atIndex:7];
+            /* The SG_K_HEADS2D grid: x = split, y = query head, matching the
+             * kernel's tg.x / tg.y. Both grid attributes are declared uint2
+             * there, the same pairing the SG_K_TILES2D dispatch above uses and
+             * for the same stated reason (the two position attributes must
+             * agree on their vector width), so the kernel reads its lane index
+             * out of tid.x of an SG_TG x 1 threadgroup. Total threads per
+             * threadgroup is still exactly SG_TG, which is what the fixed
+             * tg_max/tg_sum fold trees are shaped for. */
+            [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)n_splits, (NSUInteger)n_heads, 1)
+                threadsPerThreadgroup:MTLSizeMake(SG_TG, 1, 1)];
+            [enc endEncoding];
+            [cb commit];
+            [cb waitUntilCompleted];
+            if ([cb error]) {
+                rc = gpu_errf("gpu: %s failed: %s", kn,
+                              [[[cb error] localizedDescription] UTF8String]);
+            }
+        }
+    }
+    return rc;
+}
+
+sg_err sg_gpu_run_attn_splitk_combine(sg_gpu *g, void *m, void *s, void *acc,
+                                      void *out, const uint32_t params[8]) {
+    const char *kn = "k_attn_decode_splitk_combine";
+    if (!g || !m || !s || !acc || !out || !params) {
+        return (sg_err){"gpu: sg_gpu_run_attn_splitk_combine got a NULL argument"};
+    }
+    sg_err e = check_params(kn, params);
+    if (sg_failed(e)) return e;
+
+    uint32_t n_heads = params[0];
+    uint64_t need_ms = 0, need_acc = 0, need_out = 0;
+    if (!splitk_sizes(params, NULL, NULL, &need_ms, &need_acc, &need_out, NULL)) {
+        return gpu_errf("gpu: %s params describe a region that overflows 64 bits", kn);
+    }
+
+    sg_gpu_buf *ins[3] = {(sg_gpu_buf *)m, (sg_gpu_buf *)s, (sg_gpu_buf *)acc};
+    sg_gpu_buf *ob = (sg_gpu_buf *)out;
+    static const char *const in_name[3] = {"m", "s", "acc"};
+    const uint64_t in_need[3] = {need_ms, need_ms, need_acc};
+
+    for (int i = 0; i < 3; i++) {
+        e = splitk_need(kn, in_name[i], ins[i], in_need[i]);
+        if (sg_failed(e)) return e;
+    }
+    e = splitk_need(kn, "out", ob, need_out);
+    if (sg_failed(e)) return e;
+
+    for (int i = 0; i < 3; i++) {
+        if (bufs_overlap(ins[i], ob)) {
+            return gpu_errf("gpu: %s output overlaps input %s", kn, in_name[i]);
+        }
+    }
+
+    __block sg_err rc = SG_OK;
+    @autoreleasepool {
+        id<MTLCommandBuffer> cb = [g->queue commandBuffer];
+        id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+        if (!cb || !enc) {
+            rc = (sg_err){"gpu: could not open a compute encoder"};
+        } else {
+            [enc setComputePipelineState:g->pipes[KI_ATTN_SPLITK_COMBINE]];
+            for (int i = 0; i < 3; i++) {
+                [enc setBuffer:ins[i]->buf offset:(NSUInteger)ins[i]->offset atIndex:(NSUInteger)i];
+            }
+            [enc setBuffer:ob->buf offset:(NSUInteger)ob->offset atIndex:3];
+            [enc setBytes:params length:8 * sizeof(uint32_t) atIndex:4];
+            /* One SG_TG-wide threadgroup per query head, a plain 1D grid: the
+             * combine folds n_splits triples per head and has no second
+             * dimension to spread. */
+            [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)n_heads, 1, 1)
+                threadsPerThreadgroup:MTLSizeMake(SG_TG, 1, 1)];
+            [enc endEncoding];
+            [cb commit];
+            [cb waitUntilCompleted];
+            if ([cb error]) {
+                rc = gpu_errf("gpu: %s failed: %s", kn,
                               [[[cb error] localizedDescription] UTF8String]);
             }
         }

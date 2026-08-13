@@ -2173,3 +2173,123 @@ deletions are the original unguarded malloc call, replaced; `sg_ref_attn_combine
 `attn_layer` both byte-for-byte untouched, confirmed via `git diff` inspection, not just
 diff-stat), `surge.h` +20/-5 (two doc paragraphs extended in place), `tests/
 test_attn_decode.c` +252/-0. No kernel, encoder, existing gate, or tolerance touched.
+
+### P2.2 Metal split-K decode-attention kernels (WRITTEN AND COMPILED, GATES DEFERRED)
+
+Wrote the Metal twin of P2.0's `sg_ref_attn_combine` and P2.1's `sg_ref_attn_decode` /
+`sg_ref_attn_decode_splitk`. **A 28-hour benchmark owned the GPU for the whole task**
+(`pgrep -f "surge-bench|bench_niah"` returned PID 98563 before the first edit and after
+the last), so this task WROTE and COMPILED but never RAN a kernel. No `make check`, no
+`surge`, no `surge-bench`, no Metal binary executed. **Every numeric gate is deferred and
+nothing below is a measured correctness result.** Purely additive: `k_attn_decode_f16`,
+`enc_attn`, `enc_attn_f16`, `src/ref.c` and every existing gate are byte-for-byte
+untouched.
+
+**Why split-K at all.** `k_attn_decode_f16` dispatches exactly `n_heads` threadgroups
+(`src/metal.m`), so at 32 heads only 32 of this machine's 80 GPU cores have anything
+scheduled and ONE threadgroup walks the entire 262,144-key sequence: 1.25 tok/s at
+262,144 on the 2B, GPU drawing 6-20 W against a 170 W limiter. Split-K makes the grid
+`n_heads x n_splits`.
+
+**1. `src/kernels.metal` (+~295 lines, appended at the end so no existing line reference
+moves).** `k_attn_decode_splitk_partial`: one threadgroup per (query head, split), 2D
+grid (x = split, y = head), emitting `m`/`s`/`acc[head_dim]` per partition.
+`k_attn_decode_splitk_combine`: one threadgroup per query head, folding that head's
+splits in strictly increasing index order. Mirrored, not reinvented:
+- partition rule identical to `attn_decode_core`'s: `t0 = i*seq/n_splits`,
+  `t1 = (i+1)*seq/n_splits`, 64-bit intermediate, tiles `[0, seq)` exactly;
+- empty split (`t0 >= t1`, forced whenever `n_splits > seq`) emits the documented
+  `m = -INFINITY, s = 0, acc = 0`, which the combine consumes with no special case
+  (`exp(-INFINITY - M)` is exactly 0.0);
+- arithmetic, GQA `hk = h / repeat` (incl. the `repeat == 0` fallback to kv head 0),
+  `[seq, n_kv_heads, head_dim]` KV indexing and `q_stride` handling are
+  `k_attn_decode_f16`'s verbatim;
+- `attn_combine_weight` is `src/ref.c`'s function in f32, equality test and all (so a
+  split tied at `+INFINITY` gets weight exactly 1.0 instead of `INF - INF` = NaN).
+The ONE deliberate arithmetic difference from `k_attn_decode_f16`: the partial does NOT
+divide by its own sum. The split's weights must stay UNNORMALIZED, since undoing a
+per-split normalization is exactly what the combine's rescaling would otherwise have to
+do.
+
+**2. Determinism.** No atomics, no `simd_sum`/`simd_max`, no shared-accumulator
+read-modify-write. The partial uses the file's existing fixed-shape `tg_max`/`tg_sum`
+trees, exactly as `k_attn_decode_f16` does, and writes `m`/`s` from `lid == 0` (a store,
+not a reduction: both folds hand the same value to every thread). The combine uses NO
+fold at all, deliberately: every thread walks the same `n_splits` triples in the same
+strictly increasing index order and independently computes the identical `M` and `S`, so
+no thread reads anything another thread wrote (the determinism rule satisfied a fortiori)
+AND the order matches `sg_ref_attn_combine`'s own serial passes rather than a tree that
+would reassociate them. Split count is a dispatch parameter (`params[6]`), never derived
+from data.
+
+**3. `seq == 0`, the P2.1 hand-off divergence, resolved by choosing the oracle's
+behavior.** `k_attn_decode_f16` folds `seq == 0` into its early return and leaves `out`
+UNWRITTEN (`src/kernels.metal:497`); the CPU oracle writes `out[d] = 0.0`. The new pair
+takes the ORACLE's side: at `seq == 0` every split is empty, so every triple is the
+`-INFINITY`/0/0 encoding and the combine's all-empty branch writes 0.0. `check_params`
+therefore accepts `seq == 0` (unlike `sg_gpu_run_attn_decode_f16`, which rejects it), and
+`splitk_sizes()` clamps the otherwise-zero score scratch to one float so the binding
+stays valid. Documented in the kernel header, in `surge.h`, and in `check_params`. The
+gate test deliberately does NOT exercise `seq == 0`: the behavior is chosen and
+documented, not measured.
+
+**4. `src/metal.m` (+~310 lines).** `KI_ATTN_SPLITK_PARTIAL` / `KI_ATTN_SPLITK_COMBINE`
+appended to the `KI_` enum with matching `SG_KERNELS` rows (the `_Static_assert` keeps
+them in lockstep). New `SG_K_HEADS2D` grid class: the SECOND kind after M5.3's
+`SG_K_TILES2D` that needs two group dimensions, added for exactly the reason
+`src/metal.m` already states about `SG_K_ATTN` (one `*groups` count cannot express a 2D
+grid), and left at `gpu_grid`'s documented default so a caller that ignores the comment
+gets an obviously-wrong single threadgroup rather than a plausible wrong number. Shared
+`check_params` rule for both kernels (one params array serves both dispatches, so both
+are validated against it: nonzero `n_heads`/`head_dim`/`n_splits`, GQA divisibility,
+`q_stride >= head_dim`); a `check_sizes` ROUTING rule naming both kernels so
+`sg_gpu_run_op` refuses them with a message pointing at the entry points that work
+rather than the generic "no size rule"; `splitk_sizes()` computing q/k/v/m/s/acc/out/
+scratch byte counts with every product guarded by the existing `mul_ck`/`add_ck`. Two
+one-shots, `sg_gpu_run_attn_splitk_partial` (six device buffers) and
+`sg_gpu_run_attn_splitk_combine` (four), each checking sizes, NULL args and aliasing
+(including OUTPUT-vs-OUTPUT overlap, which the `(a, b, out)` kernels never have to say).
+The scores scratch is sized `n_heads * n_splits * ceil(seq/n_splits)` floats with the
+IDENTICAL 64-bit expression the kernel uses to find its private row, so host sizing and
+kernel indexing cannot drift.
+
+**5. NOT wired into decode.** `enc_attn` / `enc_attn_f16` are untouched and still
+dispatch `k_attn_decode_f16`. Switching decode over is a later task, after the gates pass.
+
+**6. The gate test, written now and registered, never run.** `metal_attn_splitk_matches_ref`
+in `tests/test_metal_ops.c` (+~268 lines), guarded by that file's existing
+skip-when-Metal-is-unavailable structure. It compares the Metal path against BOTH oracles
+on identical inputs: vs `sg_ref_attn_decode_splitk` at the same `n_splits` (the tight,
+twin check) and vs `sg_ref_attn_decode` (direct, which is what would catch a bug
+consistent across every partition boundary, the K-invariance trap the P2.1 review named).
+`n_splits` in {1, 2, 3, 7, 64, 257} at seq 200 (so 257 EXCEEDS seq and the tail splits
+are genuinely empty) and seq 1000 (so the low-`n_splits` cases stride past 256 keys per
+threadgroup), on the real 32/8/128 GQA shape, at both `q_stride` variants (`head_dim`
+dense and `2*head_dim` hybrid, with the gate half NaN-POISONED so a q_stride bug returns
+NaN rather than a merely inaccurate number). Also: the m/s/acc buffers are asserted
+directly against the partition rule (empty splits EXACTLY `-INFINITY`/0/0, non-empty
+splits finite `m` and `s >= 1.0`), since the combine maps an empty-encoded split and an
+all-zero-weight split to the same output and would hide an off-by-one boundary; 100x
+determinism with all four output buffers poisoned before each run; and the documented
+rejections (NULL args, `n_splits == 0`, GQA mismatch, `q_stride < head_dim`, undersized
+partial buffers, m/s aliasing, out aliasing an input, and `sg_gpu_run_op` refusing both
+kernels by name).
+
+**Verified (compiler and CPU only, all four re-run after the final edit):**
+1. `xcrun -sdk macosx metal -fno-fast-math -Wall -c src/kernels.metal` clean;
+2. `xcrun -sdk macosx metallib` links it, and `k_attn_decode_splitk_partial` /
+   `k_attn_decode_splitk_combine` are both present in the resulting library (built to
+   `/tmp` on purpose, NOT over `src/kernels.metallib`, so the running benchmark's loaded
+   library was never replaced under it; `make` regenerates it from the same two commands);
+3. `xcrun clang -fsyntax-only -std=c11 -Wall -Wextra -Werror src/metal.m` clean;
+4. `tests/test_metal_ops.c` compiles under the same flags;
+5. `make debug` (SURGE_NO_METAL, ASan/UBSan) exit 0, **83523 checks, 0 failures**, no
+   sanitizer diagnostics. Measured the same number in a clean `git worktree` at HEAD
+   before the change: **83523 / 0**, identical, so the CPU side did not regress.
+
+**UNVERIFIED, every one of these needs the GPU (see the P2.2 report for the full list):**
+that either kernel runs at all; every numeric comparison against both oracles; the 100x
+determinism rerun; the empty-split encoding assertions; the `seq == 0` choice; the
+argument-rejection assertions; the 2D `SG_K_HEADS2D` dispatch mapping `tg.x`/`tg.y` to
+the intended (split, head); and any performance claim whatsoever, since no split-K
+kernel has been timed.

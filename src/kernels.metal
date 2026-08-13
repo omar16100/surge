@@ -1304,3 +1304,299 @@ kernel void k_rmsnorm_gated_chunk(device const float *y  [[buffer(0)]],
         oh[i] = sg_silu(zh[i]) * (yh[i] * scale * w[i]);
     }
 }
+
+/* =====================================================================
+ * Split-K decode attention (Task P2.2)
+ * =====================================================================
+ *
+ * k_attn_decode_f16 above dispatches exactly n_heads threadgroups, so at 32
+ * heads only 32 of this machine's 80 GPU cores have anything scheduled and
+ * ONE threadgroup walks the entire 262,144-key sequence. These two kernels
+ * are the flash-decoding answer: partition [0, seq) into n_splits contiguous
+ * ranges, give each (query head, split) its own threadgroup, and fold the
+ * per-split partial results afterwards by log-sum-exp rescaling.
+ *
+ * THEY ARE THE METAL TWIN OF THE ALREADY-GATED CPU ORACLE, statement for
+ * statement:
+ *   - the partition rule is sg_ref_attn_decode_splitk's exactly (src/ref.c,
+ *     attn_decode_core): t0 = i*seq/n_splits, t1 = (i+1)*seq/n_splits, integer
+ *     division with a 64-bit intermediate. It tiles [0, seq) exactly (split
+ *     i's t1 IS split i+1's t0, the last t1 IS seq), leaves the ragged
+ *     remainder in the high-index splits, and produces genuinely empty splits
+ *     whenever n_splits > seq;
+ *   - the per-split triple (m, s, acc) is sg_ref_attn_combine's contract
+ *     (surge.h): m = max score over the split, s = sum exp(score - m),
+ *     acc[d] = sum exp(score - m) * v[d], the UNNORMALIZED weighted-V sum;
+ *   - an empty split (t0 >= t1) emits the documented m = -INFINITY, s = 0,
+ *     acc = 0 encoding, which the combine's log-sum-exp handles with no
+ *     special case at all (weight exp(-INFINITY - M) == 0);
+ *   - the arithmetic, the GQA mapping (hk = h / repeat, falling back to kv
+ *     head 0 when repeat == 0), the [seq, n_kv_heads, head_dim] KV indexing
+ *     and the q_stride handling are k_attn_decode_f16's verbatim.
+ *
+ * DETERMINISM (the rule at the top of this file). No atomics, no simd_sum /
+ * simd_max, no read-modify-write of a shared accumulator: the partial kernel
+ * folds with the same fixed-shape tg_max/tg_sum trees k_attn_decode_f16 uses,
+ * and the combine walks splits in strictly increasing index order. The split
+ * count is a DISPATCH PARAMETER (params[6]), never derived from data, so the
+ * partition boundaries and therefore every summation order are fixed before
+ * the first byte is read.
+ *
+ * seq == 0: DELIBERATELY DIFFERENT FROM k_attn_decode_f16, which folds seq==0
+ * into its early-return guard (:497) and leaves `out` completely UNWRITTEN.
+ * These kernels instead match the CPU oracle: every split is empty (t0 == t1
+ * == 0 for every i), so every triple is the -INFINITY/0/0 encoding and the
+ * combine's all-empty branch writes the documented out[d] = 0.0. The
+ * divergence surge.h warns about under "KNOWN DIVERGENCE FROM
+ * k_attn_decode_f16 AT seq==0" therefore does NOT apply to this pair; they
+ * agree with sg_ref_attn_decode_splitk there. (metal.m accepts seq == 0 for
+ * exactly this reason, unlike sg_gpu_run_attn_decode_f16, which rejects it.)
+ *
+ * NOT WIRED INTO THE DECODE PATH. enc_attn / enc_attn_f16 still dispatch
+ * k_attn_decode_f16; switching decode over happens only once these have
+ * passed their GPU gates. */
+
+/* ref.c's attn_combine_weight in f32 (src/ref.c, above sg_ref_attn_combine),
+ * including the reason for the equality test: mi == M means the weight is
+ * exactly 1.0 by definition, and computing it as exp(mi - M) would give the
+ * indeterminate INF - INF = NaN when both are +INFINITY even though the two
+ * are genuinely equal. Every other combination evaluates correctly through
+ * the subtraction, including an empty split's mi == -INFINITY against a
+ * finite M (IEEE-754 makes that -INFINITY, not NaN, and exp(-INFINITY) is
+ * exactly 0.0). A NaN mi is not caught by the equality (NaN == anything is
+ * false) and falls through to exp(NaN - M) == NaN, which the combine
+ * propagates rather than launders. */
+static inline float attn_combine_weight(float mi, float M) {
+    if (mi == M) return 1.0f;
+    return precise::exp(mi - M);
+}
+
+/* One threadgroup per (query head, split), a 2D grid dispatched as
+ * (x = split, y = head); metal.m's SG_K_HEADS2D class is what carries those
+ * two group dimensions, since SG_K_ATTN's single *groups count cannot (see
+ * gpu_grid there, and the SG_K_TILES2D precedent it follows).
+ *
+ * Buffers: q f32 [n_heads, q_stride]; kc, vc f16 [seq, n_kv_heads, head_dim]
+ * (the sg_kv layout); m, s f32 [n_heads, n_splits]; acc f32
+ * [n_heads, n_splits, head_dim]; scores f32 scratch, one private row of
+ * `span` floats per (head, split) where span = ceil(seq / n_splits), sized by
+ * metal.m with the IDENTICAL formula.
+ *
+ * params: [0]=n_heads [1]=n_kv_heads [2]=head_dim [3]=seq [4]=q_stride
+ * [5]=softmax scale bits [6]=n_splits (params[7] unused).
+ *
+ * `span` is the exact upper bound on a split's length: with the partition
+ * rule above, t1 - t0 <= floor(seq/n_splits) + 1 <= ceil(seq/n_splits) for
+ * every i, and the bound is TIGHT (some split always attains it, whether or
+ * not n_splits divides seq), so it is neither too small nor wasteful. The
+ * scores row therefore never overruns its slice and neighbouring splits
+ * never share a byte. */
+kernel void k_attn_decode_splitk_partial(device const float *q  [[buffer(0)]],
+                                         device const half *kc   [[buffer(1)]],
+                                         device const half *vc   [[buffer(2)]],
+                                         device float *m_out     [[buffer(3)]],
+                                         device float *s_out     [[buffer(4)]],
+                                         device float *acc_out   [[buffer(5)]],
+                                         constant uint *p        [[buffer(6)]],
+                                         device float *scores    [[buffer(7)]],
+                                         uint2 tg  [[threadgroup_position_in_grid]],
+                                         uint2 tid [[thread_position_in_threadgroup]])
+{
+    uint n_heads = p[0], n_kv = p[1], hd = p[2], seq = p[3];
+    uint q_stride = p[4];
+    float scale = as_type<float>(p[5]);
+    uint n_splits = p[6];
+
+    uint part = tg.x, h = tg.y, lid = tid.x;
+    /* Every term here is uniform across the threadgroup (tg.x/tg.y are, lid
+     * is not used), so this return is uniform and cannot strand a thread on
+     * one of the barriers below. */
+    if (h >= n_heads || part >= n_splits || n_kv == 0u || hd == 0u) return;
+
+    /* The partition rule, in 64-bit exactly like attn_decode_core's. */
+    uint t0 = (uint)(((ulong)part * (ulong)seq) / (ulong)n_splits);
+    uint t1 = (uint)((((ulong)part + 1ul) * (ulong)seq) / (ulong)n_splits);
+
+    /* Flat (head, split) index into the m/s arrays. Built in 64-bit: n_heads
+     * and n_splits are independent uint32 params, so h*n_splits alone can
+     * exceed 32 bits even though metal.m's size checks (which guard the same
+     * product in uint64) would reject a buffer that large. */
+    size_t part_idx = (size_t)h * (size_t)n_splits + (size_t)part;
+    device float *acc = acc_out + part_idx * (size_t)hd;
+
+    /* Empty split, guaranteed for the high-index splits whenever
+     * n_splits > seq (and for EVERY split when seq == 0): the documented
+     * m = -INFINITY / s = 0 / acc = 0 encoding, which the combine consumes
+     * with no special case. Uniform branch (t0, t1 are uniform). */
+    if (t0 >= t1) {
+        if (lid == 0u) {
+            m_out[part_idx] = -INFINITY;
+            s_out[part_idx] = 0.0f;
+        }
+        for (uint i = lid; i < hd; i += SG_TG) acc[i] = 0.0f;
+        return;
+    }
+
+    uint repeat = n_heads / n_kv;         /* GQA: mlx repeats the kv-head axis */
+    uint hk = repeat ? (h / repeat) : 0u;
+    device const float *qh = q + (size_t)h * q_stride;
+
+    /* This (head, split)'s private score row. span is recomputed here rather
+     * than passed in so the kernel and metal.m cannot drift apart by a param
+     * that one of them forgot to set; both compute ceil(seq/n_splits) in
+     * 64-bit. */
+    uint span = (uint)((((ulong)seq + (ulong)n_splits) - 1ul) / (ulong)n_splits);
+    device float *sc = scores + part_idx * (size_t)span;
+    uint len = t1 - t0;
+    threadgroup float red[SG_TG];
+
+    /* 1. scores over [t0, t1). Thread `lid` owns the split's keys lid,
+     *    lid+256, ... (indexed RELATIVE to t0, so t0 + r cannot overflow the
+     *    way t0 + lid could at a t0 near UINT32_MAX); the dot product is a
+     *    serial loop over head_dim, so no reduction is needed here. */
+    for (uint r = lid; r < len; r += SG_TG) {
+        device const half *kt = kc + ((size_t)(t0 + r) * n_kv + hk) * hd;
+        float dot = 0.0f;
+        for (uint i = 0; i < hd; i++) dot += qh[i] * (float)kt[i];
+        sc[r] = dot * scale;
+    }
+    threadgroup_barrier(mem_flags::mem_device | mem_flags::mem_threadgroup);
+
+    /* 2. m = max score over THIS SPLIT only. Same fixed tree, same
+     *    degenerate-branch-free shape as k_attn_decode_f16 (the host only
+     *    ever passes keys at positions <= pos, so there is no mask value that
+     *    could make a score non-finite). */
+    float m = -INFINITY;
+    for (uint r = lid; r < len; r += SG_TG) { float v = sc[r]; m = (v > m) ? v : m; }
+    m = tg_max(red, lid, m);
+
+    /* 3. s = sum exp(score - m) over the split, and the exponentials stay in
+     *    the score row for step 4. NOTE THE ONE DELIBERATE DIFFERENCE from
+     *    k_attn_decode_f16: there is NO division by the sum here. The split's
+     *    weights must stay UNNORMALIZED, because normalizing per split is
+     *    exactly what the combine's log-sum-exp rescaling has to undo. */
+    float sacc = 0.0f;
+    for (uint r = lid; r < len; r += SG_TG) {
+        float e = precise::exp(sc[r] - m);
+        sc[r] = e;
+        sacc += e;
+    }
+    float s = tg_sum(red, lid, sacc);
+    threadgroup_barrier(mem_flags::mem_device | mem_flags::mem_threadgroup);
+
+    /* 4. acc[d] = sum_t exp(score_t - m) * v[t][d] over the split. Thread
+     *    `lid` owns OUTPUT dims lid, lid+256, ... and walks t in increasing
+     *    order, so there is no cross-thread reduction and the summation order
+     *    is fixed, exactly as in k_attn_decode_f16's step 3. */
+    for (uint i = lid; i < hd; i += SG_TG) {
+        float a = 0.0f;
+        for (uint r = 0; r < len; r++) {
+            a += sc[r] * (float)vc[((size_t)(t0 + r) * n_kv + hk) * hd + i];
+        }
+        acc[i] = a;
+    }
+
+    /* tg_max/tg_sum hand the SAME value to every thread, so writing m and s
+     * from one designated thread is not a reduction, just a store. */
+    if (lid == 0u) {
+        m_out[part_idx] = m;
+        s_out[part_idx] = s;
+    }
+}
+
+/* One threadgroup per query head, folding that head's n_splits partial
+ * triples into the final attention output. sg_ref_attn_combine (src/ref.c)
+ * pass for pass:
+ *
+ *   M = max_i m[i];  S = sum_i s[i]*w(m[i], M);
+ *   out[d] = ( sum_i acc[i][d]*w(m[i], M) ) / S
+ *
+ * with w = attn_combine_weight above, and the oracle's degenerate cases in
+ * the same order it checks them:
+ *   - M is NaN: every out[d] is that NaN. surge.h's contract is "a NaN
+ *     anywhere in m[] makes every out[d] NaN"; the scan below propagates a
+ *     NaN from ANY index into M (the way tg_max does, and unlike the CPU
+ *     loop, which only picks one up at i == 0 and catches the rest through
+ *     its isnan(S) check instead). Both routes end at the same NaN-out
+ *     answer the contract promises; only the intermediate differs.
+ *   - M == -INFINITY, i.e. EVERY split empty (which is also the seq == 0
+ *     case): out[d] = 0.0, the documented "attention over zero keys"
+ *     convention, caught before it could become -INF - -INF = NaN.
+ *   - M == +INFINITY needs no branch: attn_combine_weight gives every split
+ *     tied at that +INFINITY weight exactly 1.0 and every other split 0.0.
+ *   - S is NaN: propagate rather than let the S > 0.0 guard below launder it
+ *     into a manufactured 0.0.
+ *
+ * NO tg_sum/tg_max FOLD HERE, unlike the partial kernel: there is no
+ * cross-thread reduction to make. Every thread walks the same n_splits
+ * triples in the same strictly increasing index order and independently
+ * computes the identical M and S, which is both the determinism rule
+ * satisfied a fortiori (no thread reads anything another thread wrote, so
+ * there is no order to fix) and a closer match to sg_ref_attn_combine, whose
+ * own passes are strictly-increasing serial sums rather than trees. The
+ * weights are recomputed inside the pass-3 loop rather than cached, exactly
+ * as the oracle does it: they are a pure function of already-fixed inputs, so
+ * recomputing changes no bit. n_splits is a small dispatch parameter (tens to
+ * low hundreds), not a sequence length, so the redundancy is cheap.
+ *
+ * Buffers: m, s f32 [n_heads, n_splits]; acc f32 [n_heads, n_splits,
+ * head_dim]; out f32 [n_heads, head_dim]. params are the SAME array the
+ * partial dispatch takes, so the host can fill it once; this kernel reads
+ * only [0]=n_heads, [2]=head_dim and [6]=n_splits. */
+kernel void k_attn_decode_splitk_combine(device const float *m_in   [[buffer(0)]],
+                                         device const float *s_in   [[buffer(1)]],
+                                         device const float *acc_in [[buffer(2)]],
+                                         device float *out          [[buffer(3)]],
+                                         constant uint *p           [[buffer(4)]],
+                                         uint h   [[threadgroup_position_in_grid]],
+                                         uint lid [[thread_position_in_threadgroup]])
+{
+    uint n_heads = p[0], hd = p[2], n_splits = p[6];
+    if (h >= n_heads || hd == 0u || n_splits == 0u) return;
+
+    size_t base = (size_t)h * (size_t)n_splits;
+    device const float *mh = m_in + base;
+    device const float *sh = s_in + base;
+    device const float *ah = acc_in + base * (size_t)hd;
+    device float *oh = out + (size_t)h * hd;
+
+    /* Pass 1: M = max_i m[i], strictly increasing i, NaN-propagating (see the
+     * header comment, and tg_max's own NaN rule at the top of this file). */
+    float M = -INFINITY;
+    for (uint i = 0; i < n_splits; i++) {
+        float v = mh[i];
+        M = (v != v) ? v : ((v > M) ? v : M);
+    }
+
+    if (M != M) {                       /* NaN anywhere in m[]: propagate */
+        for (uint d = lid; d < hd; d += SG_TG) oh[d] = M;
+        return;
+    }
+    if (M == -INFINITY) {               /* every split empty (incl. seq == 0) */
+        for (uint d = lid; d < hd; d += SG_TG) oh[d] = 0.0f;
+        return;
+    }
+
+    /* Pass 2: S = sum_i s[i] * w(m[i], M), strictly increasing i. An empty
+     * split contributes 0.0 * 0.0 with no special case. */
+    float S = 0.0f;
+    for (uint i = 0; i < n_splits; i++) S += sh[i] * attn_combine_weight(mh[i], M);
+
+    if (S != S) {                       /* NaN: propagate, never launder */
+        for (uint d = lid; d < hd; d += SG_TG) oh[d] = S;
+        return;
+    }
+
+    /* Pass 3: out[d] = ( sum_i acc[i][d] * w(m[i], M) ) / S, strictly
+     * increasing i for every d, one output dim per thread so nothing is
+     * shared. S > 0.0 holds under the documented input contract (the split
+     * achieving M is non-empty, so its own s[i] >= 1.0); the guard is
+     * defensive only, for a caller that hands over a contradictory triple. */
+    for (uint d = lid; d < hd; d += SG_TG) {
+        float num = 0.0f;
+        for (uint i = 0; i < n_splits; i++) {
+            num += ah[(size_t)i * hd + d] * attn_combine_weight(mh[i], M);
+        }
+        oh[d] = (S > 0.0f) ? (num / S) : 0.0f;
+    }
+}

@@ -787,6 +787,55 @@ sg_err sg_gpu_run_attn_decode_f16(sg_gpu *g, void *q, void *k, void *v, void *ou
 sg_err sg_gpu_run_attn_prefill(sg_gpu *g, void *q, void *k, void *v, void *out,
                                const uint32_t params[8]);
 
+/* One-shot dispatches for the SPLIT-K decode-attention pair (Task P2.2,
+ * k_attn_decode_splitk_partial + k_attn_decode_splitk_combine), the Metal twin
+ * of sg_ref_attn_decode_splitk / sg_ref_attn_combine above. Same synchronous
+ * commit-and-wait contract as the entries above; each is its own dispatch
+ * because the partial kernel takes SIX device buffers and the combine FOUR,
+ * where sg_gpu_run_op carries at most three.
+ *
+ * WHY: k_attn_decode_f16 dispatches exactly n_heads threadgroups, so at 32
+ * heads only 32 of the 80 GPU cores are scheduled and one threadgroup walks the
+ * whole 262,144-key sequence. Split-K makes the grid n_heads x n_splits.
+ *
+ * NOT WIRED INTO DECODE. sg_gpu_forward's attention still calls
+ * k_attn_decode_f16; these two are reachable only through the entry points
+ * here and their per-op test, until their GPU gates pass.
+ *
+ * PARTITIONING is sg_ref_attn_decode_splitk's rule verbatim: split i covers
+ * [i*seq/n_splits, (i+1)*seq/n_splits), integer division in 64-bit. It tiles
+ * [0, seq) exactly and yields empty splits whenever n_splits > seq; an empty
+ * split emits sg_ref_attn_combine's documented m = -INFINITY, s = 0, acc = 0
+ * encoding, which the combine consumes with no special case.
+ *
+ * LAYOUT. q f32 [n_heads, q_stride] (only q[h][0 .. head_dim) is the query;
+ * the hybrid model's gate half is never read); k, v f16
+ * [seq, n_kv_heads, head_dim] SEPARATE buffers, the sg_kv layout, exactly as
+ * sg_gpu_run_attn_decode_f16 takes them; m, s f32 [n_heads, n_splits]; acc f32
+ * [n_heads, n_splits, head_dim] (the UNNORMALIZED weighted-V sums); out f32
+ * [n_heads, head_dim]. GQA: query head h reads kv head h / (n_heads /
+ * n_kv_heads), falling back to kv head 0 when n_heads < n_kv_heads.
+ *
+ * ONE params ARRAY SERVES BOTH CALLS: [0]=n_heads [1]=n_kv_heads [2]=head_dim
+ * [3]=seq [4]=q_stride [5]=softmax scale bits (f32 bit pattern) [6]=n_splits
+ * (params[7] unused). The combine reads only [0], [2] and [6]. n_splits is a
+ * dispatch parameter and is never derived from data, which is what keeps the
+ * partition boundaries (and so every summation order) fixed.
+ *
+ * REJECTED: a NULL argument; n_kv_heads == 0 or n_heads not a multiple of it;
+ * q_stride < head_dim; n_heads, head_dim or n_splits == 0; a buffer smaller
+ * than the layout above; an output overlapping an input or another output.
+ *
+ * seq == 0 IS ACCEPTED and is NOT the k_attn_decode_f16 divergence sg_ref_
+ * attn_decode documents: every split is then empty, so the pair writes the
+ * oracle's own out[d] = 0.0 rather than leaving `out` untouched. These kernels
+ * therefore match sg_ref_attn_decode_splitk at every seq, including 0. */
+sg_err sg_gpu_run_attn_splitk_partial(sg_gpu *g, void *q, void *k, void *v,
+                                      void *m, void *s, void *acc,
+                                      const uint32_t params[8]);
+sg_err sg_gpu_run_attn_splitk_combine(sg_gpu *g, void *m, void *s, void *acc,
+                                      void *out, const uint32_t params[8]);
+
 /* One-shot dispatches for the gated-DeltaNet chunked-scan prefill kernels (Task
  * M5.5), each the same synchronous commit-and-wait contract as the entries
  * above, extended to the extra device buffer the kernel needs beyond (a, b,

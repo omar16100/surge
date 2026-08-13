@@ -2543,6 +2543,273 @@ static void metal_rejects_bad_arguments(void) {
     free(shared);
 }
 
+/* --------------------------------------------------------------------
+ * P2.2: split-K decode attention (k_attn_decode_splitk_partial +
+ * k_attn_decode_splitk_combine) vs the P2.0/P2.1 CPU oracles
+ * --------------------------------------------------------------------
+ *
+ * THESE KERNELS WERE WRITTEN AND COMPILED WITH THE GPU HELD BY A 28-HOUR
+ * BENCHMARK, so this subtest had never been executed when it was committed.
+ * It is the gate, written to be run the moment the GPU frees; nothing in it
+ * had been observed to pass at that point. Everything it asserts is
+ * therefore a CLAIM ABOUT INTENT until it runs green.
+ *
+ * Two oracles, on identical inputs, for every case:
+ *   TIGHT   vs sg_ref_attn_decode_splitk at the SAME n_splits. This is the
+ *           twin comparison: the Metal pair and that function partition
+ *           [0, seq) by the same rule, build the same per-split (m, s, acc)
+ *           triple, and fold it with the same log-sum-exp rescaling, so they
+ *           must agree partition boundary for partition boundary.
+ *   DIRECT  vs sg_ref_attn_decode (one pass over every key, no splitting at
+ *           all). This is what proves split-K did not change the ANSWER, not
+ *           merely that two split-K implementations agree with each other --
+ *           the K-invariance trap the P2.1 review called out.
+ *
+ * K and V are rounded to f16 before either side sees them, and the CPU
+ * oracles get the exactly-widened f32 values, so the only remaining gap is
+ * ref.c's double accumulation against the kernel's f32 (the ~1e-7 the rest of
+ * this file measures), not a rounding the oracle never committed. */
+
+/* Assert the partial buffers themselves encode the partition the CPU oracle
+ * defines: empty splits (which n_splits > seq forces) must carry EXACTLY the
+ * documented m = -INFINITY, s = 0, acc = 0, and non-empty splits must carry a
+ * finite m with s >= 1.0 (the key achieving that split's own max contributes
+ * exp(0) == 1.0, so the sum cannot be smaller). Checked directly rather than
+ * only through the combined output, because the combine maps an
+ * empty-encoded split and an all-zero-weight split to the same answer and
+ * would hide a partition rule that is off by one. */
+static void splitk_check_partials(const char *label, const float *m, const float *s,
+                                  const float *acc, uint32_t n_heads, uint32_t hd,
+                                  uint32_t seq, uint32_t n_splits) {
+    uint64_t bad_empty = 0, bad_full = 0, bad_acc = 0;
+    for (uint32_t h = 0; h < n_heads; h++) {
+        for (uint32_t i = 0; i < n_splits; i++) {
+            uint32_t t0 = (uint32_t)((uint64_t)i * seq / n_splits);
+            uint32_t t1 = (uint32_t)((uint64_t)(i + 1) * seq / n_splits);
+            size_t at = (size_t)h * n_splits + i;
+            if (t0 >= t1) {
+                if (!(m[at] == -INFINITY) || s[at] != 0.0f) bad_empty++;
+                for (uint32_t d = 0; d < hd; d++) {
+                    if (acc[at * hd + d] != 0.0f) bad_acc++;
+                }
+            } else {
+                if (!isfinite(m[at]) || !(s[at] >= 1.0f)) bad_full++;
+            }
+        }
+    }
+    tt_assert(bad_empty == 0 && bad_acc == 0 && bad_full == 0,
+              "%s: %llu empty splits not encoded as (-inf, 0), %llu with a nonzero acc, "
+              "%llu non-empty splits with a non-finite m or s < 1",
+              label, (unsigned long long)bad_empty, (unsigned long long)bad_acc,
+              (unsigned long long)bad_full);
+}
+
+/* One (shape, q_stride) sweep over every n_splits in the gate's list. */
+static void splitk_shape(const char *what, uint32_t n_heads, uint32_t n_kv, uint32_t hd,
+                         uint32_t seq, uint32_t q_stride, uint32_t seed) {
+    const uint32_t splits[] = {1, 2, 3, 7, 64, 257};
+    uint32_t out_n = n_heads * hd;
+    uint64_t kvn = (uint64_t)seq * n_kv * hd;
+    float scale = (float)(1.0 / sqrt((double)hd));
+
+    lcg_seed(seed);
+    float *q = xmalloc((size_t)n_heads * q_stride * sizeof *q);
+    for (uint32_t h = 0; h < n_heads; h++) {
+        float *qh = q + (size_t)h * q_stride;
+        for (uint32_t i = 0; i < hd; i++) qh[i] = lcg_next();
+        /* The hybrid layout's attention-gate half is NOT query data and must
+         * never be read. Poison it with NaN: if the kernel's q_stride
+         * handling were wrong by so much as one element, every comparison
+         * below would come back NaN rather than merely inaccurate. */
+        for (uint32_t i = hd; i < q_stride; i++) qh[i] = (float)NAN;
+    }
+
+    uint16_t *k16 = xmalloc((size_t)kvn * sizeof *k16);
+    uint16_t *v16 = xmalloc((size_t)kvn * sizeof *v16);
+    float *k32 = xmalloc((size_t)kvn * sizeof *k32);
+    float *v32 = xmalloc((size_t)kvn * sizeof *v32);
+    for (uint64_t i = 0; i < kvn; i++) {
+        k16[i] = sg_f32_to_f16(lcg_next() * 2.0f);
+        v16[i] = sg_f32_to_f16(lcg_next() * 2.0f);
+        k32[i] = sg_f16_to_f32(k16[i]);   /* the f16 rounding, widened back exactly */
+        v32[i] = sg_f16_to_f32(v16[i]);
+    }
+
+    /* Oracle 2 (direct, no splitting) is the same for every n_splits. */
+    float *want_direct = xmalloc(out_n * sizeof *want_direct);
+    sg_ref_attn_decode(q, k32, v32, n_heads, n_kv, hd, seq, q_stride, scale, want_direct);
+
+    gbuf qb = gb_from(q, (uint64_t)n_heads * q_stride);
+    gbuf16 kb = gb16_new(kvn), vb = gb16_new(kvn);
+    memcpy(kb.h, k16, (size_t)kvn * sizeof(uint16_t));
+    memcpy(vb.h, v16, (size_t)kvn * sizeof(uint16_t));
+
+    float *want_split = xmalloc(out_n * sizeof *want_split);
+    for (size_t si = 0; si < sizeof splits / sizeof splits[0]; si++) {
+        uint32_t ns = splits[si];
+        uint32_t p[8] = {n_heads, n_kv, hd, seq, q_stride, f32_bits(scale), ns, 0};
+        gbuf mb = gb_new((uint64_t)n_heads * ns);
+        gbuf sb = gb_new((uint64_t)n_heads * ns);
+        gbuf ab = gb_new((uint64_t)n_heads * ns * hd);
+        gbuf ob = gb_new(out_n);
+        gb_poison(&mb); gb_poison(&sb); gb_poison(&ab); gb_poison(&ob);
+
+        sg_err e = sg_gpu_run_attn_splitk_partial(g_gpu, qb.b, kb.b, vb.b,
+                                                  mb.b, sb.b, ab.b, p);
+        tt_assert(!sg_failed(e), "splitk partial (%s, n_splits %u): %s", what, ns,
+                  e.msg ? e.msg : "ok");
+        if (!sg_failed(e)) {
+            char lbl[96];
+            snprintf(lbl, sizeof lbl, "splitk partials (%s, K=%u)", what, ns);
+            splitk_check_partials(lbl, mb.h, sb.h, ab.h, n_heads, hd, seq, ns);
+
+            e = sg_gpu_run_attn_splitk_combine(g_gpu, mb.b, sb.b, ab.b, ob.b, p);
+            tt_assert(!sg_failed(e), "splitk combine (%s, n_splits %u): %s", what, ns,
+                      e.msg ? e.msg : "ok");
+            if (!sg_failed(e)) {
+                sg_ref_attn_decode_splitk(q, k32, v32, n_heads, n_kv, hd, seq,
+                                          q_stride, scale, ns, want_split);
+                snprintf(lbl, sizeof lbl, "splitk %s K=%-3u vs ref_splitk", what, ns);
+                check_rel(lbl, ob.h, want_split, out_n);
+                snprintf(lbl, sizeof lbl, "splitk %s K=%-3u vs ref_decode", what, ns);
+                check_rel(lbl, ob.h, want_direct, out_n);
+            }
+        }
+        gb_free(&mb); gb_free(&sb); gb_free(&ab); gb_free(&ob);
+    }
+
+    gb_free(&qb); gb16_free(&kb); gb16_free(&vb);
+    free(q); free(k16); free(v16); free(k32); free(v32);
+    free(want_direct); free(want_split);
+}
+
+/* 100 reruns of the same dispatch pair on identical inputs must be
+ * BYTE-IDENTICAL, with every output buffer poisoned before each run so a
+ * partially-written result cannot pass by inheriting the previous run's
+ * bytes. This is the property the fixed-tree folds and the fixed partition
+ * rule exist to provide; a stray atomic or a simd_sum would show up here. */
+static void splitk_determinism(void) {
+    const uint32_t n_heads = 32, n_kv = 8, hd = 128, seq = 1000, q_stride = 2 * hd;
+    const uint32_t ns = 7;
+    uint32_t out_n = n_heads * hd;
+    uint64_t kvn = (uint64_t)seq * n_kv * hd;
+    float scale = (float)(1.0 / sqrt((double)hd));
+
+    lcg_seed(0x5D17Fu);
+    float *q = xmalloc((size_t)n_heads * q_stride * sizeof *q);
+    for (uint32_t i = 0; i < n_heads * q_stride; i++) q[i] = lcg_next();
+    uint16_t *k16 = xmalloc((size_t)kvn * sizeof *k16);
+    uint16_t *v16 = xmalloc((size_t)kvn * sizeof *v16);
+    for (uint64_t i = 0; i < kvn; i++) {
+        k16[i] = sg_f32_to_f16(lcg_next() * 2.0f);
+        v16[i] = sg_f32_to_f16(lcg_next() * 2.0f);
+    }
+
+    gbuf qb = gb_from(q, (uint64_t)n_heads * q_stride);
+    gbuf16 kb = gb16_new(kvn), vb = gb16_new(kvn);
+    memcpy(kb.h, k16, (size_t)kvn * sizeof(uint16_t));
+    memcpy(vb.h, v16, (size_t)kvn * sizeof(uint16_t));
+    gbuf mb = gb_new((uint64_t)n_heads * ns);
+    gbuf sb = gb_new((uint64_t)n_heads * ns);
+    gbuf ab = gb_new((uint64_t)n_heads * ns * hd);
+    gbuf ob = gb_new(out_n);
+    uint32_t p[8] = {n_heads, n_kv, hd, seq, q_stride, f32_bits(scale), ns, 0};
+
+    float *first = xmalloc(out_n * sizeof *first);
+    uint64_t mism = 0;
+    for (int rep = 0; rep < 100; rep++) {
+        gb_poison(&mb); gb_poison(&sb); gb_poison(&ab); gb_poison(&ob);
+        sg_err e = sg_gpu_run_attn_splitk_partial(g_gpu, qb.b, kb.b, vb.b,
+                                                  mb.b, sb.b, ab.b, p);
+        if (!sg_failed(e)) e = sg_gpu_run_attn_splitk_combine(g_gpu, mb.b, sb.b, ab.b, ob.b, p);
+        tt_assert(!sg_failed(e), "splitk determinism rep %d: %s", rep, e.msg ? e.msg : "ok");
+        if (sg_failed(e)) break;
+        if (rep == 0) memcpy(first, ob.h, out_n * sizeof(float));
+        else for (uint32_t i = 0; i < out_n; i++) if (ob.h[i] != first[i]) mism++;
+    }
+    tt_assert(mism == 0, "split-K decode attention: %llu bit-exact mismatches over "
+                         "100 reruns of the same input", (unsigned long long)mism);
+    if (mism == 0) {
+        fprintf(stderr, "   split-K decode attention: bit-identical over 100 reruns\n");
+    }
+
+    free(first); free(q); free(k16); free(v16);
+    gb_free(&qb); gb16_free(&kb); gb16_free(&vb);
+    gb_free(&mb); gb_free(&sb); gb_free(&ab); gb_free(&ob);
+}
+
+/* The host-side contract: every documented rejection actually rejects. These
+ * need no correct kernel at all (check_params and the size rules run before
+ * anything is encoded), so they are the one part of this subtest that does
+ * not depend on the deferred numeric gates. */
+static void splitk_rejects_bad_arguments(void) {
+    const uint32_t n_heads = 4, n_kv = 2, hd = 8, seq = 16, ns = 3;
+    uint32_t good[8] = {n_heads, n_kv, hd, seq, hd, f32_bits(0.35f), ns, 0};
+    gbuf qb = gb_new((uint64_t)n_heads * hd);
+    gbuf16 kb = gb16_new((uint64_t)seq * n_kv * hd), vb = gb16_new((uint64_t)seq * n_kv * hd);
+    gbuf mb = gb_new((uint64_t)n_heads * ns), sb = gb_new((uint64_t)n_heads * ns);
+    gbuf ab = gb_new((uint64_t)n_heads * ns * hd), ob = gb_new((uint64_t)n_heads * hd);
+    sg_err e;
+
+    e = sg_gpu_run_attn_splitk_partial(g_gpu, NULL, kb.b, vb.b, mb.b, sb.b, ab.b, good);
+    tt_assert(sg_failed(e), "splitk partial should reject a NULL q");
+    e = sg_gpu_run_attn_splitk_combine(g_gpu, mb.b, sb.b, ab.b, NULL, good);
+    tt_assert(sg_failed(e), "splitk combine should reject a NULL out");
+
+    uint32_t zero_k[8]; memcpy(zero_k, good, sizeof good); zero_k[6] = 0;
+    e = sg_gpu_run_attn_splitk_partial(g_gpu, qb.b, kb.b, vb.b, mb.b, sb.b, ab.b, zero_k);
+    tt_assert(sg_failed(e), "splitk partial should reject n_splits == 0");
+    e = sg_gpu_run_attn_splitk_combine(g_gpu, mb.b, sb.b, ab.b, ob.b, zero_k);
+    tt_assert(sg_failed(e), "splitk combine should reject n_splits == 0");
+
+    uint32_t bad_gqa[8]; memcpy(bad_gqa, good, sizeof good); bad_gqa[1] = 3;
+    e = sg_gpu_run_attn_splitk_partial(g_gpu, qb.b, kb.b, vb.b, mb.b, sb.b, ab.b, bad_gqa);
+    tt_assert(sg_failed(e), "splitk partial should reject n_heads not a multiple of n_kv");
+
+    uint32_t bad_stride[8]; memcpy(bad_stride, good, sizeof good); bad_stride[4] = hd - 1;
+    e = sg_gpu_run_attn_splitk_partial(g_gpu, qb.b, kb.b, vb.b, mb.b, sb.b, ab.b, bad_stride);
+    tt_assert(sg_failed(e), "splitk partial should reject q_stride < head_dim");
+
+    /* An undersized partial buffer: n_splits raised without growing m/s/acc.
+     * This is the mistake that would have the kernel write past the end. */
+    uint32_t big_k[8]; memcpy(big_k, good, sizeof good); big_k[6] = ns + 1;
+    e = sg_gpu_run_attn_splitk_partial(g_gpu, qb.b, kb.b, vb.b, mb.b, sb.b, ab.b, big_k);
+    tt_assert(sg_failed(e), "splitk partial should reject partial buffers sized for fewer splits");
+
+    /* Aliasing: an output over an input, and two outputs over each other. */
+    e = sg_gpu_run_attn_splitk_partial(g_gpu, qb.b, kb.b, vb.b, mb.b, mb.b, ab.b, good);
+    tt_assert(sg_failed(e), "splitk partial should reject m and s being the same buffer");
+    e = sg_gpu_run_attn_splitk_combine(g_gpu, mb.b, sb.b, ab.b, mb.b, good);
+    tt_assert(sg_failed(e), "splitk combine should reject out aliasing an input");
+
+    /* And sg_gpu_run_op must refuse both by name rather than dispatch them
+     * with two of their seven bindings missing. */
+    e = sg_gpu_run_op(g_gpu, "k_attn_decode_splitk_partial", qb.b, kb.b, ob.b, good);
+    tt_assert(sg_failed(e), "sg_gpu_run_op should refuse k_attn_decode_splitk_partial");
+    e = sg_gpu_run_op(g_gpu, "k_attn_decode_splitk_combine", mb.b, sb.b, ob.b, good);
+    tt_assert(sg_failed(e), "sg_gpu_run_op should refuse k_attn_decode_splitk_combine");
+
+    gb_free(&qb); gb16_free(&kb); gb16_free(&vb);
+    gb_free(&mb); gb_free(&sb); gb_free(&ab); gb_free(&ob);
+}
+
+static void metal_attn_splitk_matches_ref(void) {
+    /* The real decode shape this exists for: Qwen3-4B-Instruct-2507's
+     * 32 query heads over 8 kv heads, head_dim 128 (repeat 4). Two sequence
+     * lengths on purpose: seq 200 puts n_splits 257 ABOVE seq, so the tail
+     * splits are genuinely empty and exercise the -inf/0/0 encoding; seq 1000
+     * keeps every split populated and pushes the low n_splits cases past 256
+     * keys per threadgroup, where the score loop strides. Both q_stride
+     * variants at both lengths: head_dim (dense qwen3, no gate) and
+     * 2*head_dim (the hybrid's interleaved attention gate, NaN-poisoned). */
+    splitk_shape("32x8x128 seq200 dense", 32, 8, 128, 200, 128, 0x51A7Cu);
+    splitk_shape("32x8x128 seq200 gated", 32, 8, 128, 200, 256, 0x51A7Du);
+    splitk_shape("32x8x128 seq1000 dense", 32, 8, 128, 1000, 128, 0x51A7Eu);
+    splitk_shape("32x8x128 seq1000 gated", 32, 8, 128, 1000, 256, 0x51A7Fu);
+    splitk_determinism();
+    splitk_rejects_bad_arguments();
+}
+
 /* -------------------------------------------------------------------- */
 
 int main(void) {
@@ -2581,6 +2848,7 @@ int main(void) {
     tt_run("metal_attn_decode_f16_matches_f32", metal_attn_decode_f16_matches_f32);
     tt_run("metal_rope_chunk_matches_rope_heads", metal_rope_chunk_matches_rope_heads);
     tt_run("metal_attn_prefill_matches_decode", metal_attn_prefill_matches_decode);
+    tt_run("metal_attn_splitk_matches_ref", metal_attn_splitk_matches_ref);
     tt_run("metal_conv1d_chunk_matches_step", metal_conv1d_chunk_matches_step);
     tt_run("metal_delta_gates_chunk_matches", metal_delta_gates_chunk_matches);
     tt_run("metal_delta_chunk_matches_multi", metal_delta_chunk_matches_multi);

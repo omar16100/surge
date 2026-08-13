@@ -492,7 +492,20 @@ void sg_ref_attn_combine(const float *m, const float *s, const float *acc,
  * while n_heads > 0 is a caller contract violation, out left untouched.
  * `seq == 0` is well-defined, NOT a no-op: every head then attends over zero
  * keys, sg_ref_attn_combine's documented all-empty convention, so out[d] ==
- * 0.0 for every d. */
+ * 0.0 for every d.
+ *
+ * KNOWN DIVERGENCE FROM k_attn_decode_f16 AT seq==0 (review finding, P2.1
+ * fix round 1): unlike the n_kv_heads==0/head_dim==0/n_heads==0 no-ops
+ * above, seq==0 is NOT a no-op on the Metal kernel side. k_attn_decode_f16
+ * (src/kernels.metal:497) folds `seq == 0u` into its own single early-return
+ * guard and leaves `out` COMPLETELY UNWRITTEN there -- it does NOT write
+ * zeros. This oracle instead treats seq==0 as the well-defined "attention
+ * over zero keys" case and writes an explicit 0.0 per the all-empty
+ * convention above. A future byte-for-byte Metal-vs-oracle comparison at
+ * seq==0 MUST account for this divergence (e.g. pre-zero the Metal output
+ * buffer before dispatch, or exclude seq==0 from that specific comparison),
+ * or it will spuriously disagree despite both sides being correct by their
+ * own documented contract. */
 void sg_ref_attn_decode(const float *q, const float *kc, const float *vc,
                         uint32_t n_heads, uint32_t n_kv_heads, uint32_t head_dim,
                         uint32_t seq, uint32_t q_stride, float scale, float *out);
@@ -520,10 +533,12 @@ void sg_ref_attn_decode(const float *q, const float *kc, const float *vc,
  * bit-identical to this function called with n_parts == 1.
  *
  * Same layout, GQA rule, numerics and out/head_dim/n_heads/n_kv_heads/NULL
- * conventions as sg_ref_attn_decode above, plus: `n_parts == 0` is also
- * well-defined, not a no-op (sg_ref_attn_combine's own n_parts==0
- * convention: out[d] == 0.0 for every d, since every head then has zero
- * partitions to combine). */
+ * conventions as sg_ref_attn_decode above -- INCLUDING its documented
+ * seq==0 divergence from k_attn_decode_f16 (that function leaves `out`
+ * unwritten at seq==0; this one writes an explicit 0.0) -- plus: `n_parts
+ * == 0` is also well-defined, not a no-op (sg_ref_attn_combine's own
+ * n_parts==0 convention: out[d] == 0.0 for every d, since every head then
+ * has zero partitions to combine). */
 void sg_ref_attn_decode_splitk(const float *q, const float *kc, const float *vc,
                                uint32_t n_heads, uint32_t n_kv_heads, uint32_t head_dim,
                                uint32_t seq, uint32_t q_stride, float scale,

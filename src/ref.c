@@ -393,6 +393,26 @@ void sg_ref_attn_combine(const float *m, const float *s, const float *acc,
  * qh[0 .. head_dim) is ever read here, so a q_stride > head_dim gate half
  * (Task P1) is never touched. dacc[head_dim] is caller-owned double scratch,
  * overwritten on every call (not read beforehand). */
+/* Overflow-checked size_t multiply/add, mirroring src/metal.m's mul_ck/
+ * add_ck (same problem, different translation unit and a different integer
+ * domain: metal.m guards GPU buffer byte counts in uint64_t, this guards a
+ * host malloc() size in size_t, the type malloc actually takes). A wrapped
+ * byte count would be SMALL, so an undersized allocation would sail through
+ * and the write loops that follow would index with the original, unwrapped
+ * n_parts/head_dim -- worse than no check at all. An overflow is therefore
+ * treated as an allocation failure (returns false) rather than a silently
+ * wrapped number (review finding, P2.1 fix round 1). */
+static bool ref_mul_ck(size_t a, size_t b, size_t *out) {
+    if (a != 0 && b > SIZE_MAX / a) return false;
+    *out = a * b;
+    return true;
+}
+static bool ref_add_ck(size_t a, size_t b, size_t *out) {
+    if (a > SIZE_MAX - b) return false;
+    *out = a + b;
+    return true;
+}
+
 static void attn_partial(const float *qh, const float *kc, const float *vc,
                          uint32_t n_kv_heads, uint32_t hk, uint32_t head_dim,
                          double scale, uint32_t t0, uint32_t t1, double *dacc,
@@ -472,13 +492,30 @@ static void attn_decode_core(const float *q, const float *kc, const float *vc,
      * size tied to a caller argument. Allocation failure leaves `out`
      * entirely untouched -- the same contract-violation convention
      * sg_ref_attn_combine documents for its own NULL-array case, rather than
-     * a partial write across some heads but not others. */
+     * a partial write across some heads but not others.
+     *
+     * The byte counts below are every one of ref_mul_ck/ref_add_ck-guarded
+     * (review finding, P2.1 fix round 1): np and hd are both caller-supplied
+     * uint32_t with surge.h documenting n_parts as explicitly UNCAPPED, so
+     * `np*2 + np*hd` genuinely can overflow size_t for large-but individually
+     * valid inputs, and an unguarded overflow would wrap to a small `need`,
+     * pass malloc, and let the write loops below run off the end with the
+     * original (unwrapped) n_parts/head_dim -- an overflow is rejected as an
+     * allocation failure instead (out left untouched), never truncated. */
     float *fbuf = NULL;
     if (n_parts > 0) {
-        fbuf = malloc((np * 2 + np * hd) * sizeof(float));
+        size_t t0, t1, t2, need;
+        bool sizes_ok = ref_mul_ck(np, 2, &t0)              /* m[np] + s[np] */
+                     && ref_mul_ck(np, hd, &t1)              /* acc[np][hd] */
+                     && ref_add_ck(t0, t1, &t2)
+                     && ref_mul_ck(t2, sizeof(float), &need);
+        if (!sizes_ok) return;
+        fbuf = malloc(need);
         if (!fbuf) return;
     }
-    double *dacc = malloc(hd * sizeof(double));
+    size_t dacc_need;
+    if (!ref_mul_ck(hd, sizeof(double), &dacc_need)) { free(fbuf); return; }
+    double *dacc = malloc(dacc_need);
     if (!dacc) { free(fbuf); return; }
 
     float *m = fbuf;

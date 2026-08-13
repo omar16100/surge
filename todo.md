@@ -2092,3 +2092,84 @@ touched.
   restructuring the historical record inside an otherwise narrowly-scoped, additive
   task; an archive split (e.g. moving pre-P1 entries to a dated archive file) is a
   reasonable follow-up if this file's growth becomes a real problem.
+
+### P2.1 fix round 1 (review: CHANGES-REQUIRED, 4 findings closed)
+
+Reviewer verified the implementation correct by hand and every gate passing live
+(81536 checks, worst error 1.192e-07), but ruled that gate 1 and gate 2 only prove
+K-INVARIANCE (split-K partition tiling + `sg_ref_attn_combine` wiring), not arithmetic
+correctness -- both `sg_ref_attn_decode` and `sg_ref_attn_decode_splitk` route through
+the same `attn_decode_core`/`attn_partial` static core, so a bug consistent across
+every partition boundary (wrong scale, swapped `kc`/`vc` roles, a sign error, a wrong
+stride, a dropped max-subtraction) reproduces identically on both sides of every
+comparison and stays invisible. Also found: an unguarded `size_t` multiply overflow in
+the split-K scratch allocation, two undertested documented paths (`n_parts==0`, the GQA
+`repeat==0` fallback), and a real behavioral divergence from the eventual Metal kernel
+at `seq==0` that was not yet disclosed in the contract. Four findings, all closed in
+one round; GPU confirmed held throughout by the same 28h B7-retry benchmark
+(`pgrep -f "surge-bench|bench_niah"` non-empty before and after, same PID 98563); no
+tolerance loosened, no existing gate (including P2.0's own) touched.
+
+1. **CRITICAL: no independent arithmetic cross-check.** Chose a hybrid of the
+   reviewer's two suggested fixes: a NEW test-local `gold_attn_head` (`tests/
+   test_attn_decode.c`) that independently re-derives one head's attention output --
+   own dot-product loop, own `kc`/`vc` indexing, own `q_stride` offset, own GQA `hk`
+   computed by the caller -- but STRUCTURED the way `src/ref.c`'s already-validated
+   `attn_layer` (`:1160-1232`, core at `:1201-1223`) computes it: materialize
+   `scores[seq]`, normalize with the REAL, independently-gated `sg_ref_softmax`
+   (`ref_softmax_matches_numpy`, max err 1.819e-12) BEFORE the weighted-V pass -- the
+   OPPOSITE order from `attn_partial`, which defers normalization to
+   `sg_ref_attn_combine`'s single final divide. Not a second path into
+   `attn_decode_core` at all; the only thing it shares with production code is the
+   general-purpose, already-independently-tested `sg_ref_softmax` utility (the same
+   category of reuse as reusing libm's `exp()`). New `test_gold_independent_arithmetic`
+   cross-checks BOTH `sg_ref_attn_decode` and `sg_ref_attn_decode_splitk` (n_parts in
+   {3,7}) against this gold reference across 4 shapes (incl. the real 32/8/128 GQA
+   shape and the repeat==0 edge case) x 3 seq values. Worst observed: **1.192e-07**
+   max absolute error -- identical order of magnitude to gate 1's own K-invariance
+   error, i.e. the early-vs-late normalization reorder costs no more than ordinary
+   float32 rounding already does elsewhere in this file. Did NOT touch `attn_layer`
+   itself (no refactor, no risk to the live decode path or its frozen-digest/mini_fwd
+   gates) -- the independence comes from writing fresh code structured the same way,
+   not from calling into it.
+2. **IMPORTANT: unguarded size_t multiply overflow** (`src/ref.c`, the
+   `attn_decode_core` scratch malloc). `(np*2 + np*hd) * sizeof(float)` multiplied two
+   caller-supplied, surge.h-documented-as-UNCAPPED `uint32_t`s (`n_parts`, `head_dim`)
+   with no bound check; a wrapped `need` would be SMALL, sail through `malloc`, and let
+   the write loops index with the original unwrapped dimensions. Fixed with new
+   `ref_mul_ck`/`ref_add_ck` (`size_t`, `SIZE_MAX`-checked), mirroring `src/metal.m`'s
+   `mul_ck`/`add_ck` STYLE (same reasoning, different translation unit and integer
+   domain: metal.m guards GPU buffer byte counts in `uint64_t`, this guards a host
+   `malloc()` size in `size_t`) -- every multiply/add in the sizing path is now guarded,
+   an overflow is rejected as an allocation failure (`out` left untouched, the existing
+   contract-violation convention) rather than silently wrapped.
+3. **MINOR: `n_parts==0` never tested.** New `test_n_parts_zero_is_defined_zero` pins
+   the documented `out[d]==0.0` convention directly (mirroring how P2.0's own
+   `test_degenerate_no_nan` pins the combine step's identical convention).
+4. **MINOR: GQA `repeat==0` fallback never exercised.** New
+   `test_gqa_repeat_zero_fallback` (`n_heads=3 < n_kv_heads=7`): every head, given an
+   identical query, is bit-exact to head 0 (proves they all read the SAME kv head), AND
+   cross-checked against `gold_attn_head` forced to `hk==0` (proves it specifically IS
+   kv head 0, not merely "some other constant index" that would also pass the
+   bit-exact check alone). Also folded into `test_gold_independent_arithmetic`'s shape
+   sweep.
+
+**Hand-off note (not a fix, disclosed as requested):** the reviewer found `seq==0`
+DIVERGES from the Metal kernel this oracle is meant to check -- `surge.h` documents
+`seq==0` as writing `out[d]=0.0` for every head, but `k_attn_decode_f16`
+(`src/kernels.metal:497`) returns early there, leaving `out` completely UNWRITTEN. A
+future byte-for-byte Metal-vs-oracle comparison at `seq==0` would spuriously disagree
+unless the harness pre-zeroes or special-cases it. Documented explicitly in both
+`sg_ref_attn_decode`'s and `sg_ref_attn_decode_splitk`'s `surge.h` contracts under a new
+"KNOWN DIVERGENCE FROM k_attn_decode_f16 AT seq==0" paragraph, so whoever wires the
+Metal split-K gate sees it before being surprised by it.
+
+**Verification:** `make debug` (SURGE_NO_METAL, ASan/UBSan): exit 0, `test_attn_decode
+.bin` 81616 checks (81536 + 80 new), 0 failures, no sanitizer diagnostics. Ran the full
+suite twice, byte-identical apart from one unrelated pre-existing test's PID-suffixed
+temp filename. Compiled clean under `-Wall -Wextra -Werror`, no em dashes.
+`git diff --numstat` since the original P2.1 commit: `src/ref.c` +40/-3 (the 3
+deletions are the original unguarded malloc call, replaced; `sg_ref_attn_combine` and
+`attn_layer` both byte-for-byte untouched, confirmed via `git diff` inspection, not just
+diff-stat), `surge.h` +20/-5 (two doc paragraphs extended in place), `tests/
+test_attn_decode.c` +252/-0. No kernel, encoder, existing gate, or tolerance touched.

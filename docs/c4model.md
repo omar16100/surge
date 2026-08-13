@@ -313,13 +313,36 @@ optionally Accelerate for the CPU reference path. No third-party libraries.
     and `n_parts > seq` (forced empty partitions), across three shapes incl. the real
     Qwen3-4B-Instruct-2507 32/8/128 GQA shape; `n_parts==1` bit-exact; GQA MAPPING
     proven (not just numerically close) via an identical-query trick at both
-    repeat=4 and repeat=1; both `q_stride` variants, with the hybrid gate half
-    NaN-poisoned to prove it is never read as query data; 100x determinism for both
-    functions. `make debug` (SURGE_NO_METAL, ASan/UBSan) exits 0, 81536 checks, 0
-    failures, no sanitizer diagnostics, worst observed error 1.192e-07. The Metal
-    kernel itself remains a later, not-yet-started task; nothing in the live decode
-    path changed. Full report:
+    repeat=4 and repeat=1 (plus, since fix round 1, the repeat==0 fallback); both
+    `q_stride` variants, with the hybrid gate half NaN-poisoned to prove it is never
+    read as query data; 100x determinism for both functions. `make debug`
+    (SURGE_NO_METAL, ASan/UBSan) exits 0, 81616 checks, 0 failures, no sanitizer
+    diagnostics, worst observed error 1.192e-07. The Metal kernel itself remains a
+    later, not-yet-started task; nothing in the live decode path changed. Full report:
     `.superpowers/sdd/2026-08-09-surge-m3-m5/task-P2.1-report.md`.
+  - Task P2.1 fix round 1 (review: CHANGES-REQUIRED, 4 findings, all closed): the
+    original gates above proved only K-INVARIANCE (split-K tiling + the
+    `sg_ref_attn_combine` wiring), since both public functions share one
+    `attn_decode_core`/`attn_partial` static core -- a bug consistent across every
+    partition boundary would pass both gates 1 and 2 invisibly. CRITICAL fix: a new
+    test-local `gold_attn_head` (`tests/test_attn_decode.c`), independently derived
+    and structured the way `attn_layer` (`src/ref.c:1160-1232`, mlx-fixture-validated)
+    computes attention -- materialize `scores[]`, normalize with the real
+    `sg_ref_softmax` BEFORE the weighted-V pass, the OPPOSITE order from
+    `attn_partial`'s defer-to-combine -- cross-checked against both
+    `sg_ref_attn_decode` and `sg_ref_attn_decode_splitk`; worst observed error
+    1.192e-07, the same order as gate 1's own K-invariance error. `attn_layer` itself
+    was NOT touched (no refactor, no risk to its own frozen-digest/mini_fwd gates).
+    IMPORTANT fix: the split-K scratch `malloc` size (`np*2 + np*hd` for
+    caller-supplied, uncapped `n_parts`/`head_dim`) was an unguarded `size_t`
+    multiply that could wrap and undersize the allocation; new `ref_mul_ck`/
+    `ref_add_ck` (`src/ref.c`) close it, mirroring `src/metal.m`'s `mul_ck`/`add_ck`
+    style in the `size_t` domain instead of GPU-buffer `uint64_t`. Two MINOR test
+    gaps closed (`n_parts==0`, the GQA `repeat==0` fallback). Hand-off note (not a
+    fix): `seq==0` diverges from `k_attn_decode_f16` (`src/kernels.metal:497` leaves
+    `out` unwritten there; this oracle writes an explicit 0.0), now documented
+    explicitly in both functions' `surge.h` contracts so the future Metal-vs-oracle
+    gate does not spuriously disagree at that boundary.
 - **Not built:** M4 (kernel excellence / beat mlx-lm, incl. the split-K decode-attention
   Metal kernel that Task P2.0's combine math and Task P2.1's decode-attention-core
   oracles are the CPU-proven prerequisites for), the dense-qwen3 GPU forward's own

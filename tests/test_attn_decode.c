@@ -80,6 +80,81 @@ static int bit_equal(const float *a, const float *b, uint32_t n) {
     return 1;
 }
 
+/* --------------------------------------------------------------------
+ * CRITICAL fix (P2.1 review round 1): an INDEPENDENT arithmetic
+ * cross-check.
+ *
+ * Gate 1 (equivalence) and gate 2 (n_parts==1 bit-exact) both compare
+ * sg_ref_attn_decode against sg_ref_attn_decode_splitk, and BOTH route
+ * through the same static attn_decode_core/attn_partial core in
+ * src/ref.c (by design -- that is what makes n_parts==1 a structural
+ * identity rather than a coincidence). That proves K-INVARIANCE (the
+ * split-K partition tiling and the sg_ref_attn_combine wiring are
+ * correct) but NOT arithmetic correctness: a bug consistent across every
+ * partition boundary (wrong scale, swapped kc/vc roles, a sign error in
+ * the dot product, a wrong q_stride offset, a dropped max-subtraction)
+ * would reproduce identically on both sides of every gate-1/gate-2
+ * comparison and stay invisible to them.
+ *
+ * gold_attn_head below is a FROM-SCRATCH, independently-written reference
+ * for ONE head's attention output, deliberately structured the way
+ * src/ref.c's own already-validated attn_layer (src/ref.c:1160-1232, core
+ * at :1201-1223 -- gated against real mlx ground truth by the mini_fwd
+ * fixture, tests/test_ref_fwd.c) computes it: materialize a scores[seq]
+ * array via an independently-written dot-product loop (own kc/vc
+ * indexing, own q_stride offset already applied by the caller, own GQA hk
+ * mapping computed by the CALLER of this helper, not shared with
+ * attn_partial/attn_decode_core in any way), normalize with the REAL
+ * sg_ref_softmax (src/ref.c; independently gated against real numpy/mlx
+ * ground truth by tests/test_ref_ops.c's ref_softmax_matches_numpy at
+ * 1.819e-12 max error, and used unmodified by attn_layer itself) BEFORE
+ * the weighted-V pass, then accumulate the weighted V sum in double and
+ * round once. This is the OPPOSITE order from attn_partial, which defers
+ * normalization to sg_ref_attn_combine's single final divide and keeps
+ * every partition's exp-weighted V sum un-normalized until then -- a
+ * genuinely different code path, not merely a second call into the code
+ * under test, and it inherits real validated infrastructure
+ * (sg_ref_softmax) rather than being independent but unverified against
+ * anything. seq must be >= 1 (not exercised at seq==0: sg_ref_softmax is
+ * a no-op there and this helper's own scores malloc would be a 0-byte
+ * request, which plain test code has no need to special-case). */
+static void gold_attn_head(const float *qh, const float *kc, const float *vc,
+                           uint32_t n_kv_heads, uint32_t hk, uint32_t head_dim,
+                           uint32_t seq, float scale, float *out) {
+    double dscale = (double)scale;
+    float *scores = malloc((size_t)seq * sizeof(float));
+    for (uint32_t t = 0; t < seq; t++) {
+        const float *kt = kc + ((size_t)t * n_kv_heads + hk) * head_dim;
+        double dot = 0.0;
+        for (uint32_t d = 0; d < head_dim; d++) dot += (double)qh[d] * (double)kt[d];
+        scores[t] = (float)(dot * dscale);
+    }
+    sg_ref_softmax(scores, seq);   /* real, independently-gated production softmax */
+
+    double *acc = calloc(head_dim, sizeof(double));
+    for (uint32_t t = 0; t < seq; t++) {
+        const float *vt = vc + ((size_t)t * n_kv_heads + hk) * head_dim;
+        double p = (double)scores[t];
+        for (uint32_t d = 0; d < head_dim; d++) acc[d] += p * (double)vt[d];
+    }
+    for (uint32_t d = 0; d < head_dim; d++) out[d] = (float)acc[d];
+
+    free(scores);
+    free(acc);
+}
+
+/* Measured (see test_gold_independent_arithmetic below) worst absolute
+ * difference between gold_attn_head and sg_ref_attn_decode/splitk across
+ * the whole sweep: 1.192e-07 -- about 2 float32 ULPs at these magnitudes,
+ * indistinguishable from gate 1's own worst K-invariance error of the same
+ * order (1.192e-07), i.e. the early-vs-late normalization reorder costs no
+ * more than ordinary float32 rounding already does elsewhere in this file;
+ * consistent with two genuinely different, both-valid rounding paths rather
+ * than a defect. 1e-5 leaves >80x headroom over that measured value while
+ * staying far tighter than any real arithmetic bug (wrong scale, swapped
+ * kc/vc, sign error, wrong stride) would produce. */
+#define GOLD_TOL 1e-5f
+
 typedef struct { uint32_t n_heads, n_kv_heads, head_dim; } shape_cfg;
 
 /* --------------------------------------------------------------------
@@ -144,6 +219,81 @@ static void test_splitk_equals_direct(void) {
                 check_equiv(shapes[sh].n_heads, shapes[sh].n_kv_heads,
                            shapes[sh].head_dim, seqs[si], n_parts_list[ni]);
             }
+        }
+    }
+}
+
+/* --------------------------------------------------------------------
+ * CRITICAL fix (P2.1 review round 1): sg_ref_attn_decode AND
+ * sg_ref_attn_decode_splitk (several n_parts) both cross-checked against
+ * the independent gold_attn_head reference above, closing the "K-invariance
+ * only, not arithmetic correctness" gap gate 1 alone cannot close.
+ * -------------------------------------------------------------------- */
+static float g_worst_gold_err = 0.0f;
+
+static void check_gold(uint32_t n_heads, uint32_t n_kv_heads, uint32_t head_dim,
+                       uint32_t seq) {
+    float scale = 1.0f / sqrtf((float)head_dim);
+    size_t kv_n = (size_t)seq * n_kv_heads * head_dim;
+    float *kc = malloc(kv_n * sizeof(float));
+    float *vc = malloc(kv_n * sizeof(float));
+    fill_random(kc, kv_n, -1.0f, 1.0f);
+    fill_random(vc, kv_n, -3.0f, 3.0f);
+    float *q = malloc((size_t)n_heads * head_dim * sizeof(float));
+    fill_random(q, (size_t)n_heads * head_dim, -1.0f, 1.0f);
+
+    /* The test's OWN independent GQA map (same formula as src/ref.c's, but
+     * computed here from scratch, not read from or called into ref.c's
+     * attn_decode_core/attn_partial). */
+    uint32_t repeat = n_heads / n_kv_heads;
+    uint32_t out_n = n_heads * head_dim;
+    float *gold_out = malloc((size_t)out_n * sizeof(float));
+    for (uint32_t h = 0; h < n_heads; h++) {
+        uint32_t hk = repeat ? (h / repeat) : 0u;
+        gold_attn_head(q + (size_t)h * head_dim, kc, vc, n_kv_heads, hk, head_dim,
+                       seq, scale, gold_out + (size_t)h * head_dim);
+    }
+
+    float *direct_out = malloc((size_t)out_n * sizeof(float));
+    sg_ref_attn_decode(q, kc, vc, n_heads, n_kv_heads, head_dim, seq, head_dim,
+                       scale, direct_out);
+    float err = max_abs_err(gold_out, direct_out, out_n);
+    if (err > g_worst_gold_err) g_worst_gold_err = err;
+    tt_assert(err < GOLD_TOL,
+              "gold vs sg_ref_attn_decode: n_heads=%u n_kv_heads=%u head_dim=%u seq=%u "
+              "worst abs err=%.3e (want <%.1e)",
+              n_heads, n_kv_heads, head_dim, seq, (double)err, (double)GOLD_TOL);
+
+    static const uint32_t nps[] = { 3, 7 };
+    for (size_t k = 0; k < sizeof nps / sizeof *nps; k++) {
+        float *splitk_out = malloc((size_t)out_n * sizeof(float));
+        sg_ref_attn_decode_splitk(q, kc, vc, n_heads, n_kv_heads, head_dim, seq,
+                                  head_dim, scale, nps[k], splitk_out);
+        float err2 = max_abs_err(gold_out, splitk_out, out_n);
+        if (err2 > g_worst_gold_err) g_worst_gold_err = err2;
+        tt_assert(err2 < GOLD_TOL,
+                  "gold vs sg_ref_attn_decode_splitk(n_parts=%u): n_heads=%u n_kv_heads=%u "
+                  "head_dim=%u seq=%u worst abs err=%.3e (want <%.1e)",
+                  nps[k], n_heads, n_kv_heads, head_dim, seq, (double)err2, (double)GOLD_TOL);
+        free(splitk_out);
+    }
+
+    free(kc); free(vc); free(q); free(gold_out); free(direct_out);
+}
+
+static void test_gold_independent_arithmetic(void) {
+    static const shape_cfg shapes[] = {
+        { 4, 1, 8 },     /* small, heavy GQA (repeat=4) */
+        { 6, 6, 16 },    /* 1:1, no GQA */
+        { 32, 8, 128 },  /* real Qwen3-4B-Instruct-2507 shape (repeat=4) */
+        { 2, 5, 10 },    /* MINOR fix (item 4): repeat==0, n_heads < n_kv_heads */
+    };
+    static const uint32_t seqs[] = { 1, 9, 40 };
+
+    for (size_t sh = 0; sh < sizeof shapes / sizeof *shapes; sh++) {
+        for (size_t si = 0; si < sizeof seqs / sizeof *seqs; si++) {
+            check_gold(shapes[sh].n_heads, shapes[sh].n_kv_heads,
+                      shapes[sh].head_dim, seqs[si]);
         }
     }
 }
@@ -300,6 +450,70 @@ static void test_gqa_repeat1(void) {
 }
 
 /* --------------------------------------------------------------------
+ * MINOR fix (P2.1 review round 1, item 4): the GQA repeat==0 fallback
+ * (n_heads < n_kv_heads, so integer division n_heads/n_kv_heads truncates
+ * to 0, src/ref.c's `hk = repeat ? h/repeat : 0u`) was implemented and
+ * documented but never exercised by any test shape. Pin it directly: with
+ * n_heads < n_kv_heads, EVERY head must map to kv head 0, not just "some
+ * consistent head" (the identical-query trick alone cannot distinguish "all
+ * map to kv head 0" from "all map to kv head 3" -- the gold cross-check
+ * below, forced to hk==0, closes that gap).
+ * -------------------------------------------------------------------- */
+static void test_gqa_repeat_zero_fallback(void) {
+    uint32_t n_heads = 3, n_kv_heads = 7, head_dim = 10, seq = 20;
+    uint32_t repeat = n_heads / n_kv_heads;
+    tt_assert(repeat == 0,
+              "test precondition: expected repeat==0 (n_heads<n_kv_heads), got %u", repeat);
+    float scale = 1.0f / sqrtf((float)head_dim);
+
+    float *kc = malloc((size_t)seq * n_kv_heads * head_dim * sizeof(float));
+    float *vc = malloc((size_t)seq * n_kv_heads * head_dim * sizeof(float));
+    for (uint32_t hk = 0; hk < n_kv_heads; hk++) {
+        for (uint32_t t = 0; t < seq; t++) {
+            float *kt = kc + ((size_t)t * n_kv_heads + hk) * head_dim;
+            float *vt = vc + ((size_t)t * n_kv_heads + hk) * head_dim;
+            for (uint32_t d = 0; d < head_dim; d++) {
+                kt[d] = rng_range(-1.0f, 1.0f) + (float)hk;
+                vt[d] = rng_range(-2.0f, 2.0f) + (float)(hk * 10);
+            }
+        }
+    }
+
+    float *q_row = malloc((size_t)head_dim * sizeof(float));
+    fill_random(q_row, head_dim, -1.0f, 1.0f);
+    float *q = malloc((size_t)n_heads * head_dim * sizeof(float));
+    for (uint32_t h = 0; h < n_heads; h++) {
+        memcpy(q + (size_t)h * head_dim, q_row, head_dim * sizeof(float));
+    }
+
+    float *out = malloc((size_t)n_heads * head_dim * sizeof(float));
+    sg_ref_attn_decode(q, kc, vc, n_heads, n_kv_heads, head_dim, seq, head_dim,
+                       scale, out);
+
+    /* Every head, given the identical query, must be bit-exact to head 0:
+     * proves they all read the SAME kv head (whatever it is). */
+    for (uint32_t h = 1; h < n_heads; h++) {
+        tt_assert(bit_equal(out + 0 * head_dim, out + (size_t)h * head_dim, head_dim),
+                  "repeat==0 fallback: head 0 and head %u (n_heads=%u < n_kv_heads=%u) "
+                  "given an identical query produced different output",
+                  h, n_heads, n_kv_heads);
+    }
+
+    /* And it specifically IS kv head 0 (not e.g. some other constant index
+     * that would also pass the bit_equal checks above): cross-check against
+     * the independent gold reference forced to hk==0. */
+    float *gold = malloc((size_t)head_dim * sizeof(float));
+    gold_attn_head(q, kc, vc, n_kv_heads, 0u, head_dim, seq, scale, gold);
+    float err = max_abs_err(out, gold, head_dim);
+    if (err > g_worst_gold_err) g_worst_gold_err = err;
+    tt_assert(err < GOLD_TOL,
+              "repeat==0 fallback: head 0 vs independent gold forced to kv head 0: "
+              "worst abs err=%.3e (want <%.1e)", (double)err, (double)GOLD_TOL);
+
+    free(kc); free(vc); free(q_row); free(q); free(out); free(gold);
+}
+
+/* --------------------------------------------------------------------
  * Gate 4: q_stride both ways, gate half never read as query data.
  * -------------------------------------------------------------------- */
 static void test_q_stride_gate_never_read(void) {
@@ -433,6 +647,38 @@ static void test_seq_zero_is_defined_zero(void) {
     }
 }
 
+/* --------------------------------------------------------------------
+ * MINOR fix (P2.1 review round 1, item 3): sg_ref_attn_decode_splitk's
+ * n_parts==0 path is documented in surge.h as well-defined (out[d]==0.0 for
+ * every d, since every head then has zero partitions to combine -- the same
+ * sg_ref_attn_combine convention test_attn_combine.c's own
+ * test_degenerate_no_nan pins for the combine step directly) but no test
+ * passed n_parts==0 before this fix.
+ * -------------------------------------------------------------------- */
+static void test_n_parts_zero_is_defined_zero(void) {
+    uint32_t n_heads = 4, n_kv_heads = 2, head_dim = 10, seq = 30;
+    float scale = 1.0f / sqrtf((float)head_dim);
+    size_t kv_n = (size_t)seq * n_kv_heads * head_dim;
+    float *kc = malloc(kv_n * sizeof(float));
+    float *vc = malloc(kv_n * sizeof(float));
+    fill_random(kc, kv_n, -1.0f, 1.0f);
+    fill_random(vc, kv_n, -3.0f, 3.0f);
+    float *q = malloc((size_t)n_heads * head_dim * sizeof(float));
+    fill_random(q, (size_t)n_heads * head_dim, -1.0f, 1.0f);
+
+    float out[4 * 10];
+    memset(out, 0xAA, sizeof out);
+    sg_ref_attn_decode_splitk(q, kc, vc, n_heads, n_kv_heads, head_dim, seq,
+                              head_dim, scale, 0 /* n_parts */, out);
+    for (size_t i = 0; i < n_heads * head_dim; i++) {
+        tt_assert(out[i] == 0.0f,
+                  "n_parts==0: out[%zu]=%g, want 0.0 (documented well-defined convention)",
+                  i, (double)out[i]);
+    }
+
+    free(kc); free(vc); free(q);
+}
+
 static void test_null_and_zero_dim_no_crash(void) {
     float dummy_q[8], dummy_kv[8];
     for (int i = 0; i < 8; i++) { dummy_q[i] = 1.0f; dummy_kv[i] = 1.0f; }
@@ -470,15 +716,21 @@ static void test_null_and_zero_dim_no_crash(void) {
 int main(void) {
     tt_run("split-K equals direct (n_parts in {1,2,3,7,64,257}, ragged seq, incl real GQA shape)",
            test_splitk_equals_direct);
+    tt_run("CRITICAL fix: independent arithmetic cross-check (softmax-first gold reference)",
+           test_gold_independent_arithmetic);
     tt_run("n_parts==1 bit-exact identity", test_n_parts_1_bit_exact);
     tt_run("GQA mapping: real 32/8 shape (repeat=4)", test_gqa_real_shape);
     tt_run("GQA mapping: n_heads==n_kv_heads (repeat=1)", test_gqa_repeat1);
+    tt_run("GQA mapping: repeat==0 fallback (n_heads<n_kv_heads)", test_gqa_repeat_zero_fallback);
     tt_run("q_stride both ways: gate half never read as query data", test_q_stride_gate_never_read);
     tt_run("100x determinism (direct and split-K)", test_determinism_100x);
     tt_run("seq==0 is the documented all-empty zero output", test_seq_zero_is_defined_zero);
+    tt_run("n_parts==0 is the documented all-empty zero output", test_n_parts_zero_is_defined_zero);
     tt_run("NULL/zero-dim inputs: no crash, documented no-op", test_null_and_zero_dim_no_crash);
 
     fprintf(stderr, "gate 1 worst observed: max absolute error=%.3e (want <1e-6)\n",
             (double)g_worst_abs_err);
+    fprintf(stderr, "gold independent cross-check worst observed: max absolute error=%.3e "
+                    "(want <%.1e)\n", (double)g_worst_gold_err, (double)GOLD_TOL);
     return tt_report();
 }

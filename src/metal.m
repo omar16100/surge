@@ -1800,11 +1800,18 @@ static void enc_matmul(sg_enc *E, int ki, void *x, uint64_t xoff, void *w,
  * layer's residual contribution. `layer_idx` is only used on the fp16 path,
  * to look up this layer's K/V buffers in g->kv.
  *
- * The queries keep their interleaved [head, 2*head_dim] layout the whole way
- * through on BOTH paths: q_norm and RoPE touch only the first head_dim of
- * each head (k_rmsnorm_heads / k_rope_heads take the stride), so the
- * attention output gate in the second half arrives at k_gate_sigmoid_strided
- * exactly as q_proj produced it.
+ * The queries keep whatever per-head layout q_proj produced, the whole way
+ * through, on both KV dtypes: q_norm and RoPE touch only the first head_dim
+ * of each head (k_rmsnorm_heads / k_rope_heads take the stride).
+ *
+ * The per-head stride is ARCH-DEPENDENT (P1), not universally 2*head_dim:
+ *   - hybrid qwen3_5/qwen35 (attn_output_gate == true): stride 2*head_dim,
+ *     queries in the first half and the folded attention output gate in the
+ *     second, so the gate reaches k_gate_sigmoid_strided exactly as q_proj
+ *     produced it;
+ *   - dense qwen3 (attn_output_gate == false): stride head_dim, queries only,
+ *     there is no second half and the gate dispatch is skipped entirely.
+ * Both read g->q_width, which sg_gpu_load_model sets from the flag.
  *
  * f32 path (SURGE_KV_DTYPE=f32): byte-for-bit the pre-M5.2 code. k_proj and
  * v_proj write STRAIGHT INTO the cache slot for this position and the

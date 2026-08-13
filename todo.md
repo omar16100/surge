@@ -1834,7 +1834,7 @@ Metal-only vs pure-C documented on each), `Makefile` (new `METAL_HYBRID_TESTS` r
   the weight payloads -- deferred to when the GPU is free; the mini hybrid GGUF fixture
   (`mini_fwd_gguf_matches_mlx`, small synthetic file, exercises the same `post_attention_norm.weight`
   lookup and 2x q_proj GGUF code path) ran clean under `make debug` throughout regardless.
-- GATES: `make debug` (SURGE_NO_METAL, ASan/UBSan) exits 0, 14 suites, 0 failures, no sanitizer
+- GATES: `make debug` (SURGE_NO_METAL, ASan/UBSan) exits 0, 13 suites, 0 failures, no sanitizer
   diagnostics (hermetic, no env vars). All real-file runs above (dense 4B gates 2+3, hybrid 2B
   regression) also exit 0 clean under both `-O2` and the ASan/UBSan debug build. `src/metal.m`
   could not be compiled with the real Metal frameworks or linked/run at all (excluded from every

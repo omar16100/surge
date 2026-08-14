@@ -2365,3 +2365,75 @@ first P2.2 commit. Every deleted line this round is inside P2.2's own code plus 
 `struct sg_gpu` comment extended in place (original sentence kept verbatim);
 `scratch_ensure`, `k_attn_decode_f16`, `enc_attn`, `enc_attn_f16` and `src/ref.c` remain
 byte-for-byte untouched. **Nothing moved from deferred to verified.**
+
+### P2.3a split-K timing harness (BUILT AND COMPILED, MEASUREMENT DEFERRED)
+
+Built the instrument P2.2 left as its own last paragraph: a timing harness that sweeps
+`n_splits` for the split-K decode-attention pair against the incumbent `k_attn_decode_f16`,
+so a default `n_splits` (and the wire-in/don't-wire-in call itself) rests on a measurement
+instead of grid arithmetic. **The GPU was busy for this entire task too**
+(`pgrep -f "bench_niah|phase0|surge-bench"` returned PIDs 45250/45303/45305 before the
+first edit and after the last), so, exactly like P2.2, this task WROTE and COMPILED but
+never RAN a kernel. **No timing number has been measured. Every number
+`tests/bench_splitk.bin` will ever print is measured live by whoever runs it after the GPU
+frees; nothing here is a claim about what those numbers will be.**
+
+**House-style choice (the brief asked for one): a new `tests/bench_splitk.c` built by an
+explicit `make bench-splitk` target**, not a flag on `surge-bench`. `surge-bench`
+(`src/cli_bench.c`) is a whole-model leaderboard-row tool (prefill + decode + admission
+gates + JSON); this is a raw per-kernel A/B, closer in spirit to `tests/test_metal_ops.c`'s
+buffer-poking than to a model run, and reuses that file's conventions (a `gbuf`-style
+alloc wrapper, `f32_bits`, an LCG fill) without editing it. Naming the file
+`tests/bench_splitk.c` (not `test_*.c`) keeps it out of `check`'s `$(TESTS)` wildcard
+structurally, so `make check`'s file list and runtime are byte-for-byte unchanged by this
+task -- verified by diffing the Makefile (the `check:`/`TESTS` lines have zero diff hits)
+rather than by running `make check`, which the task's hard constraint forbids.
+
+**What it does (`tests/bench_splitk.c`, new, 592 lines).** For the real 27B decode shape
+(24 heads/4 kv/head_dim 256) and 4B dense shape (32/8/128), at seq 8192/32768/131072/
+262144: allocates K/V honestly per seq (~1 GiB combined at the largest cell) via a
+non-fatal `galloc()` that prints a SKIP line with the exact byte count on failure rather
+than aborting or dropping the row silently; measures the incumbent ONCE per (shape, seq)
+(it does not depend on `n_splits`) and re-prints it on every row in that group, so each
+printed row is self-contained -- shape, seq, n_splits, incumbent time, split-K time,
+speedup, both kernels' achieved GB/s -- never a number compared against a different
+invocation; sweeps `n_splits` in {1,2,4,8,16,32,64,128,256,512,1024}, clamped into
+`surge.h`'s occupancy band (`4 <= n_splits <= seq/256`) by clamping each raw value into
+range and dropping the resulting adjacent duplicates, so only genuinely distinct in-band
+values are ever dispatched; times split-K as BOTH dispatches together (partial then
+combine), since that pair, not the partial alone, is what reaches the same final output
+the incumbent produces in one call; 1 discarded warm-up + N timed reps (`--reps`, default
+20) per cell, `clock_gettime(CLOCK_MONOTONIC)` wrapped tightly around each synchronous
+commit-and-wait call, the same convention `src/cli_bench.c`'s own `now_s()` uses.
+Achieved GB/s counts K+V f16 bytes read once per query-head threadgroup (the real HBM
+traffic pattern both kernels share, GQA repeat included since one kv head's data at these
+seq lengths already exceeds any plausible GPU cache), the SAME formula for both kernels,
+so the two GB/s columns are a clean, common yardstick, not two different rulers. Every
+row is printed even on failure (an allocation failure or a kernel error prints a SKIP or
+FAIL line naming the exact shape/seq/n_splits and the reason), per the brief's "a row
+that cannot allocate must say so, not silently skip."
+
+**Verified (compiler and CPU only, GPU still held):**
+1. `xcrun clang -fsyntax-only -std=c11 -Wall -Wextra -Werror -Isrc -I. tests/bench_splitk.c`
+   clean on BOTH the real Metal path and the `-DSURGE_NO_METAL` stub path;
+2. `xcrun -sdk macosx metal -fno-fast-math -Wall -c src/kernels.metal` still compiles
+   clean and `xcrun metallib` still links it (built to `/tmp/p23a_check/`, `src/
+   kernels.metal`/`.air`/`.metallib` byte-for-byte untouched, confirmed via `git status`
+   showing only the new test file) -- this file touches no kernel, so this is a
+   regression check, not new coverage;
+3. `make debug` (SURGE_NO_METAL, ASan/UBSan) **exit 0, 83523 checks, 0 failures**, no
+   sanitizer diagnostics, the IDENTICAL count to the P2.2 baseline (`bench_splitk.c`
+   never appears in the run's output: confirmed it is not built or executed under
+   `debug`, matching its file-naming exclusion from `$(TESTS)`);
+4. The Makefile diff is purely additive: one new `BENCH_SPLITK` variable/build-rule block
+   plus `.PHONY: bench-splitk` after `bench-check`, and one token added to `clean`'s `rm`
+   line. The existing `check:`/`debug:`/`TESTS` lines have zero diff hits.
+
+**UNVERIFIED, every one of these needs the GPU:** whether `tests/bench_splitk.bin` links
+and runs at all against the real Metal frameworks; every timing number, achieved-GB/s
+figure, min/max spread and speedup ratio it will print; whether any (shape, seq) cell's
+K/V allocation actually fails on this machine under whatever else is resident; and,
+downstream of all of that, whether split-K beats the incumbent anywhere in the swept
+range -- which is the entire question this task exists to make answerable, not to answer.
+**Run command once the GPU frees:** `make bench-splitk` (or `./tests/bench_splitk.bin
+--reps N` after building, to change the rep count).

@@ -374,11 +374,38 @@ optionally Accelerate for the CPU reference path. No third-party libraries.
     assertions, and whether the kernels run at all. Gate written and registered as
     `metal_attn_splitk_matches_ref` in `tests/test_metal_ops.c`, ready to run. Full
     report: `.superpowers/sdd/2026-08-09-surge-m3-m5/task-P2.2-report.md`.
+  - Task P2.3a (`tests/bench_splitk.c` + `Makefile`, purely additive): the TIMING harness
+    for P2.2's split-K pair, a DECISION gate (not a parameter fit) for whether P2.3 wires
+    split-K into `enc_attn` at all -- if split-K does not beat the incumbent at the shapes
+    that matter, it should not be wired in. A Phase 0 benchmark held the GPU for this
+    entire task too (`pgrep -f "bench_niah|phase0|surge-bench"` non-empty before and
+    after), so this is WRITTEN and COMPILE-CHECKED ONLY; no timing number has been
+    measured. Sweeps `n_splits` over {1,2,4,8,16,32,64,128,256,512,1024}, clamped into the
+    occupancy band `surge.h` documents (`4 <= n_splits <= seq/256`), across the real 27B
+    decode shape (24 heads/4 kv/head_dim 256) and 4B dense shape (32/8/128) at seq
+    8192/32768/131072/262144, ALWAYS timing the incumbent `k_attn_decode_f16` on the
+    identical shape in the same run so every row is a direct A/B, not an isolated number.
+    Reports mean/min/max over N reps (default 20, one discarded warm-up), plus achieved
+    KV-read GB/s (K+V f16 bytes, once per query-head threadgroup, the same yardstick for
+    both kernels; full derivation and honesty caveats in the file's own header). Kept OUT
+    of `make check` structurally, not by convention: named `tests/bench_splitk.c` rather
+    than `test_*.c` (the wildcard `check`'s `$(TESTS)` is built from), so it is excluded
+    from that list by construction; reachable only via the new `make bench-splitk` target,
+    which builds AND runs it. Verified: `xcrun clang -fsyntax-only -std=c11 -Wall -Wextra
+    -Werror` clean on both the Metal path and the `-DSURGE_NO_METAL` stub path; `xcrun
+    -sdk macosx metal -fno-fast-math -Wall -c src/kernels.metal` still compiles clean and
+    `metallib` still links (kernels.metal is untouched by this task, purely additive);
+    `make debug` exit 0 at the SAME 83523 checks / 0 failures / 0 sanitizer diagnostics as
+    the P2.2 baseline. UNVERIFIED (needs the GPU): whether `make bench-splitk` builds and
+    links against the real Metal frameworks at all, and every timing number, achieved-GB/s
+    figure and speedup ratio the harness will print. Full report:
+    `.superpowers/sdd/2026-08-09-surge-m3-m5/task-P2.3a-report.md`.
 - **Not built:** M4 (kernel excellence / beat mlx-lm; Task P2.2's split-K decode-attention
-  Metal kernels are now WRITTEN but UNGATED, and nothing dispatches them from the decode
-  path yet), the dense-qwen3 GPU forward's own
-  numeric gate (P1 is loader-only; deferred until the GPU is free), server mode,
-  non-Metal platforms, MoE, continuous batching, sampling beyond greedy/temp/top-p/top-k.
+  Metal kernels are WRITTEN but UNGATED, Task P2.3a's timing harness for them is WRITTEN
+  but UNMEASURED, and nothing dispatches them from the decode path yet), the dense-qwen3
+  GPU forward's own numeric gate (P1 is loader-only; deferred until the GPU is free),
+  server mode, non-Metal platforms, MoE, continuous batching, sampling beyond
+  greedy/temp/top-p/top-k.
 
 ## Design constraints
 

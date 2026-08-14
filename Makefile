@@ -88,6 +88,42 @@ surge-bench: src/cli_bench.c $(LIB_SRC) src/metal.m $(METALLIB)
 bench-check: surge surge-bench
 	@bash tests/test_cli_bench.sh ./surge ./surge-bench
 
+# --- P2.3a: split-K decode-attention timing harness (NOT part of `make check`)
+#
+# tests/bench_splitk.c sweeps n_splits for k_attn_decode_splitk_partial +
+# _combine against the incumbent k_attn_decode_f16, across the real 27B/4B
+# shapes at seq 8192..262144 (see that file's header for the full
+# methodology). It is a MEASUREMENT tool, not a correctness gate -- it has no
+# pass/fail assertion, so it must never be folded into `check`'s $(TESTS)
+# list. That list is `$(wildcard tests/test_*.c)`, and this file is
+# deliberately named tests/bench_splitk.c (not test_*.c) so it is excluded
+# structurally, not by a rule someone has to remember to keep following.
+#
+# Same Metal-aware build shape as METAL_TESTS above (collapses to a bare skip
+# stub under SURGE_NO_METAL, so `make debug` never links Metal for it either),
+# kept as its own rule rather than folded into METAL_TESTS so that list's own
+# comment ("Task 9 Metal kernels ... checks its threadgroup width") stays
+# accurate for every file in it -- this one is not a per-op correctness gate.
+BENCH_SPLITK = tests/bench_splitk.bin
+ifeq (,$(findstring SURGE_NO_METAL,$(CFLAGS)))
+$(BENCH_SPLITK): tests/%.bin: tests/%.c $(LIB_SRC) src/metal.m $(METALLIB)
+	$(CC) $(CFLAGS) $(METAL_DEFS) -o $@ src/metal.m $< \
+	  $(LIB_SRC) $(FRAMEWORKS) $(LDLIBS)
+else
+$(BENCH_SPLITK): tests/%.bin: tests/%.c
+	$(CC) $(CFLAGS) -o $@ $<
+endif
+
+# `make bench-splitk`: builds AND RUNS the sweep (`./tests/bench_splitk.bin
+# --reps N` to override the default rep count). Never invoked by `check` or
+# `debug`. Slow and GPU-bound (many shapes x seq lengths x n_splits); prints a
+# results table to stdout, one row per (shape, seq, n_splits), with a SKIP
+# line wherever a row's buffers could not be allocated rather than a silently
+# missing row.
+.PHONY: bench-splitk
+bench-splitk: $(BENCH_SPLITK)
+	./$(BENCH_SPLITK)
+
 # --- M3.4 Q8_0 forward correctness gate (manual, NOT wired into `make check`)
 #
 # Proves surge's Metal Q8_0 decode of the 27B GGUF is NUMERICALLY correct, not
@@ -121,6 +157,6 @@ debug:
 	@rm -f $(TESTS:.c=.bin)
 	@rm -rf $(TESTS:.c=.bin.dSYM)
 clean:
-	rm -f $(TESTS:.c=.bin) surge-info surge-ref surge surge-bench $(METALLIB) src/kernels.air
+	rm -f $(TESTS:.c=.bin) surge-info surge-ref surge surge-bench $(BENCH_SPLITK) $(METALLIB) src/kernels.air
 	rm -rf $(TESTS:.c=.bin.dSYM) surge-info.dSYM surge-ref.dSYM surge.dSYM surge-bench.dSYM
 .PHONY: check debug clean

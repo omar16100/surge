@@ -1,5 +1,43 @@
 # Surge M0-M2 Tasks
 
+## 2026-08-15 - B8 rationale correction + overshoot fix (branch `fix/prefill-duty-cycle-overshoot`)
+
+**Done.**
+
+- Corrected B8's documented rationale. The premise (Mac Studio M3 firmware GPU limiter
+  clamping to 338 MHz after 3-4 min sustained load, recovering after 60-120 s idle) is not
+  supported by the completed 256K run's telemetry: clock is flat within a burst, rest
+  length does not predict the next burst's clock (r = +0.017 over 376 pairs), 338 MHz
+  appears in 27 of 7724 loaded samples. Clock tracks context length (r = -0.575), set at
+  burst start. Cost of the wrong premise: 367 rests x 90 s = 9.2 h of a 30 h run.
+- The duty cycle is RETAINED but repurposed: it keeps the compositor alive. WindowServer
+  was watchdog-killed twice on 2026-08-14 while surge-bench held the GPU, logging out the
+  session. B7's original "HUNG" was most likely the same event.
+- Predictive budget test: rest when the NEXT chunk would cross the budget, not after it
+  already has. Previously 367 of 367 bursts overran a 150 s budget (median 199.5 s, worst
+  332.9 s), every one past the 80 s watchdog window.
+- Command-buffer segmentation, `--prefill-max-burst-ms` (default off): splits the layer
+  sweep when one command buffer overruns the ceiling. Needed because at 220k context a
+  single chunk runs ~130 s, which no amount of resting BETWEEN chunks can help.
+- New surface: `sg_gpu_set_prefill_max_burst`, `sg_gpu_prefill_segments`, JSON
+  `prefill_segments`.
+- Rationale corrected in all five places it was stated: `c4model.md`, `surge.h` (x2),
+  `metal.m`, `cli_bench.c` (x2).
+- `make check`: 14 cases pass, including a new segmentation gate proving gen_ids are
+  unchanged AND that segmentation engaged (3 -> 8 command buffers).
+
+**Caught by the gate, worth remembering:** the first segmentation draft advanced the layer
+cursor with `l0 += seg` while `seg` shrinks mid-loop, silently reprocessing layers and
+producing wrong gen_ids. This is the same class of bug review had already flagged for
+`base += chunk`; making it twice in one session is the argument for the parity gate.
+
+**Not verified:** `PF_EST_MARGIN` (1.25) and the halving policy are heuristics. The
+predictive gate has not been run against a real long-context prefill (needs another
+multi-hour 256K run), and segmentation has only been exercised at the mini fixture's 4
+layers, not the 27B's 64. The discriminating experiment for the clamp question (fixed
+context, fixed work, varying idle) is specified in the plan doc and has not been run.
+
+
 | # | Task | Status |
 |---|------|--------|
 | 1 | skeleton | done |

@@ -307,7 +307,7 @@ struct sg_gpu {
      * writes straight into L->kv there, as before). */
     void *b_k32, *b_v32;
 
-    /* --- Task B8: prefill duty-cycle (firmware GPU-clamp mitigation) ---
+    /* --- Task B8: prefill duty-cycle (yields the GPU between chunks) ---
      * Set by sg_gpu_set_prefill_rest; both 0 (the calloc default in
      * sg_gpu_init) means DISABLED, i.e. sg_gpu_prefill never sleeps and its
      * OUTPUT (gen_ids, logits, KV/decode state, g->used) is byte-identical to
@@ -321,6 +321,33 @@ struct sg_gpu {
     uint32_t prefill_work_budget_ms;
     uint32_t prefill_rest_ms;
     uint64_t prefill_rest_total_ms;
+
+    /* --- prefill command-buffer segmentation -------------------------
+     * Set by sg_gpu_set_prefill_max_burst; 0 (the calloc default) means
+     * DISABLED, i.e. one command buffer per chunk exactly as before.
+     *
+     * The duty-cycle rest above can only yield the GPU BETWEEN chunks, so it
+     * cannot help once a single chunk's command buffer runs longer than the
+     * macOS userspace watchdog allows WindowServer to go without rendering
+     * (80 s; measured ~130 s for one 256-token chunk at 220k context on
+     * 2026-08-14, which killed WindowServer twice). Splitting a chunk's layer
+     * sweep across several command buffers bounds how long the GPU is held by
+     * any one submission.
+     *
+     * This is safe in a way that changing `chunk` would not be: command buffer
+     * boundaries carry no state. The same kernels are dispatched with the same
+     * arguments in the same order, and buffers committed in sequence on one
+     * queue execute in order, so segmentation cannot change a single output
+     * value. That is why the segment count may also adapt mid-run.
+     *
+     * prefill_seg_layers is the live, adapting value; it is reset from
+     * n_layers at the start of every sg_gpu_prefill call. */
+    uint32_t prefill_max_burst_ms;
+    uint32_t prefill_seg_layers;
+    /* Command buffers submitted by the most recent sg_gpu_prefill call. Equals
+     * the chunk count when segmentation is off. Exposed so a parity test can
+     * prove segmentation actually engaged rather than passing vacuously. */
+    uint64_t prefill_segments;
 };
 
 /* --------------------------------------------------------------------
@@ -3173,6 +3200,17 @@ static double pf_now_s(void) {
  * uint32_t microsecond product overflowing) and its POSIX contract includes
  * writing the unslept remainder back on an EINTR return, which is exactly
  * what the retry loop needs. */
+/*
+ * Margin applied to the previous chunk's GPU time when predicting the next
+ * chunk's. A heuristic, not a guarantee: chunk cost grows monotonically with
+ * context because each chunk attends over a longer KV cache, so last-chunk time
+ * always under-estimates next-chunk time, and the growth per chunk is small
+ * once the context is large. Measured over the 2026-08-14 256K run, consecutive
+ * chunk times grew by well under 25%. Callers who need a hard bound should set
+ * the work budget below the watchdog window rather than rely on this.
+ */
+#define PF_EST_MARGIN 1.25
+
 static void pf_sleep_ms(uint32_t ms) {
     struct timespec req = { .tv_sec = (time_t)(ms / 1000u),
                              .tv_nsec = (long)(ms % 1000u) * 1000000L };
@@ -3197,6 +3235,35 @@ void sg_gpu_set_prefill_rest(sg_gpu *g, uint32_t work_budget_ms, uint32_t rest_m
     g->prefill_rest_ms = rest_ms;
 }
 
+/*
+ * Target ceiling, in ms, for how long any one prefill command buffer holds the
+ * GPU. 0 (the calloc default) disables segmentation: one command buffer per
+ * chunk, exactly as before.
+ *
+ * A target, not a guarantee. The check is reactive, so the first command buffer
+ * to overrun does so in full; what the mechanism prevents is the overrun
+ * repeating, since the narrowed segment size persists for the rest of the call.
+ * A one-layer segment that still overruns cannot be split further.
+ *
+ * This is a different mechanism from the duty-cycle rest and solves a different
+ * problem. The rest yields the GPU BETWEEN chunks; this bounds how long a
+ * SINGLE submission holds it. Only the latter can protect the compositor once
+ * one chunk runs longer than the watchdog window on its own.
+ *
+ * Unlike changing `chunk`, this cannot alter output: command buffer boundaries
+ * carry no state, the same kernels are dispatched with the same arguments in
+ * the same order, and buffers committed in sequence on one queue execute in
+ * order. Settings persist on g until changed again.
+ */
+void sg_gpu_set_prefill_max_burst(sg_gpu *g, uint32_t max_burst_ms) {
+    if (!g) return;
+    g->prefill_max_burst_ms = max_burst_ms;
+}
+
+uint64_t sg_gpu_prefill_segments(const sg_gpu *g) {
+    return g ? g->prefill_segments : 0;
+}
+
 /* Total time (ms) sg_gpu_prefill actually slept during its most recent call;
  * 0 if the feature was disabled or never triggered (e.g. every chunk's
  * GPU-busy time stayed under work_budget_ms). Reset to 0 at the start of
@@ -3219,6 +3286,7 @@ sg_err sg_gpu_prefill(sg_gpu *g, const sg_model *m, const int32_t *tokens,
      * fails validation would otherwise still report whatever a PRIOR
      * successful call slept, which is stale and misleading. */
     g->prefill_rest_total_ms = 0;
+    g->prefill_segments = 0;
     if (!m || !tokens) return (sg_err){"gpu: sg_gpu_prefill got a NULL argument"};
     if (!g->have_state) return (sg_err){"gpu: call sg_gpu_state_new first"};
     if (m != g->model) return (sg_err){"gpu: this gpu was loaded with a different sg_model"};
@@ -3327,6 +3395,12 @@ sg_err sg_gpu_prefill(sg_gpu *g, const sg_model *m, const int32_t *tokens,
     /* Progress log for long prefills (a 256K ingest is minutes-to-hours on this
      * box). Auto-quiet for short prompts so `make check` stays silent; logs a
      * throttled line every 8th chunk plus the last. */
+    /* Segmentation starts wide (one command buffer for the whole layer sweep,
+     * i.e. today's behaviour) and narrows only if a submission overruns the
+     * ceiling. Reset per call so one long-context run cannot leave a later,
+     * shorter one permanently over-segmented. */
+    g->prefill_seg_layers = c->n_layers;
+
     bool pf_log = n_tokens >= 8192u;
     double t_pf0 = pf_now_s();
 
@@ -3390,6 +3464,21 @@ sg_err sg_gpu_prefill(sg_gpu *g, const sg_model *m, const int32_t *tokens,
          * the encode path itself never branches on rest_enabled; only the
          * accumulate-and-maybe-rest decision after the command buffer
          * completes does. */
+        double chunk_gpu_s = 0.0;
+        uint32_t seg = g->prefill_seg_layers;
+        if (seg == 0u || seg > c->n_layers) seg = c->n_layers;
+
+        /*
+         * The cursor advances by the layers actually encoded (l1 - l0), NOT by
+         * `seg`. `seg` can shrink at the bottom of this loop, and a `l0 += seg`
+         * increment would then rewind over layers already applied to the
+         * residual stream, running them a second time. That is silent: it
+         * produces a plausible but wrong hidden state rather than an error.
+         */
+        for (uint32_t l0 = 0; l0 < c->n_layers && !sg_failed(rc); ) {
+            uint32_t l1 = l0 + seg;
+            if (l1 > c->n_layers) l1 = c->n_layers;
+
         double t_gpu0 = 0.0, t_gpu1 = 0.0;
         @autoreleasepool {
             id<MTLCommandBuffer> cb = [g->queue commandBuffer];
@@ -3398,7 +3487,7 @@ sg_err sg_gpu_prefill(sg_gpu *g, const sg_model *m, const int32_t *tokens,
                 rc = (sg_err){"gpu: could not open a compute encoder"};
             } else {
                 sg_enc E = { g, enc };
-                for (uint32_t i = 0; i < c->n_layers; i++) {
+                for (uint32_t i = l0; i < l1; i++) {
                     sg_gpu_layer *L = &g->ls[i];
                     /* ln1 per token: KI_RMSNORM_HEADS with heads=n is the
                      * per-slice form of decode's k_rmsnorm (identical scale
@@ -3425,7 +3514,9 @@ sg_err sg_gpu_prefill(sg_gpu *g, const sg_model *m, const int32_t *tokens,
                     enc_op(&E, KI_ADD, g->b_x, 0, g->b_r, 0, g->b_x, 0, nil, 0,
                            PARAMS(n * c->hidden));
                 }
-                if (last) {
+                /* Logits belong to the FINAL segment of the final chunk, so
+                 * that b_x already carries every layer's contribution. */
+                if (last && l1 == c->n_layers) {
                     /* Only the last chunk's LAST row needs logits: out_norm on
                      * that row (KI_RMSNORM_HEADS, heads=1, reading b_x at the
                      * last token's offset) then lm_head via the matvec kernel,
@@ -3446,6 +3537,36 @@ sg_err sg_gpu_prefill(sg_gpu *g, const sg_model *m, const int32_t *tokens,
                                   [[[cb error] localizedDescription] UTF8String]);
                 }
             }
+        }
+        chunk_gpu_s += t_gpu1 - t_gpu0;
+        /* Counts SUBMITTED command buffers, so a segment whose encoder could
+         * not be opened is not counted; t_gpu1/t_gpu0 are both 0 in that case
+         * and rc is already set, ending the loop. */
+        if (!sg_failed(rc)) g->prefill_segments++;
+        l0 = l1;
+
+        /* Adapt the segment size to the measured submission time.
+         *
+         * REACTIVE, not a hard cap: this segment has already run long by the
+         * time we look. The first overrun of a run is therefore unbounded, and
+         * a floor-of-1-layer segment can still exceed the ceiling with nothing
+         * left to split. What this does guarantee is that the overrun does not
+         * REPEAT: the narrowed seg persists on g across the remaining chunks of
+         * the call. Choose a ceiling well under the watchdog window so the
+         * first overrun still lands inside it.
+         *
+         * Applies from the NEXT segment; the cursor above already advanced by
+         * what was encoded, so shrinking here cannot rewind it. */
+        if (g->prefill_max_burst_ms > 0u && seg > 1u &&
+            (t_gpu1 - t_gpu0) * 1000.0 > (double)g->prefill_max_burst_ms) {
+            seg /= 2u;
+            g->prefill_seg_layers = seg;
+            if (pf_log) {
+                fprintf(stderr, "gpu: prefill segment -> %u layers "
+                        "(command buffer ran %.0f ms, ceiling %u ms)\n",
+                        seg, (t_gpu1 - t_gpu0) * 1000.0, g->prefill_max_burst_ms);
+            }
+        }
         }
         if (sg_failed(rc)) { e = rc; goto cleanup; }
 
@@ -3469,11 +3590,32 @@ sg_err sg_gpu_prefill(sg_gpu *g, const sg_model *m, const int32_t *tokens,
          * the next iteration). Pure timing -- no buffer, state, or accumulator
          * that feeds the computed logits or KV state is touched here, only
          * pf_work_acc_ms (a local, loop-scoped counter) and g's rest-tracking
-         * fields, so this cannot change gen_ids. Never rests after the final
-         * chunk (nothing left to protect) or when disabled. */
-        if (rest_enabled) {
-            pf_work_acc_ms += (t_gpu1 - t_gpu0) * 1000.0;
-            if (!last && pf_work_acc_ms >= (double)g->prefill_work_budget_ms) {
+         * fields, so this cannot change gen_ids. No-op when disabled.
+         *
+         * The test is PREDICTIVE: it asks whether the NEXT chunk would carry
+         * the accumulator past the budget, not whether this one already did.
+         * Testing after the fact meant a burst always ran to budget + one
+         * chunk, and one chunk grows with context: over the 2026-08-14 256K
+         * run, 367 of 367 bursts overran a 150 s budget, median 199.5 s and
+         * worst 332.9 s. Chunk cost grows monotonically with context (each
+         * chunk attends over a longer KV cache), so the previous chunk is a
+         * slight UNDER-estimate of the next; PF_EST_MARGIN covers that.
+         *
+         * The final chunk is now PROTECTED rather than special-cased. The old
+         * rule skipped the budget test whenever the next chunk was the last
+         * one, so the longest chunk of the run was the one most likely to be
+         * submitted onto an already-exhausted budget. Here the test runs at the
+         * end of every non-final chunk and accounts for the chunk that follows,
+         * including when that chunk is the last. Resting AFTER the final chunk
+         * is still pointless (nothing follows it), which is what !last means
+         * now. */
+        if (rest_enabled && !last) {
+            double est_next_ms;
+
+            pf_work_acc_ms += chunk_gpu_s * 1000.0;
+            est_next_ms = chunk_gpu_s * 1000.0 * PF_EST_MARGIN;
+
+            if (pf_work_acc_ms + est_next_ms >= (double)g->prefill_work_budget_ms) {
                 if (pf_log) {
                     fprintf(stderr, "gpu: prefill duty-cycle resting %u ms "
                             "(worked %.0f ms since last rest)\n",

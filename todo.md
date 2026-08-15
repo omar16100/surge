@@ -31,6 +31,13 @@ cursor with `l0 += seg` while `seg` shrinks mid-loop, silently reprocessing laye
 producing wrong gen_ids. This is the same class of bug review had already flagged for
 `base += chunk`; making it twice in one session is the argument for the parity gate.
 
+**Verified after the fact:** `tools/prefill_longctx_gate.sh` PASS on the real 2B, 295
+checks / 0 failures, wall 28,741 s, prefill-vs-serial gap 1.222e-06 (unchanged from the
+mini run). The 8 h duration is the gate's own cost (262k prefill = 21,971 s of it), not a
+regression. That run also saturated the GPU for ~8 h with no rests and showed smooth
+context-driven throughput decay (17 -> 12 tok/s), which corroborates the Finding 1
+analysis on a second model.
+
 **Not verified:** `PF_EST_MARGIN` (1.25) and the halving policy are heuristics. The
 predictive gate has not been run against a real long-context prefill (needs another
 multi-hour 256K run), and segmentation has only been exercised at the mini fixture's 4

@@ -199,8 +199,42 @@ model of the hardware.
 
 - `make check`: 14 cases pass, including the pre-existing B8 gates unchanged and the new
   segmentation gate (`command buffers 3 -> 8`, gen_ids identical).
-- `tools/prefill_longctx_gate.sh` on the real 2B model: see the run log referenced in
-  `todo.md`.
+- `tools/prefill_longctx_gate.sh` on the real 2B model: **PASS**, 295 checks / 0 failures,
+  exit 0, wall time 28,741 s. Phase A depth-equivalence 0 mismatches; phase B 262,112-token
+  prefill reached `used==262144` with non-degenerate decode. Worst prefill-vs-serial
+  last-logit relative gap **1.222e-06, identical to the hermetic mini run**, so the
+  segmentation edit did not perturb numerics at real scale.
+- 8 hours is normal for this gate, not a regression: the 262k prefill alone accounts for
+  21,971 s of the 28,741 s.
+
+### Unplanned corroboration of Finding 1
+
+The gate arms neither `--prefill-work-ms` nor `--prefill-max-burst-ms`, so it held the GPU
+saturated for ~8 hours with NO rests at all, on a 2B (a different model from the 27B run
+the analysis came from). Prefill throughput decayed smoothly and monotonically with
+context:
+
+    ctx 173056  17 tok/s      ctx 222208  14 tok/s
+    ctx 189440  16 tok/s      ctx 238592  13 tok/s
+    ctx 205824  15 tok/s      ctx 262112  12 tok/s
+
+Under the documented premise (clamp to 338 MHz after 3-4 min of sustained load, recovering
+only after 60-120 s idle) this run should have been pinned at the clamp for essentially
+its entire duration after the first few minutes, and the decay should track time-under-load
+rather than context. It tracks context, smoothly, with no step change. Independent of the
+run the original analysis used.
+
+Not a substitute for the discriminating experiment below, which controls work and varies
+idle. But it is a second workload, on a second model, pointing the same way.
+
+### And a limit worth stating
+
+WindowServer was NOT killed during those 8 saturated hours, and no new watchdog reports
+were written. That is not evidence the risk is gone: the 2026-08-14 kill was one event
+across 367 bursts, so a single clean run proves little either way. It does mean the
+failure is probabilistic rather than deterministic, and I cannot currently say what made
+that particular burst fatal. Worth keeping in mind before treating the mitigation as
+sufficient.
 - New surface: `sg_gpu_set_prefill_max_burst`, `sg_gpu_prefill_segments`, CLI
   `--prefill-max-burst-ms`, JSON `prefill_segments`.
 

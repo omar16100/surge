@@ -143,9 +143,12 @@ Part A alone cannot help once one chunk exceeds the watchdog. `--prefill-max-bur
 (default 0 = off): when a single command buffer overruns M, split the layer sweep across
 more command buffers, halving down to a floor of one layer.
 
-The ceiling is a target, not a hard cap: the check is reactive, so the first overrunning
-command buffer runs in full and a one-layer segment cannot split further. It prevents the
-overrun from repeating, because the narrowed segment persists for the rest of the call.
+The ceiling is a target, not a hard cap, and not a promise of a single overrun. The check
+is reactive, so each overrunning submission runs in full and only then halves: a 64-layer
+sweep can overrun at 64, then 32, then 16, converging over up to log2(layers) overruns. A
+segment already at the 1-layer floor cannot shrink further and will keep overrunning. Set
+the ceiling well under the watchdog window so the overruns along the way still land
+inside it.
 
 Segmentation rather than chunk resizing, per review. This is the safer mechanism by a
 wide margin: command buffer boundaries carry no state, so the same kernels run with the
@@ -179,15 +182,28 @@ model of the hardware.
 
 ## Tests
 
-- `tests/test_gpu_prefill.c`: unit test for the predictive gate arithmetic (no GPU) -
-  given a synthetic sequence of chunk durations, assert rest points land before the
-  budget is exceeded, not after.
-- `tests/test_cli_bench.sh`: extend the existing forced-rest gate to assert the observed
-  worked-time per burst never exceeds `budget * margin`, which is the property that was
-  silently violated for 367 consecutive bursts.
-- Part B gate as described above. Blocking for Part B only.
-- Existing B8 gates (byte-identical disabled path, rest accounting) must stay green
+Implemented:
+
+- `tests/test_cli_bench.sh`: the segmentation parity gate (segmented gen_ids == unsegmented
+  over an uneven chunk schedule, AND `prefill_segments` rose so it cannot pass vacuously).
+- `tests/test_gpu_prefill.c`: `prefill_segments` obeys the same reset-as-first-mutation
+  contract as `prefill_rest_total_ms`, so an early-failing call cannot report a prior
+  call's count.
+- The existing B8 gates (byte-identical disabled path, exact rest accounting) stay green
   unchanged.
+
+PLANNED, NOT IMPLEMENTED. Recorded as a gap rather than quietly dropped:
+
+- A no-GPU unit test of the predictive gate arithmetic: given a synthetic sequence of chunk
+  durations, assert the rest points land before the budget is crossed rather than after.
+  The predictive test is currently three inline lines in `sg_gpu_prefill`, so this needs a
+  small extraction to be testable.
+- A `tests/test_cli_bench.sh` assertion that per-burst worked time never exceeds
+  `budget * margin`. This is the property that was silently violated for 367 consecutive
+  bursts, so it is the single most valuable missing test.
+
+Consequence: the predictive gate is covered only by the existing rest-accounting gate,
+which pins the NUMBER of rests, not the worked time between them.
 
 ## Docs to update in the same commit
 
@@ -218,14 +234,17 @@ context:
     ctx 189440  16 tok/s      ctx 238592  13 tok/s
     ctx 205824  15 tok/s      ctx 262112  12 tok/s
 
-Under the documented premise (clamp to 338 MHz after 3-4 min of sustained load, recovering
-only after 60-120 s idle) this run should have been pinned at the clamp for essentially
-its entire duration after the first few minutes, and the decay should track time-under-load
-rather than context. It tracks context, smoothly, with no step change. Independent of the
-run the original analysis used.
+This is WEAK corroboration and should not be read as more. There is no clock or power
+telemetry for this run: tok/s is all I have. Token throughput can decay with context even
+under a fixed clamp, because the work per token grows, so a flat clamp is not excluded by
+this trace. What the trace does rule out is a dramatic clamp-like throughput cliff followed
+by a plateau, which is what a hard 338 MHz pin arriving after 3-4 minutes would most
+plausibly look like.
 
-Not a substitute for the discriminating experiment below, which controls work and varies
-idle. But it is a second workload, on a second model, pointing the same way.
+So: consistent with the memory-bound explanation, on a second workload and a second model,
+and not consistent with the most obvious shape of the documented premise. Not proof. The
+discriminating experiment below, which holds work fixed and varies idle, is still the thing
+that would settle it, and it has not been run.
 
 ### And a limit worth stating
 

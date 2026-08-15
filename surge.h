@@ -1047,12 +1047,18 @@ sg_err sg_gpu_prefill(sg_gpu *g, const sg_model *m, const int32_t *tokens,
  * chunk cost grows with context: 367 of 367 bursts in the 2026-08-14 256K run
  * overran a 150 s budget, median 199.5 s, worst 332.9 s.
  *
- * sg_gpu_prefill accumulates
- * the GPU-busy wall time of each chunk (commit..waitUntilCompleted), and once
- * that accumulated time reaches work_budget_ms -- provided at least one chunk
- * still remains -- sleeps rest_ms with NO command buffer in flight, so the GPU
- * goes genuinely idle and anything else needing the GPU can run, then resumes and
+ * sg_gpu_prefill accumulates the wall time of each chunk's
+ * commit..waitUntilCompleted span, and once that accumulated time PLUS the
+ * estimate above would reach work_budget_ms -- provided at least one chunk still
+ * remains -- sleeps rest_ms with NO command buffer in flight, so the GPU goes
+ * genuinely idle and anything else needing the GPU can run, then resumes and
  * resets the accumulator.
+ *
+ * Note that span is WALL time, not GPU-busy time. On a contended GPU it also
+ * counts time other processes held the device, so the accumulator inflates and
+ * the duty cycle rests more often than the work alone warrants. That errs
+ * toward yielding, which is the safe direction here, but it means budget values
+ * tuned on an idle machine do not transfer directly to a busy one.
  *
  * DISABLED is the default (both fields 0 from sg_gpu_init's calloc) and is
  * also what either argument being 0 selects: no accumulator ever crosses
@@ -1080,12 +1086,13 @@ uint64_t sg_gpu_prefill_rest_ms(const sg_gpu *g);
  * long any one prefill command buffer holds the GPU. 0 (the default) disables
  * it: one command buffer per chunk, exactly as before.
  *
- * A target, not a cap. The check is reactive: the first command buffer to
- * overrun the ceiling does so in full, and a segment already down to one layer
- * cannot be split further. What it does guarantee is that the overrun does not
- * repeat, because the narrowed segment size persists for the rest of the call.
- * Pick a ceiling well under the watchdog window so the first overrun still
- * lands inside it.
+ * A target, not a cap, and not a promise of a single overrun. The check is
+ * reactive: each overrunning submission runs in full and only then halves the
+ * segment, so a 64-layer sweep can overrun at 64, then 32, then 16, converging
+ * over up to log2(layers) overruns rather than stopping after one. A segment
+ * already at the 1-layer floor cannot shrink further and will keep overrunning.
+ * Pick a ceiling well under the watchdog window so the overruns along the way
+ * still land inside it.
  *
  * Separate mechanism from the duty-cycle rest, for a problem the rest cannot
  * reach. The rest yields the GPU between chunks; it cannot help once a single

@@ -3240,10 +3240,13 @@ void sg_gpu_set_prefill_rest(sg_gpu *g, uint32_t work_budget_ms, uint32_t rest_m
  * GPU. 0 (the calloc default) disables segmentation: one command buffer per
  * chunk, exactly as before.
  *
- * A target, not a guarantee. The check is reactive, so the first command buffer
- * to overrun does so in full; what the mechanism prevents is the overrun
- * repeating, since the narrowed segment size persists for the rest of the call.
- * A one-layer segment that still overruns cannot be split further.
+ * A target, not a guarantee, and specifically NOT a promise of a single
+ * overrun. The check is reactive, so each overrun happens in full and the size
+ * only halves afterwards: a 64-layer sweep can overrun at 64, then 32, then 16,
+ * converging rather than stopping. A segment already at the 1-layer floor
+ * cannot shrink further and will keep overrunning. The narrowed size does
+ * persist for the rest of the call, so the sequence is bounded by log2(layers)
+ * overruns, not by one.
  *
  * This is a different mechanism from the duty-cycle rest and solves a different
  * problem. The rest yields the GPU BETWEEN chunks; this bounds how long a
@@ -3548,12 +3551,12 @@ sg_err sg_gpu_prefill(sg_gpu *g, const sg_model *m, const int32_t *tokens,
         /* Adapt the segment size to the measured submission time.
          *
          * REACTIVE, not a hard cap: this segment has already run long by the
-         * time we look. The first overrun of a run is therefore unbounded, and
-         * a floor-of-1-layer segment can still exceed the ceiling with nothing
-         * left to split. What this does guarantee is that the overrun does not
-         * REPEAT: the narrowed seg persists on g across the remaining chunks of
-         * the call. Choose a ceiling well under the watchdog window so the
-         * first overrun still lands inside it.
+         * time we look. Overruns can therefore REPEAT while the size converges
+         * (64 layers can overrun at 64, then 32, then 16), and a segment already
+         * at the 1-layer floor cannot shrink further, so it can overrun forever.
+         * What halving guarantees is only that each overrun makes the next
+         * submission smaller until the floor. Choose a ceiling well under the
+         * watchdog window so the overruns along the way still land inside it.
          *
          * Applies from the NEXT segment; the cursor above already advanced by
          * what was encoded, so shrinking here cannot rewind it. */

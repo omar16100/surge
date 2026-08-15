@@ -38,6 +38,13 @@ regression. That run also saturated the GPU for ~8 h with no rests and showed sm
 context-driven throughput decay (17 -> 12 tok/s), which corroborates the Finding 1
 analysis on a second model.
 
+**Known gaps (from pre-push review):** no test asserts per-burst worked time stays within
+`budget * margin`, which is exactly the property that was violated 367 times; the
+predictive gate arithmetic has no no-GPU unit test; the segmented path is covered only at
+the mini fixture's 4 layers, never at the 27B's 64. The duty-cycle accumulator also
+measures WALL time of commit..waitUntilCompleted, so on a contended GPU it counts other
+processes' time and over-rests, meaning budgets tuned on an idle machine do not transfer.
+
 **Not verified:** `PF_EST_MARGIN` (1.25) and the halving policy are heuristics. The
 predictive gate has not been run against a real long-context prefill (needs another
 multi-hour 256K run), and segmentation has only been exercised at the mini fixture's 4

@@ -210,10 +210,12 @@ optionally Accelerate for the CPU reference path. No third-party libraries.
     chunks, so it cannot help once ONE chunk's command buffer outlasts the watchdog window;
     at 220k context a single 256-token chunk measured ~130 s. When a submission overruns the
     ceiling, the layer sweep is split across more command buffers (halving, floor 1 layer).
-    The ceiling is a TARGET, not a cap: the check is reactive, so the first command buffer
-    to overrun does so in full and a one-layer segment cannot be split further. What it
-    guarantees is that the overrun does not repeat, since the narrowed segment size
-    persists for the rest of the call. Set it well under the watchdog window.
+    The ceiling is a TARGET, not a cap, and NOT a promise of a single overrun: the check
+    is reactive, so each overrunning submission runs in full and only then halves. A
+    64-layer sweep can overrun at 64, then 32, then 16, converging over up to log2(layers)
+    overruns; a segment at the 1-layer floor cannot shrink further and keeps overrunning.
+    Set the ceiling well under the watchdog window so the overruns along the way still
+    land inside it.
     Unlike changing `chunk`, this cannot alter output: command buffer boundaries carry no
     state, the same kernels run with the same arguments in the same order, and buffers
     committed in sequence on one queue execute in order. That claim is GATED, not assumed:

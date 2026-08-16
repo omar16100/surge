@@ -1,5 +1,28 @@
 # Surge M0-M2 Tasks
 
+## WIP: split-K decode attention (P2.x) -- NOT COMPLETE, NOT VERIFIED ON GPU
+
+Flagged 2026-08-16 when this branch was pushed. Everything under Task P2.0 through P2.3a
+below is work in progress and must not be read as finished:
+
+| Task | State |
+|---|---|
+| P2.0 split-K combine math (`sg_ref_attn_combine`) | CPU-gated, done |
+| P2.1 split-K decode-attention oracle | CPU-gated, done |
+| P2.2 Metal split-K kernels | **UNVERIFIED**, no GPU gate has been run |
+| P2.3a split-K timing harness (`make bench-splitk`) | **built, NO TIMINGS MEASURED** |
+
+What that means concretely: the CPU oracles (P2.0, P2.1) are proven and can be trusted.
+The Metal kernels (P2.2) have never been executed against those oracles on real hardware,
+and the timing harness (P2.3a) has never produced a number. No claim about split-K being
+faster than the incumbent has been measured, only hypothesised. The commits themselves say
+so in their subject lines ("UNVERIFIED pending GPU gates", "NO TIMINGS MEASURED"); this
+table exists so the status is visible from the top of the file rather than only in git log.
+
+Next step when the GPU is free: `make bench-splitk`, then the P2.2 correctness gate against
+the P2.1 oracle.
+
+
 ## 2026-08-15 - B8 rationale correction + overshoot fix (branch `fix/prefill-duty-cycle-overshoot`)
 
 **Done.**

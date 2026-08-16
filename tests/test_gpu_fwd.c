@@ -280,6 +280,220 @@ static void mini_f16_kv_decode_coherent(void) {
     free(ids);
 }
 
+/* Task P2.3: the DECODE PATH's split-K wiring, on the same mini hybrid
+ * fixture, run past the SG_TG*4 == 1024 threshold at which enc_attn switches
+ * from k_attn_decode_f16 to the k_attn_decode_splitk_partial + _combine pair.
+ *
+ * The per-op gate for those two kernels lives in test_metal_ops.c and is
+ * untouched; what is new and untested there is the WIRING: the hand-rolled 2D
+ * dispatch inside sg_gpu_forward's open command buffer, the m/s/acc buffers
+ * shared by every full-attention layer and every step, the dedicated
+ * splitk_scratch, and the threshold itself.
+ *
+ * THE THRESHOLD IS WHAT MAKES THIS NON-VACUOUS. Both modes run the SAME kernel
+ * below the threshold, so for every position with seq = pos+1 < 1024 the two
+ * runs must be BYTE-IDENTICAL; at and above it they run different kernels over
+ * a different partition of the same sum, so they must AGREE NUMERICALLY while
+ * DIFFERING in at least one bit somewhere. Asserting both directions pins the
+ * switch to exactly the documented sequence length: a wiring that never
+ * dispatched split-K would fail the "differs somewhere above" half, and one
+ * that dispatched it too early would fail the byte-identical half.
+ *
+ * Three passes over the same synthetic id sequence: incumbent (pinned with
+ * SURGE_ATTN_SPLITK=0), split-K (the default), and split-K again through a
+ * reset state for a byte-identical determinism rerun. */
+/* > 1024 so the threshold is crossed, and chosen so that
+ * n_splits = clamp(N/SG_TG, 4, 1024) == 6 is DIFFERENT from this fixture's
+ * n_heads == 4. That matters: the partial is dispatched on a 2D grid
+ * (x = split, y = head), and a swapped-axis bug produces plausible-looking
+ * output whenever n_splits happens to equal n_heads (P2.2's own deferred-gate
+ * list says so). At 1088 the two would both be 4 and this gate would be blind
+ * to exactly the bug the hand-rolled dispatch is most likely to have. */
+#define SPLITK_GATE_N 1600u
+#define SPLITK_GATE_THRESHOLD 1024u  /* SG_TG * 4, mirrored from metal.m */
+
+static void splitk_gate_run(sg_model *m, const int32_t *ids, uint32_t n,
+                            const char *mode, float *logits_out, uint32_t *arg_out) {
+    uint32_t vocab = m->cfg.vocab;
+    setenv("SURGE_ATTN_SPLITK", mode, 1);
+    sg_err e = sg_gpu_state_new(g_gpu, m, n);
+    tt_assert(!sg_failed(e), "sg_gpu_state_new (splitk=%s): %s", mode,
+              e.msg ? e.msg : "ok");
+    if (sg_failed(e)) return;
+
+    for (uint32_t t = 0; t < n; t++) {
+        const float *gl = NULL;
+        e = sg_gpu_forward(g_gpu, m, ids[t], t, &gl);
+        if (sg_failed(e)) {
+            tt_assert(false, "sg_gpu_forward %u (splitk=%s): %s", t, mode,
+                      e.msg ? e.msg : "ok");
+            return;
+        }
+        memcpy(logits_out + (size_t)t * vocab, gl, (size_t)vocab * sizeof *gl);
+        arg_out[t] = argmax_f32(gl, vocab);
+    }
+}
+
+static void mini_f16_splitk_decode_matches_incumbent(void) {
+    size_t n_seed = 0;
+    int32_t *seed = read_ids_file(MINI_DIR "/ids.txt", &n_seed);
+    tt_assert(seed && n_seed > 1, "read %s/ids.txt", MINI_DIR);
+    if (!seed || n_seed < 2) { free(seed); return; }
+
+    sg_gguf *gg = NULL;
+    sg_err e = sg_gguf_open(MINI_DIR "/model.gguf", &gg);
+    tt_assert(!sg_failed(e), "sg_gguf_open: %s", e.msg ? e.msg : "ok");
+    if (sg_failed(e)) { free(seed); return; }
+
+    sg_model m;
+    e = sg_model_from_gguf(gg, &m);
+    tt_assert(!sg_failed(e), "sg_model_from_gguf: %s", e.msg ? e.msg : "ok");
+    if (sg_failed(e)) { sg_gguf_close(gg); free(seed); return; }
+
+    e = sg_gpu_load_model(g_gpu, &m);
+    tt_assert(!sg_failed(e), "sg_gpu_load_model: %s", e.msg ? e.msg : "ok");
+    if (sg_failed(e)) { sg_model_free(&m); sg_gguf_close(gg); free(seed); return; }
+
+    const uint32_t n = SPLITK_GATE_N;
+    uint32_t vocab = m.cfg.vocab;
+    /* The fixture ships 12 ids; cycle them to reach past the threshold. The
+     * content does not matter here (this compares two kernels against each
+     * other, not against an oracle), only that it is in-vocab and identical
+     * across the three passes. */
+    int32_t *ids = xmalloc((size_t)n * sizeof *ids);
+    for (uint32_t t = 0; t < n; t++) ids[t] = seed[t % n_seed];
+
+    size_t lbytes = (size_t)n * vocab * sizeof(float);
+    float *l_inc = xmalloc(lbytes), *l_sk = xmalloc(lbytes), *l_sk2 = xmalloc(lbytes);
+    uint32_t *a_inc = xmalloc((size_t)n * sizeof *a_inc);
+    uint32_t *a_sk = xmalloc((size_t)n * sizeof *a_sk);
+    uint32_t *a_sk2 = xmalloc((size_t)n * sizeof *a_sk2);
+    memset(l_inc, 0, lbytes);
+    memset(l_sk, 0, lbytes);
+    memset(l_sk2, 0, lbytes);
+
+    /* How many times to REPEAT the split-K pass for the determinism check
+     * below. One extra pass keeps `make check` in the seconds it lives in;
+     * SURGE_SPLITK_DET_REPS=100 turns this into the 100x byte-identical rerun
+     * the task's gate list asks for, at roughly a second per pass. */
+    uint32_t det_reps = 1;
+    const char *reps_env = getenv("SURGE_SPLITK_DET_REPS");
+    if (reps_env) {
+        long v = strtol(reps_env, NULL, 10);
+        if (v > 0 && v < 100000) det_reps = (uint32_t)v;
+    }
+
+    splitk_gate_run(&m, ids, n, "0", l_inc, a_inc);
+    splitk_gate_run(&m, ids, n, "1", l_sk, a_sk);
+
+    /* 1. Below the threshold both modes dispatch k_attn_decode_f16, so every
+     *    bit must match. A single difference here means split-K engaged
+     *    earlier than documented. */
+    uint32_t below_diff = 0;
+    for (uint32_t t = 0; t + 1 < SPLITK_GATE_THRESHOLD && t < n; t++) {
+        if (memcmp(l_inc + (size_t)t * vocab, l_sk + (size_t)t * vocab,
+                   (size_t)vocab * sizeof(float)) != 0) below_diff++;
+    }
+    tt_assert(below_diff == 0,
+              "below seq %u the two modes must be byte-identical, %u positions differ",
+              SPLITK_GATE_THRESHOLD, below_diff);
+
+    /* 2. At and above it they must DIFFER somewhere, or split-K was never
+     *    dispatched and everything below this is vacuous. */
+    uint32_t above_diff = 0, above_total = 0;
+    for (uint32_t t = SPLITK_GATE_THRESHOLD - 1; t < n; t++) {
+        above_total++;
+        if (memcmp(l_inc + (size_t)t * vocab, l_sk + (size_t)t * vocab,
+                   (size_t)vocab * sizeof(float)) != 0) above_diff++;
+    }
+    tt_assert(above_diff > 0,
+              "at seq >= %u split-K must actually change the bits (0 of %u "
+              "positions differ, so the split-K path never ran)",
+              SPLITK_GATE_THRESHOLD, above_total);
+
+    /* 3. The two paths must still AGREE. The metric is DELIBERATELY NOT this
+     *    file's bare per-element relative ratio: task P2.0 established (and
+     *    its reviewer independently confirmed against an all-double gold
+     *    reference) that such a ratio explodes on a logit that lands near zero
+     *    by cancellation, reporting a huge number for an error of one float
+     *    ULP. Two summation orders over the same keys is exactly the case that
+     *    triggers it. So this asserts what actually matters for a decode:
+     *
+     *      - identical argmax at every position (the token-level property),
+     *      - the worst ABSOLUTE logit delta is smaller than the SMALLEST
+     *        top1-top2 margin any position had, which is the M3.4 gate's
+     *        robustness argument: if the largest disagreement anywhere is
+     *        under the closest call anywhere, no position could have flipped,
+     *        so the argmax agreement above is not luck,
+     *      - the worst delta relative to the logit SCALE at its own position
+     *        (max |logit| there), reported and bounded, which is the
+     *        cancellation-proof version of the relative bar. */
+    uint32_t arg_mismatch = 0;
+    double worst_abs = 0.0, worst_scaled = 0.0, min_margin = INFINITY;
+    for (uint32_t t = 0; t < n; t++) {
+        if (a_inc[t] != a_sk[t]) arg_mismatch++;
+        const float *a = l_inc + (size_t)t * vocab, *b = l_sk + (size_t)t * vocab;
+        double scale = 0.0, top1 = -INFINITY, top2 = -INFINITY;
+        for (uint32_t i = 0; i < vocab; i++) {
+            double av = fabs((double)a[i]);
+            if (av > scale) scale = av;
+            if ((double)a[i] > top1) { top2 = top1; top1 = (double)a[i]; }
+            else if ((double)a[i] > top2) { top2 = (double)a[i]; }
+        }
+        if (scale < 1.0) scale = 1.0;
+        if (top1 - top2 < min_margin) min_margin = top1 - top2;
+        for (uint32_t i = 0; i < vocab; i++) {
+            double d = fabs((double)a[i] - (double)b[i]);
+            if (d > worst_abs) worst_abs = d;
+            if (d / scale > worst_scaled) worst_scaled = d / scale;
+        }
+    }
+    tt_assert(arg_mismatch == 0,
+              "split-K vs incumbent argmax differs at %u of %u positions",
+              arg_mismatch, n);
+    tt_assert(worst_abs < min_margin,
+              "worst |logit delta| %.3e must stay under the smallest top1-top2 "
+              "margin %.3e, or an argmax could flip", worst_abs, min_margin);
+    tt_assert(worst_scaled < 1e-4,
+              "split-K vs incumbent worst logit delta relative to the position's "
+              "logit scale is %.3e", worst_scaled);
+
+    /* 4. Determinism: every split-K rerun through a fresh state must be BIT
+     *    identical to the first, including the m/s/acc buffers being reused by
+     *    every layer and every step (a stale-buffer bug would show up as a
+     *    run-to-run difference, not as a wrong-looking number). memcmp rather
+     *    than float ==, per the P2.2 fix round: == calls a stable NaN a
+     *    mismatch and misses a +0.0/-0.0 flip, which are the two signals that
+     *    matter here. */
+    uint32_t det_diff = 0;
+    for (uint32_t r = 0; r < det_reps; r++) {
+        splitk_gate_run(&m, ids, n, "1", l_sk2, a_sk2);
+        for (uint32_t t = 0; t < n; t++) {
+            if (memcmp(l_sk + (size_t)t * vocab, l_sk2 + (size_t)t * vocab,
+                       (size_t)vocab * sizeof(float)) != 0) det_diff++;
+        }
+    }
+    tt_assert(det_diff == 0, "split-K decode reruns differ at %u of %u "
+              "(position, rerun) pairs over %u reruns", det_diff, n * det_reps,
+              det_reps);
+
+    fprintf(stderr, "   split-K decode: %u/%u positions differ from the incumbent "
+                    "above seq %u, 0 below; worst |delta| %.3e (scaled %.3e) vs "
+                    "min top1-top2 margin %.3e; argmax %u/%u agree; %u rerun(s) "
+                    "byte-identical at %u/%u positions\n",
+            above_diff, above_total, SPLITK_GATE_THRESHOLD, worst_abs, worst_scaled,
+            min_margin, n - arg_mismatch, n, det_reps, n * det_reps - det_diff,
+            n * det_reps);
+
+    unsetenv("SURGE_ATTN_SPLITK");
+    free(a_sk2); free(a_sk); free(a_inc);
+    free(l_sk2); free(l_sk); free(l_inc);
+    free(ids);
+    sg_model_free(&m);
+    sg_gguf_close(gg);
+    free(seed);
+}
+
 /* Q8_0 now loads on the Metal path (M3.2+M3.3). This env-guarded check wants
  * a real Q8_0 gguf, loads it, and greedily decodes a few tokens, asserting the
  * outputs are valid (in-vocab, finite logits) and NOT degenerate (not the same
@@ -373,6 +587,9 @@ int main(void) {
      * default ever changes back. */
     setenv("SURGE_KV_DTYPE", "f16", 1);
     tt_run("mini_f16_kv_decode_coherent", mini_f16_kv_decode_coherent);
+    /* P2.3: the split-K decode wiring, which only exists on the f16 path. */
+    tt_run("mini_f16_splitk_decode_matches_incumbent",
+           mini_f16_splitk_decode_matches_incumbent);
     unsetenv("SURGE_KV_DTYPE");
 
     fprintf(stderr, "worst relative logit gap vs ref: %.3e\n", g_worst_rel);

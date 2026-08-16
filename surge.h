@@ -798,9 +798,14 @@ sg_err sg_gpu_run_attn_prefill(sg_gpu *g, void *q, void *k, void *v, void *out,
  * heads only 32 of the 80 GPU cores are scheduled and one threadgroup walks the
  * whole 262,144-key sequence. Split-K makes the grid n_heads x n_splits.
  *
- * NOT WIRED INTO DECODE. sg_gpu_forward's attention still calls
- * k_attn_decode_f16; these two are reachable only through the entry points
- * here and their per-op test, until their GPU gates pass.
+ * WIRED INTO DECODE (Task P2.3, after the P2.2 gates passed on hardware).
+ * sg_gpu_forward's attention now dispatches this PAIR, by hand, inside its one
+ * open command buffer, whenever the fp16 KV path is live and the sequence is at
+ * least SG_TG * 4 == 1024 keys; below that, and on the f32 KV path, and with
+ * SURGE_ATTN_SPLITK=0, it dispatches the incumbent k_attn_decode_f16 as before.
+ * The entry points here are still the per-op test's oracles and are unchanged;
+ * the decode path does NOT call them (they commit and wait, which is exactly
+ * what a batched encoder must not do).
  *
  * PARTITIONING is sg_ref_attn_decode_splitk's rule verbatim: split i covers
  * [i*seq/n_splits, (i+1)*seq/n_splits), integer division in 64-bit. It tiles
@@ -835,9 +840,20 @@ sg_err sg_gpu_run_attn_prefill(sg_gpu *g, void *q, void *k, void *v, void *out,
  * per lane, so a split shorter than 256 keys leaves lanes idle: at seq 200 with
  * n_splits 257 the per-split length is 1 and 255 of 256 lanes do nothing.
  * Roughly n_splits <= seq / SG_TG keeps every lane fed, and above that the
- * split count buys threadgroups at the cost of lanes. Whoever picks a default
- * n_splits when this is wired into decode needs that bound and a measurement,
- * not just the grid arithmetic; no split-K kernel has been timed yet.
+ * split count buys threadgroups at the cost of lanes.
+ *
+ * THE MEASURED DEFAULT (Task P2.3a's sweep, `make bench-splitk`), which the
+ * decode path uses: n_splits = clamp(seq / SG_TG, 4, 1024). Sweeping n_splits
+ * over {1..1024} at seq 8192 / 32768 / 131072 / 262144, on both the real 27B
+ * decode shape (24 heads, 4 kv, head_dim 256) and the real 4B dense shape (32
+ * heads, 8 kv, head_dim 128), the fastest value was EXACTLY seq / SG_TG in all
+ * eight cells (32, 128, 512, 1024 respectively), i.e. the top of this band:
+ * give every split exactly SG_TG keys so no lane idles. At 262144 the pair beat
+ * k_attn_decode_f16 by 15.9x on the 27B shape and 21.9x on the 4B shape. Below
+ * seq 1024 the floor of that clamp is what binds instead of seq / SG_TG, so the
+ * splits fall under SG_TG keys and the closed form stops being the measured
+ * optimum; the decode path keeps the incumbent kernel there rather than
+ * extrapolating below the shortest sequence that was measured.
  *
  * ONE params ARRAY SERVES BOTH CALLS: [0]=n_heads [1]=n_kv_heads [2]=head_dim
  * [3]=seq [4]=q_stride [5]=softmax scale bits (f32 bit pattern) [6]=n_splits
@@ -961,6 +977,19 @@ sg_err sg_gpu_run_rmsnorm_gated_chunk(sg_gpu *g, void *y, void *z, void *out, vo
  * 64-token decode. (The f16 path additionally inherits sg_kv's own cap
  * ceiling, SG_KV_CAP_MAX == 262144, which matches this project's 256K
  * target and so is not a practical limit here.)
+ *
+ * The DECODE-STEP ATTENTION KERNEL is chosen by the SURGE_ATTN_SPLITK env var,
+ * also read at sg_gpu_state_new time (Task P2.3). Default 1: sg_gpu_forward
+ * dispatches the split-K pair (k_attn_decode_splitk_partial +
+ * k_attn_decode_splitk_combine) with the measured
+ * n_splits = clamp(seq / SG_TG, 4, 1024), for every step whose sequence has
+ * reached SG_TG * 4 == 1024 keys. SURGE_ATTN_SPLITK=0 pins the incumbent
+ * k_attn_decode_f16 for every step, which is what an A/B measurement of the two
+ * needs; the f32 KV path always uses the incumbent, since the split-K kernels
+ * read half-typed K/V. The two kernels partition the sum over keys differently,
+ * so they agree to float rounding, not bit for bit: expect the same generated
+ * token ids, not the same logit bits. Each choice is independently
+ * deterministic (rerunning either one reproduces its own logits exactly).
  *
  * Order of use: sg_gpu_init -> sg_gpu_load_model -> sg_gpu_state_new ->
  * sg_gpu_forward per token with pos = 0, 1, 2, ... A second sequence needs

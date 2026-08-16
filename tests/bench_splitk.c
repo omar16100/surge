@@ -125,8 +125,15 @@
  * Purely additive: no kernel, no metal.m entry point, no sg_ref_*, no
  * existing gate is touched by this file.
  *
- * Usage: tests/bench_splitk.bin [--reps N] [-h|--help]
+ * Usage: tests/bench_splitk.bin [--reps N] [--seqs A,B,C] [-h|--help]
  *   (built and run together by `make bench-splitk`; see the Makefile.)
+ *
+ * --seqs was added by task P2.3 to sweep sequence lengths the default list
+ * does not reach. That list starts at 8192, but decode has to decide what to
+ * do BELOW it, where the n_splits = clamp(seq/SG_TG, 4, 1024) closed form
+ * stops handing each split a full SG_TG keys; a threshold there should be
+ * measured like the rest of the curve rather than argued from the grid
+ * arithmetic. The default sweep is unchanged when the flag is absent.
  */
 #ifdef SURGE_NO_METAL
 
@@ -239,6 +246,11 @@ static const shape_t SHAPES[] = {
 
 static const uint32_t SEQS[] = { 8192u, 32768u, 131072u, 262144u };
 #define N_SEQS ((int)(sizeof SEQS / sizeof SEQS[0]))
+
+/* Cap on a --seqs list (P2.3). A fixed stack array rather than a malloc: the
+ * list is typed by hand on a command line, so a couple of dozen entries is
+ * already far more than anyone will pass, and a bounded buffer cannot leak. */
+#define MAX_SEQS 32
 
 static const uint32_t SPLITS[] = { 1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024 };
 #define N_SPLITS ((int)(sizeof SPLITS / sizeof SPLITS[0]))
@@ -390,7 +402,8 @@ static void print_skip_ns(const char *shape, uint32_t seq, uint32_t ns, const ch
  * incumbent once, and sweep the clamped, deduped n_splits list.
  * -------------------------------------------------------------------- */
 
-static void run_shape(sg_gpu *g, const shape_t *sh, int reps) {
+static void run_shape(sg_gpu *g, const shape_t *sh, int reps,
+                      const uint32_t *seqs, int n_seqs) {
     char err[256];
     uint32_t q_stride = sh->head_dim;   /* dense; see file header */
 
@@ -427,8 +440,8 @@ static void run_shape(sg_gpu *g, const shape_t *sh, int reps) {
 
     float scale = (float)(1.0 / sqrt((double)sh->head_dim));
 
-    for (int si = 0; si < N_SEQS; si++) {
-        uint32_t seq = SEQS[si];
+    for (int si = 0; si < n_seqs; si++) {
+        uint32_t seq = seqs[si];
         uint64_t kv_elems = (uint64_t)seq * sh->n_kv * sh->head_dim;
         uint64_t kv_bytes_each = kv_elems * sizeof(uint16_t);
 
@@ -539,14 +552,23 @@ static void run_shape(sg_gpu *g, const shape_t *sh, int reps) {
 
 static void usage(const char *prog) {
     fprintf(stderr,
-        "usage: %s [--reps N] [-h|--help]\n"
-        "  --reps N   timed repetitions per (shape, n_splits), after 1 discarded\n"
-        "             warm-up call (default %d)\n",
-        prog, DEFAULT_REPS);
+        "usage: %s [--reps N] [--seqs A,B,C] [-h|--help]\n"
+        "  --reps N     timed repetitions per (shape, n_splits), after 1 discarded\n"
+        "               warm-up call (default %d)\n"
+        "  --seqs LIST  comma-separated sequence lengths to sweep instead of the\n"
+        "               default %d..%d (at most %d of them, each >= 1). Added by\n"
+        "               task P2.3 to measure the SHORT-sequence end of the curve,\n"
+        "               which the default list (>= 8192) does not reach and which\n"
+        "               decode's fallback threshold depends on.\n",
+        prog, DEFAULT_REPS, (int)SEQS[0], (int)SEQS[N_SEQS - 1], MAX_SEQS);
 }
 
 int main(int argc, char **argv) {
     int reps = DEFAULT_REPS;
+    const uint32_t *seqs = SEQS;
+    int n_seqs = N_SEQS;
+    uint32_t seq_buf[MAX_SEQS];
+
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--reps") == 0 && i + 1 < argc) {
             long v = strtol(argv[++i], NULL, 10);
@@ -555,6 +577,35 @@ int main(int argc, char **argv) {
                 return 2;
             }
             reps = (int)v;
+        } else if (strcmp(argv[i], "--seqs") == 0 && i + 1 < argc) {
+            const char *list = argv[++i];
+            int n = 0;
+            const char *p = list;
+            while (*p) {
+                char *end = NULL;
+                long v = strtol(p, &end, 10);
+                if (end == p || v < 1 || v > (long)UINT32_MAX) {
+                    fprintf(stderr, "bad --seqs value: %s\n", list);
+                    return 2;
+                }
+                if (n == MAX_SEQS) {
+                    fprintf(stderr, "--seqs takes at most %d values\n", MAX_SEQS);
+                    return 2;
+                }
+                seq_buf[n++] = (uint32_t)v;
+                p = end;
+                if (*p == ',') p++;
+                else if (*p != '\0') {
+                    fprintf(stderr, "bad --seqs value: %s\n", list);
+                    return 2;
+                }
+            }
+            if (n == 0) {
+                fprintf(stderr, "--seqs needs at least one value\n");
+                return 2;
+            }
+            seqs = seq_buf;
+            n_seqs = n;
         } else if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
             usage(argv[0]);
             return 0;
@@ -582,7 +633,7 @@ int main(int argc, char **argv) {
     fflush(stdout);
 
     for (int i = 0; i < N_SHAPES; i++) {
-        run_shape(g, &SHAPES[i], reps);
+        run_shape(g, &SHAPES[i], reps, seqs, n_seqs);
     }
 
     sg_gpu_free(g);

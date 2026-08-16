@@ -1366,13 +1366,18 @@ kernel void k_rmsnorm_gated_chunk(device const float *y  [[buffer(0)]],
  * past seq/256 keeps adding threadgroups whose lanes are mostly idle, and past
  * seq it adds threadgroups that do nothing but write the empty encoding. At
  * seq 262,144 that upper bound is 1024 splits, so the interesting range is
- * wide, but it IS bounded. Whoever picks a default n_splits when this is wired
- * into decode needs a measurement inside that band, not just the grid
- * arithmetic; nothing here has been timed.
+ * wide, but it IS bounded.
  *
- * NOT WIRED INTO THE DECODE PATH. enc_attn / enc_attn_f16 still dispatch
- * k_attn_decode_f16; switching decode over happens only once these have
- * passed their GPU gates. */
+ * THE MEASUREMENT WAS TAKEN (P2.3a, `make bench-splitk`): the fastest n_splits
+ * was exactly seq / SG_TG at every seq and both real shapes tested, i.e. the
+ * TOP of that band, giving each split exactly SG_TG keys. So the decode path
+ * uses n_splits = clamp(seq / SG_TG, 4, 1024).
+ *
+ * WIRED INTO THE DECODE PATH (P2.3). enc_attn's fp16 branch dispatches this
+ * pair through metal.m's enc_attn_splitk once seq reaches SG_TG * 4 == 1024,
+ * and the incumbent k_attn_decode_f16 below that (where the clamp's floor
+ * would force splits shorter than SG_TG keys), on the f32 KV path, and under
+ * SURGE_ATTN_SPLITK=0. */
 
 /* ref.c's attn_combine_weight in f32 (src/ref.c, above sg_ref_attn_combine),
  * including the reason for the equality test: mi == M means the weight is

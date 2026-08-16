@@ -1,26 +1,27 @@
 # Surge M0-M2 Tasks
 
-## WIP: split-K decode attention (P2.x) -- NOT COMPLETE, NOT VERIFIED ON GPU
+## Split-K decode attention (P2.x): COMPLETE AND GATED ON GPU
 
-Flagged 2026-08-16 when this branch was pushed. Everything under Task P2.0 through P2.3a
-below is work in progress and must not be read as finished:
+This banner was raised on 2026-08-16 to flag P2.0-P2.3a as unverified while the GPU was
+held. It is superseded, on the same day, by the GPU gates actually running:
 
 | Task | State |
 |---|---|
 | P2.0 split-K combine math (`sg_ref_attn_combine`) | CPU-gated, done |
 | P2.1 split-K decode-attention oracle | CPU-gated, done |
-| P2.2 Metal split-K kernels | **UNVERIFIED**, no GPU gate has been run |
-| P2.3a split-K timing harness (`make bench-splitk`) | **built, NO TIMINGS MEASURED** |
+| P2.2 Metal split-K kernels | **GATED ON HARDWARE**, worst rel 1.027e-06 vs BOTH oracles, 100x byte-identical |
+| P2.3a split-K timing harness (`make bench-splitk`) | **MEASURED**: 15.9x (27B shape) and 21.9x (4B shape) at seq 262144 |
+| P2.3 wiring into the decode path | **DONE AND GATED**, see Task P2.3 Results at the end of this file |
 
-What that means concretely: the CPU oracles (P2.0, P2.1) are proven and can be trusted.
-The Metal kernels (P2.2) have never been executed against those oracles on real hardware,
-and the timing harness (P2.3a) has never produced a number. No claim about split-K being
-faster than the incumbent has been measured, only hypothesised. The commits themselves say
-so in their subject lines ("UNVERIFIED pending GPU gates", "NO TIMINGS MEASURED"); this
-table exists so the status is visible from the top of the file rather than only in git log.
-
-Next step when the GPU is free: `make bench-splitk`, then the P2.2 correctness gate against
-the P2.1 oracle.
+What that means concretely: the CPU oracles (P2.0, P2.1) are proven; the Metal kernels
+(P2.2) have now been executed against both of them on real hardware and matched; the
+timing harness (P2.3a) has produced numbers, and they decided the design; and the decode
+path (P2.3) now dispatches split-K with `n_splits = clamp(seq / SG_TG, 4, 1024)`, keeping
+`k_attn_decode_f16` below seq 1024 where split-K was MEASURED to be slower. Every gate and
+its measured output is at the end of this file under "Task P2.3 Results" and in
+`docs/16082026_splitk_decode_gate.md`. The P2.0-P2.3a commit subject lines still say
+"UNVERIFIED pending GPU gates" and "NO TIMINGS MEASURED": those were accurate when written
+and are left alone rather than rewritten; this table is where the current status lives.
 
 
 ## 2026-08-15 - B8 rationale correction + overshoot fix (branch `fix/prefill-duty-cycle-overshoot`)
@@ -2512,3 +2513,83 @@ downstream of all of that, whether split-K beats the incumbent anywhere in the s
 range -- which is the entire question this task exists to make answerable, not to answer.
 **Run command once the GPU frees:** `make bench-splitk` (or `./tests/bench_splitk.bin
 --reps N` after building, to change the rep count).
+
+## Task P2.3 Results (metal.m: wire split-K into the decode path)
+
+`enc_attn`'s fp16 branch now dispatches `k_attn_decode_splitk_partial` +
+`k_attn_decode_splitk_combine` (new `enc_attn_splitk` helper, hand-rolled 2D grid because
+`gpu_grid` cannot carry two group dimensions) inside `sg_gpu_forward`'s ONE open command
+buffer, instead of `k_attn_decode_f16`. No wait between the two dispatches:
+`MTLDispatchTypeSerial` is the barrier, which is exactly what the one-shot entry points
+had to buy with a commit-and-wait.
+
+**Split count:** `n_splits = clamp(seq / SG_TG, 4, 1024)`, the P2.3a MEASURED optimum (the
+top of the occupancy band: every split gets exactly SG_TG = 256 keys). Re-measured at seq
+32768 on 2026-08-16: 27B shape 15193.45 us -> 1393.00 us = 10.907x, 4B dense shape
+13783.10 us -> 1035.20 us = 13.314x, and the closed form's 128 was the best n_splits for
+both shapes in that run.
+
+**Fallback policy (MEASURED, not extrapolated):** below seq 1024 (`SG_TG * 4`, where the
+clamp's floor starts binding and splits fall under SG_TG keys) decode keeps the incumbent.
+Added `--seqs` to `tests/bench_splitk.c` to measure the crossover the default sweep (>=
+8192) cannot reach: at seq 256 split-K is 0.710x / 0.689x (a REGRESSION), at 512 it is
+1.021x / 0.948x (a wash), at 1024 it is 1.880x / 1.272x, and it climbs from there
+(4096: 3.43x / 3.23x, 8192: 5.23x / 5.22x). `SURGE_ATTN_SPLITK=0` pins the incumbent for
+every step, which is what makes the A/B possible and why that kernel is kept reachable;
+the f32-KV path always uses it (split-K reads half-typed K/V).
+
+**The shared-scratch hazard, closed structurally, not by comment:** the partial binds the
+DEDICATED `g->splitk_scratch` (P2.2 fix round 1) and `enc_attn_splitk` contains no
+`g->scratch` reference at all; and `splitk_scratch` plus the m/s/acc partial buffers are
+sized ONCE in `sg_gpu_state_new` from `max_ctx` (bound:
+`n_splits*ceil(seq/n_splits) <= seq + n_splits - 1`, with `n_splits` nondecreasing in
+`seq`), so nothing allocates, grows or releases a buffer mid-encode. The m/s/acc buffers
+are shared across layers and steps, safe for the same serial-dispatch reason `g->b_ctx`
+already is.
+
+**GATES, all RUN (GPU confirmed free before each):**
+1. `make check` exit 0, **85319 checks, 0 failures** (baseline at the parent commit
+   1fcebb0: 85306; the 13 new checks are the split-K decode subtest). The brief's 84874
+   figure predates commits 8d23004/a9e9f6e/41174e9.
+2. `make debug` (SURGE_NO_METAL, ASan/UBSan) exit 0, **83953 checks, 0 failures, 0
+   sanitizer diagnostics**, the IDENTICAL count to a clean `git worktree` at the parent
+   commit (measured, not assumed).
+3. **Prefill unchanged.** No prefill symbol appears in the diff (`enc_attn_prefill`,
+   `enc_gdn_prefill`, `sg_gpu_prefill`, `k_attn_prefill` have zero diff hits;
+   `src/kernels.metal`'s only change is a comment block). `test_gpu_prefill` 146 checks 0
+   failures with worst prefill-vs-serial gap **1.222e-06**, digit-for-digit the M5.6
+   number; `test_cli_prefill` 11 cases byte-identical; real 4B prefill vs `--no-prefill`
+   gen_ids **BYTE-IDENTICAL** at a 3199-token prompt (the serial side uses split-K above
+   pos 1023); and real 4B prefill wall time 39.502 s (split-K) vs 39.508 s (incumbent).
+4. **Byte-exact greedy on the real 4B dense GGUF.** gen_ids identical across the
+   PRE-CHANGE binary, the new binary with split-K, and the new binary with
+   `SURGE_ATTN_SPLITK=0`, at a 3199-token prompt (32 generated) and again at a
+   32825-token prompt (64 generated, three runs).
+5. **100x determinism:** `SURGE_SPLITK_DET_REPS=100 ./tests/test_gpu_fwd.bin` ->
+   **160000/160000 (position, rerun) pairs byte-identical** over 100 reruns of a
+   1600-position decode with split-K live. Kernel-level 100x (m/s/acc/out) still green in
+   `make check`.
+6. **A/B at depth**, real 4B, same binary and prompt, only the env var changed:
+   3199 tokens 14.80 -> **41.08 tok/s** (2.78x); 32825 tokens 1.74 -> **17.12 tok/s**
+   (9.8x), with a later thermally-clamped repeat at 7.40 tok/s (4.3x). The spread is the
+   M3 firmware clock clamp, not the kernels (prefill throughput fell 28.86 -> 13.92 tok/s
+   across the three consecutive runs with prefill code untouched); the thermally matched
+   number is the same-run kernel A/B above.
+7. `-Wall -Wextra -Werror` clean (the whole build runs under it; plus `clang
+   -fsyntax-only -Werror` on `src/metal.m` and on `tests/bench_splitk.c` in both its
+   Metal and `-DSURGE_NO_METAL` forms).
+
+**New committed regression gate** `mini_f16_splitk_decode_matches_incumbent`
+(`tests/test_gpu_fwd.c`), 1600 positions on the mini hybrid fixture: 0 positions differ
+BELOW seq 1024 (both modes run the same kernel there) and 577/577 differ AT OR ABOVE it,
+which pins the switch to exactly the documented threshold and makes the rest non-vacuous;
+worst absolute logit delta **9.537e-07** against the smallest top1-top2 margin
+**1.385e-03** (a 145x margin, so no argmax could have flipped), argmax 1600/1600.
+MUTATION-PROVED: forcing `splitk_use` to 0 fails it ("0 of 577 positions differ, so the
+split-K path never ran"); swapping the partial's grid axes fails it (worst delta 4.035e-01,
+27 of 1600 argmaxes wrong). N = 1600 was chosen so `n_splits` (6) differs from the
+fixture's `n_heads` (4), because a swapped axis is invisible when those are equal.
+
+Docs: `docs/16082026_splitk_decode_gate.md` (new, registered in `docs/index.md`),
+`docs/c4model.md` decode data flow + status. Report:
+`.superpowers/sdd/2026-08-09-surge-m3-m5/task-P2.3-report.md`.

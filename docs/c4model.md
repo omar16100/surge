@@ -58,7 +58,10 @@ optionally Accelerate for the CPU reference path. No third-party libraries.
   layer, one command buffer: RMSNorm, projections (matvec), qk-norm + partial RoPE, KV
   append (fp16 by default: q/k-norm and RoPE run in an f32 scratch, then `k_kv_store_f16`
   casts into `sg_kv`'s per-layer half buffers; `SURGE_KV_DTYPE=f32` keeps the original
-  path), attention decode (full-attn layers, `k_attn_decode_f16` or `k_attn_decode`) or
+  path), attention decode (full-attn layers: since Task P2.3 the SPLIT-K PAIR
+  `k_attn_decode_splitk_partial` + `k_attn_decode_splitk_combine` once the sequence
+  reaches 1024 keys, `k_attn_decode_f16` below that and under `SURGE_ATTN_SPLITK=0`, and
+  `k_attn_decode` on the f32-KV path) or
   conv-step + delta-step (DeltaNet layers), output gate, residuals; final norm + lm_head
   -> logits -> host argmax -> next token. Byte-exact GREEDY TOKENS to the CPU reference at
   temp 0 (M2 gate, oracle is the f32-KV path); fp16 KV adds ~1e-6 logit noise on the
@@ -450,9 +453,36 @@ optionally Accelerate for the CPU reference path. No third-party libraries.
     links against the real Metal frameworks at all, and every timing number, achieved-GB/s
     figure and speedup ratio the harness will print. Full report:
     `.superpowers/sdd/2026-08-09-surge-m3-m5/task-P2.3a-report.md`.
-- **Not built:** M4 (kernel excellence / beat mlx-lm; Task P2.2's split-K decode-attention
-  Metal kernels are WRITTEN but UNGATED, Task P2.3a's timing harness for them is WRITTEN
-  but UNMEASURED, and nothing dispatches them from the decode path yet), the dense-qwen3
+  - Task P2.3a MEASURED + Task P2.3 (`src/metal.m` + `surge.h` + `src/kernels.metal`
+    comments + `tests/test_gpu_fwd.c` + `tests/bench_splitk.c`): split-K is now the
+    DECODE PATH's attention. The P2.3a sweep ran once the GPU freed and settled the
+    decision: at seq 262144 the pair beats `k_attn_decode_f16` by 15.9x on the 27B decode
+    shape and 21.9x on the 4B dense shape, and the fastest `n_splits` was exactly
+    `seq / SG_TG` at every measured cell, so the wired default is the closed form
+    `n_splits = clamp(seq / SG_TG, 4, 1024)` (the top of the occupancy band: every split
+    gets exactly SG_TG keys). `enc_attn`'s fp16 branch calls the new `enc_attn_splitk`,
+    which encodes the partial (hand-rolled 2D grid, x = split, y = head, since `gpu_grid`
+    cannot carry two group dimensions) and then the combine into the SAME open command
+    buffer, relying on `MTLDispatchTypeSerial`'s implicit inter-dispatch barrier instead
+    of the one-shots' commit-and-wait. FALLBACK: below seq 1024 (`SG_TG * 4`, the point
+    where the clamp's floor starts binding and splits fall under SG_TG keys) decode keeps
+    `k_attn_decode_f16`, and a `--seqs` sweep added to `tests/bench_splitk.c` MEASURED that
+    crossover rather than assuming it (at seq 256 split-K is 0.69-0.71x, i.e. slower; at
+    512 it is 0.95-1.02x; at 1024 it is 1.27-1.88x and rising). `SURGE_ATTN_SPLITK=0` pins
+    the incumbent, which is what makes the A/B measurable and why that kernel stays
+    reachable; the f32-KV path always uses it (the split-K kernels read half-typed K/V).
+    THE SCRATCH HAZARD IS STRUCTURALLY CLOSED: the partial binds the DEDICATED
+    `sg_gpu.splitk_scratch` (P2.2 review finding 1), never the shared `g->scratch` that
+    the same encoder binds for other kernels, and the m/s/acc partial buffers plus that
+    scratch are sized ONCE in `sg_gpu_state_new` from `max_ctx` (using
+    `n_splits * ceil(seq/n_splits) <= seq + n_splits - 1`), so nothing allocates or grows
+    mid-encode. Prefill is untouched (`k_attn_prefill`, `enc_attn_prefill`,
+    `enc_gdn_prefill`, `sg_gpu_prefill` have zero diff hits). Full report and every
+    measured gate: `.superpowers/sdd/2026-08-09-surge-m3-m5/task-P2.3-report.md`, gate
+    doc `docs/16082026_splitk_decode_gate.md`.
+- **Not built:** the rest of M4 (kernel excellence / beat mlx-lm; split-K decode attention
+  is now shipped and gated, but the GQA-shared threadgroup, online softmax and the prefill
+  kernels' own optimization are not), the dense-qwen3
   GPU forward's own numeric gate (P1 is loader-only; deferred until the GPU is free),
   server mode, non-Metal platforms, MoE, continuous batching, sampling beyond
   greedy/temp/top-p/top-k.

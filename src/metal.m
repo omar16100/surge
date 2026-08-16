@@ -307,6 +307,31 @@ struct sg_gpu {
      * writes straight into L->kv there, as before). */
     void *b_k32, *b_v32;
 
+    /* --- Task P2.3: split-K decode attention ---
+     * Read from SURGE_ATTN_SPLITK at the last sg_gpu_state_new call. true (the
+     * default) makes enc_attn's fp16 branch dispatch the
+     * k_attn_decode_splitk_partial + _combine PAIR instead of the incumbent
+     * single-threadgroup-per-head k_attn_decode_f16, once the sequence is long
+     * enough (see splitk_n_splits). false pins the incumbent, which is what the
+     * A/B measurement needs and why the incumbent stays reachable rather than
+     * being deleted. Always false on the f32 KV path: the split-K kernels read
+     * half-typed separate K and V buffers, which only the fp16 cache has. */
+    bool attn_splitk;
+    /* The largest n_splits any decode step at this max_ctx can ask for, i.e.
+     * splitk_n_splits(max_ctx). n_splits is nondecreasing in seq and seq is
+     * capped at max_ctx, so the three buffers below and g->splitk_scratch can
+     * be sized ONCE here and never grown from inside an open command buffer. */
+    uint32_t splitk_max_splits;
+    /* The per-(head, split) partial triples: m, s are [n_heads, n_splits] and
+     * acc is [n_heads, n_splits, head_dim], all f32, allocated for
+     * splitk_max_splits. One set is shared by every full-attention layer in a
+     * forward, the same way g->b_ctx and g->scratch already are: dispatches in
+     * one encoder run in encode order with an implicit barrier between them
+     * (MTLDispatchTypeSerial), so a layer's combine has consumed these before
+     * the next layer's partial overwrites them. NULL unless the fp16 path
+     * allocated them. */
+    void *b_sk_m, *b_sk_s, *b_sk_acc;
+
     /* --- Task B8: prefill duty-cycle (yields the GPU between chunks) ---
      * Set by sg_gpu_set_prefill_rest; both 0 (the calloc default in
      * sg_gpu_init) means DISABLED, i.e. sg_gpu_prefill never sleeps and its
@@ -1009,6 +1034,66 @@ static sg_err splitk_scratch_ensure(sg_gpu *g, uint64_t nbytes) {
     g->splitk_scratch = nb;
     g->splitk_scratch_bytes = nbytes;
     return SG_OK;
+}
+
+/* =====================================================================
+ * P2.3: the decode path's split-K policy
+ * =====================================================================
+ *
+ * n_splits = clamp(seq / SG_TG, 4, 1024). This is MEASURED (task P2.3a, run
+ * with `make bench-splitk` on this machine), not a guess: sweeping n_splits
+ * over {1..1024} at seq 8192 / 32768 / 131072 / 262144 on both the real 27B
+ * decode shape (24 heads, 4 kv, head_dim 256) and the real 4B dense shape (32
+ * heads, 8 kv, head_dim 128), the fastest n_splits was EXACTLY seq / SG_TG in
+ * every one of those eight cells (8192 -> 32, 32768 -> 128, 131072 -> 512,
+ * 262144 -> 1024), i.e. hand every split exactly SG_TG keys so every lane of
+ * the threadgroup gets one. That is the top of the occupancy band documented
+ * on k_attn_decode_splitk_partial (n_heads*n_splits >= GPU cores from below,
+ * n_splits <= seq/SG_TG from above), so the closed form and the band agree.
+ * At 262144 the pair beat k_attn_decode_f16 by 15.9x (27B shape) and 21.9x
+ * (4B shape).
+ *
+ * The 1024 ceiling is the band's own upper bound at SG_KV_CAP_MAX == 262144
+ * (262144/256), so it only ever binds for a hypothetical longer context; the
+ * 4 floor is the band's lower bound.
+ *
+ * SHORT SEQUENCES KEEP THE INCUMBENT (splitk_use returns 0 below
+ * SG_SPLITK_MIN_SEQ). Under seq == SG_TG * SG_SPLITK_MIN == 1024 the floor is
+ * what binds, not seq / SG_TG, so the splits come out SHORTER than SG_TG keys
+ * and the partial's lanes start idling: the closed form stops being the
+ * measured optimum and becomes an extrapolation below the shortest sequence
+ * P2.3a measured (8192). The threshold is therefore exactly the point where
+ * the clamp's floor stops binding, not a tuned constant, and below it decode
+ * runs the incumbent k_attn_decode_f16 it has always run. */
+#define SG_SPLITK_MIN 4u
+#define SG_SPLITK_MAX 1024u
+#define SG_SPLITK_MIN_SEQ (SG_TG * SG_SPLITK_MIN)
+
+/* The closed form, clamped into the occupancy band. Nondecreasing in seq
+ * (floor division is, and clamping preserves that), which is what lets
+ * sg_gpu_state_new size every split-K buffer once from max_ctx. */
+static uint32_t splitk_n_splits(uint32_t seq) {
+    uint32_t n = seq / SG_TG;
+    if (n < SG_SPLITK_MIN) n = SG_SPLITK_MIN;
+    if (n > SG_SPLITK_MAX) n = SG_SPLITK_MAX;
+    return n;
+}
+
+/* The n_splits this decode step should use, or 0 meaning "dispatch the
+ * incumbent k_attn_decode_f16 instead". Zero is returned when the policy is
+ * off (SURGE_ATTN_SPLITK=0, or the f32 KV path, which has no half-typed K/V
+ * for these kernels to read), when the sequence is below the threshold above,
+ * or when any of the three partial buffers is missing -- the last is
+ * defensive: sg_gpu_state_new allocates them together with the fp16 cache, so
+ * a NULL here means an allocation path changed, and falling back to a kernel
+ * that is known to work beats dispatching against a nil buffer. */
+static uint32_t splitk_use(const sg_gpu *g, uint32_t seq) {
+    if (!g->attn_splitk) return 0;
+    if (seq < SG_SPLITK_MIN_SEQ) return 0;
+    if (!g->b_sk_m || !g->b_sk_s || !g->b_sk_acc || !g->splitk_scratch) return 0;
+    uint32_t n = splitk_n_splits(seq);
+    if (n > g->splitk_max_splits) return 0;   /* sized from max_ctx; cannot happen */
+    return n;
 }
 
 sg_err sg_gpu_run_op(sg_gpu *g, const char *kernel, void *a, void *b, void *out,
@@ -2159,6 +2244,76 @@ static void enc_attn_f16(sg_enc *E, void *q, void *k, void *v, void *out,
       threadsPerThreadgroup:MTLSizeMake(SG_TG, 1, 1)];
 }
 
+/* Task P2.3: k_attn_decode_splitk_partial THEN k_attn_decode_splitk_combine
+ * into an already-open encoder, the batched twin of the
+ * sg_gpu_run_attn_splitk_partial / _combine one-shot pair. It replaces the
+ * enc_attn_f16 call above when splitk_use says so; both write the same
+ * [n_heads, head_dim] attention output into the same handle, so nothing
+ * downstream of it changes.
+ *
+ * TWO DISPATCHES, ONE ENCODER, NO WAIT BETWEEN THEM. The default dispatch type
+ * is MTLDispatchTypeSerial (stated at sg_gpu_forward's encoder), so the
+ * combine cannot start before the partial has finished writing m/s/acc. This
+ * is the whole point of the task: the pair used to be two commit-and-waits.
+ *
+ * THE SCRATCH HAZARD, HANDLED STRUCTURALLY. The partial binds
+ * g->splitk_scratch (buffer 7), the DEDICATED allocation P2.2's fix round
+ * added, never the process-wide g->scratch that k_attn_decode,
+ * k_attn_decode_f16, k_attn_prefill and this same encoder all bind at offset
+ * 0. That matters exactly here and only here: this is the first dispatch of
+ * the partial from INSIDE an open command buffer that also carries other
+ * scratch users, and g->scratch is grown, never partitioned, so the two would
+ * be addressing the same bytes. There is no g->scratch reference anywhere in
+ * this function, by construction rather than by rule.
+ *
+ * BUFFER SIZING IS DONE BEFORE THE COMMAND BUFFER OPENS. m, s, acc and
+ * splitk_scratch are all allocated in sg_gpu_state_new for the worst case at
+ * max_ctx (see splitk_max_splits), and splitk_use refuses to run if any of
+ * them is missing, so nothing here can allocate, grow or release a buffer
+ * mid-encode. The three are shared by every full-attention layer in the
+ * forward, which is safe for the same serial-dispatch reason as above.
+ *
+ * `p` must carry the same 8 params the one-shots take, with p[6] = n_splits;
+ * the buffer indices below are k_attn_decode_splitk_partial's and _combine's
+ * own signatures in kernels.metal. */
+static void enc_attn_splitk(sg_enc *E, void *q, void *k, void *v, void *out,
+                            const uint32_t *p) {
+    sg_gpu *g = E->g;
+    id<MTLComputeCommandEncoder> e = E->enc;
+    NSUInteger n_heads = (NSUInteger)p[0], n_splits = (NSUInteger)p[6];
+
+    /* The partial: q=0, kc=1, vc=2, m=3, s=4, acc=5, params=6, scores=7. */
+    [e setComputePipelineState:g->pipes[KI_ATTN_SPLITK_PARTIAL]];
+    [e setBuffer:bufof(q) offset:(NSUInteger)offof(q) atIndex:0];
+    [e setBuffer:bufof(k) offset:(NSUInteger)offof(k) atIndex:1];
+    [e setBuffer:bufof(v) offset:(NSUInteger)offof(v) atIndex:2];
+    [e setBuffer:bufof(g->b_sk_m) offset:(NSUInteger)offof(g->b_sk_m) atIndex:3];
+    [e setBuffer:bufof(g->b_sk_s) offset:(NSUInteger)offof(g->b_sk_s) atIndex:4];
+    [e setBuffer:bufof(g->b_sk_acc) offset:(NSUInteger)offof(g->b_sk_acc) atIndex:5];
+    [e setBytes:p length:8 * sizeof(uint32_t) atIndex:6];
+    [e setBuffer:g->splitk_scratch offset:0 atIndex:7];
+    /* SG_K_HEADS2D: x = split, y = query head, matching the kernel's tg.x /
+     * tg.y. gpu_grid's (groups, elems) pair cannot carry two group dimensions
+     * (it says so at its default case), so this is computed here by hand, the
+     * same way enc_matmul does it for SG_K_TILES2D and the one-shot partial
+     * does it for this kernel. Threads per threadgroup stay exactly SG_TG,
+     * which is the width the fixed tg_max/tg_sum fold trees are shaped for. */
+    [e dispatchThreadgroups:MTLSizeMake(n_splits, n_heads, 1)
+      threadsPerThreadgroup:MTLSizeMake(SG_TG, 1, 1)];
+
+    /* The combine: m=0, s=1, acc=2, out=3, params=4. One threadgroup per query
+     * head, a plain 1D grid, and the SAME params array (it reads only [0], [2]
+     * and [6]). */
+    [e setComputePipelineState:g->pipes[KI_ATTN_SPLITK_COMBINE]];
+    [e setBuffer:bufof(g->b_sk_m) offset:(NSUInteger)offof(g->b_sk_m) atIndex:0];
+    [e setBuffer:bufof(g->b_sk_s) offset:(NSUInteger)offof(g->b_sk_s) atIndex:1];
+    [e setBuffer:bufof(g->b_sk_acc) offset:(NSUInteger)offof(g->b_sk_acc) atIndex:2];
+    [e setBuffer:bufof(out) offset:(NSUInteger)offof(out) atIndex:3];
+    [e setBytes:p length:8 * sizeof(uint32_t) atIndex:4];
+    [e dispatchThreadgroups:MTLSizeMake(n_heads, 1, 1)
+      threadsPerThreadgroup:MTLSizeMake(SG_TG, 1, 1)];
+}
+
 /* One tiled-GEMM (M5.3) dispatch into an already-open encoder, the batched
  * analog of enc_op for a KI_MATMUL_* kernel. Buffer order is (X, W, Y) -- the
  * REVERSE of the matvec kernels enc_op drives -- so `x` is the [N, K]
@@ -2267,8 +2422,22 @@ static void enc_attn(sg_enc *E, sg_gpu_layer *L, uint32_t layer_idx, uint32_t po
         enc_kv_store(E, g->b_k32, kbuf, (uint64_t)pos * g->kv_width, g->kv_width);
         enc_kv_store(E, g->b_v32, vbuf, (uint64_t)pos * g->kv_width, g->kv_width);
 
-        enc_attn_f16(E, g->b_qg, kbuf, vbuf, g->b_ctx,
-                     PARAMS(c->n_heads, c->n_kv_heads, hd, used, q_stride, fbits(scale)));
+        /* Task P2.3: the split-K pair when the sequence is long enough for it
+         * (splitk_use returns the measured n_splits, or 0), the incumbent
+         * single-threadgroup-per-head kernel otherwise. Both produce the same
+         * [n_heads, head_dim] output in g->b_ctx; they differ in how the sum
+         * over keys is PARTITIONED, so the two paths agree to float rounding
+         * rather than bit for bit, exactly as sg_ref_attn_decode_splitk agrees
+         * with sg_ref_attn_decode. */
+        uint32_t n_splits = splitk_use(g, used);
+        if (n_splits != 0) {
+            enc_attn_splitk(E, g->b_qg, kbuf, vbuf, g->b_ctx,
+                            PARAMS(c->n_heads, c->n_kv_heads, hd, used, q_stride,
+                                   fbits(scale), n_splits));
+        } else {
+            enc_attn_f16(E, g->b_qg, kbuf, vbuf, g->b_ctx,
+                         PARAMS(c->n_heads, c->n_kv_heads, hd, used, q_stride, fbits(scale)));
+        }
     }
 
     /* The output gate is a sigmoid applied before o_proj -- same for both
@@ -2603,6 +2772,14 @@ static void gpu_free_state(sg_gpu *g) {
     sg_gpu_buf_free(g->b_k32); g->b_k32 = NULL;
     sg_gpu_buf_free(g->b_v32); g->b_v32 = NULL;
 
+    /* P2.3: the split-K partial triples, sized from max_ctx like everything
+     * else in the state. */
+    sg_gpu_buf_free(g->b_sk_m); g->b_sk_m = NULL;
+    sg_gpu_buf_free(g->b_sk_s); g->b_sk_s = NULL;
+    sg_gpu_buf_free(g->b_sk_acc); g->b_sk_acc = NULL;
+    g->splitk_max_splits = 0;
+    g->attn_splitk = false;
+
     void *shared[] = { g->b_x, g->b_h, g->b_r, g->b_qg, g->b_ctx, g->b_ffg,
                        g->b_ffu, g->b_qkv, g->b_ab, g->b_gates, g->b_y,
                        g->b_cs, g->b_logits };
@@ -2621,6 +2798,13 @@ static void gpu_free_state(sg_gpu *g) {
     [g->scratch release];
     g->scratch = nil;
     g->scratch_bytes = 0;
+    /* P2.3: the split-K score scratch is now sized from max_ctx too (see
+     * sg_gpu_state_new), so it belongs to the state for exactly the reason
+     * stated above, and is released with it. splitk_scratch_ensure regrows it
+     * on demand for the one-shot entry points. */
+    [g->splitk_scratch release];
+    g->splitk_scratch = nil;
+    g->splitk_scratch_bytes = 0;
 }
 
 static void gpu_unload(sg_gpu *g) {
@@ -2898,6 +3082,26 @@ sg_err sg_gpu_state_new(sg_gpu *g, const sg_model *m, uint32_t max_ctx) {
     g->kv_dtype = kv_dtype;
     fprintf(stderr, "gpu: KV cache dtype = %s\n", kv_dtype == SG_T_F16 ? "f16" : "f32");
 
+    /* Task P2.3: SURGE_ATTN_SPLITK selects the decode-step attention kernel.
+     * Default ON (the P2.3a sweep measured 15.9x on the 27B decode shape and
+     * 21.9x on the 4B dense shape at seq 262144), "0" pins the incumbent
+     * k_attn_decode_f16 -- which is what makes the A/B measurable and is the
+     * reason that kernel is kept reachable. Unrecognized values warn and keep
+     * the default rather than picking one silently, matching SURGE_KV_DTYPE
+     * just above. Forced off on the f32 KV path: the split-K kernels read
+     * half-typed SEPARATE K and V buffers, which only the fp16 cache has, and
+     * the f32 path is deliberately frozen at its pre-M5.2 shape anyway. */
+    const char *sk_env = getenv("SURGE_ATTN_SPLITK");
+    bool splitk_on = true;
+    if (sk_env && strcmp(sk_env, "0") == 0) {
+        splitk_on = false;
+    } else if (sk_env && sk_env[0] != '\0' && strcmp(sk_env, "1") != 0) {
+        fprintf(stderr, "gpu: SURGE_ATTN_SPLITK='%s' not recognized (want 0 or 1); "
+                        "using 1\n", sk_env);
+    }
+    g->attn_splitk = splitk_on && kv_dtype == SG_T_F16;
+    g->splitk_max_splits = 0;
+
     uint64_t half = 0;
     if (kv_dtype == SG_T_F32) {
         /* k_attn_decode's v_cache offset is a uint32 param, so the K half of
@@ -2947,6 +3151,27 @@ sg_err sg_gpu_state_new(sg_gpu *g, const sg_model *m, uint32_t max_ctx) {
              * per-layer half buffers. */
             SHARED(b_k32, g->kv_width);
             SHARED(b_v32, g->kv_width);
+
+            /* Task P2.3: the split-K decode-attention buffers. Sized ONCE,
+             * here, for the worst case this state can ever reach (n_splits is
+             * nondecreasing in seq and seq <= max_ctx), so enc_attn_splitk can
+             * never need to allocate or grow anything from inside an open
+             * command buffer.
+             *
+             * The scratch bound: the partial's score rows are
+             * n_heads * n_splits * ceil(seq/n_splits) floats, and
+             * n_splits * ceil(seq/n_splits) <= seq + n_splits - 1 for every
+             * seq, so n_heads * (max_ctx + splitk_max_splits) floats covers
+             * every step at this max_ctx with room to spare. It is asked for
+             * through splitk_scratch_ensure, the DEDICATED allocator (P2.2
+             * review finding 1), never scratch_ensure. */
+            g->splitk_max_splits = splitk_n_splits(max_ctx);
+            SHARED(b_sk_m, (uint64_t)c->n_heads * g->splitk_max_splits);
+            SHARED(b_sk_s, (uint64_t)c->n_heads * g->splitk_max_splits);
+            SHARED(b_sk_acc, (uint64_t)c->n_heads * g->splitk_max_splits * c->head_dim);
+            e = splitk_scratch_ensure(g, ((uint64_t)max_ctx + g->splitk_max_splits)
+                                             * c->n_heads * 4);
+            if (sg_failed(e)) { gpu_free_state(g); return e; }
         }
     }
     if (n_gdn > 0) {

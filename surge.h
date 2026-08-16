@@ -1018,21 +1018,47 @@ sg_err sg_gpu_prefill(sg_gpu *g, const sg_model *m, const int32_t *tokens,
                       const float **out_last_logits);
 
 /* ---------------------------------------------------------------------
- * Prefill duty-cycle: firmware GPU-clamp mitigation (Task B8)
+ * Prefill duty-cycle: keeping the compositor alive (Task B8)
  * ---------------------------------------------------------------------
  *
- * The Mac Studio M3's firmware GPU limiter clamps the GPU clock to 338 MHz
- * after roughly 3-4 minutes of SUSTAINED load and only releases back to full
- * clock after 60-120s of IDLE. sg_gpu_prefill normally submits one chunk
- * command buffer after another with no gap, so on a long enough prefill the
- * GPU never idles, the clamp never lifts, and a later chunk stalls under it.
+ * sg_gpu_prefill normally submits one chunk command buffer after another with
+ * no gap, so on a long prefill the GPU never idles. Nothing else on the machine
+ * that needs the GPU gets a turn, including WindowServer.
  *
- * sg_gpu_set_prefill_rest arms a duty cycle on `g`: sg_gpu_prefill accumulates
- * the GPU-busy wall time of each chunk (commit..waitUntilCompleted), and once
- * that accumulated time reaches work_budget_ms -- provided at least one chunk
- * still remains -- sleeps rest_ms with NO command buffer in flight, so the GPU
- * goes genuinely idle and the firmware limiter can recover, then resumes and
+ * WHY THIS EXISTS (corrected 2026-08-15). B8 was originally justified as dodging a
+ * Mac Studio M3 firmware GPU limiter believed to clamp to 338 MHz after 3-4 minutes of
+ * sustained load. Telemetry from the 30-hour 256K run does not support that: clock is
+ * FLAT across a burst (early bursts 712/723/716/710/701 MHz at t+0/30/60/90/120s, late
+ * bursts 573/591/590/591/588, constant bin counts), rest length does not predict the
+ * next burst's clock (r = +0.017 over 376 burst pairs), and 338 MHz appears in 27 of
+ * 7724 loaded samples. Clock tracks CONTEXT LENGTH (r = -0.575), set at burst start,
+ * which is long-context prefill becoming memory-bandwidth bound.
+ *
+ * The rest is still needed, for a different reason: a saturated GPU starves the
+ * compositor. WindowServer was watchdog-killed twice on 2026-08-14, taking the GUI
+ * session with it, while surge-bench held the GPU. Yielding periodically is what
+ * prevents that. See docs/15082026_prefill_duty_cycle_plan.md.
+ *
+ * sg_gpu_set_prefill_rest arms a duty cycle on `g`. The budget test is
+ * PREDICTIVE: sg_gpu_prefill rests when the accumulated GPU-busy time plus an
+ * ESTIMATE of the next chunk's (the previous chunk's time scaled by
+ * PF_EST_MARGIN) would cross work_budget_ms, rather than after it already has.
+ * Testing after the fact let a burst run to budget plus one whole chunk, and
+ * chunk cost grows with context: 367 of 367 bursts in the 2026-08-14 256K run
+ * overran a 150 s budget, median 199.5 s, worst 332.9 s.
+ *
+ * sg_gpu_prefill accumulates the wall time of each chunk's
+ * commit..waitUntilCompleted span, and once that accumulated time PLUS the
+ * estimate above would reach work_budget_ms -- provided at least one chunk still
+ * remains -- sleeps rest_ms with NO command buffer in flight, so the GPU goes
+ * genuinely idle and anything else needing the GPU can run, then resumes and
  * resets the accumulator.
+ *
+ * Note that span is WALL time, not GPU-busy time. On a contended GPU it also
+ * counts time other processes held the device, so the accumulator inflates and
+ * the duty cycle rests more often than the work alone warrants. That errs
+ * toward yielding, which is the safe direction here, but it means budget values
+ * tuned on an idle machine do not transfer directly to a busy one.
  *
  * DISABLED is the default (both fields 0 from sg_gpu_init's calloc) and is
  * also what either argument being 0 selects: no accumulator ever crosses
@@ -1054,6 +1080,41 @@ sg_err sg_gpu_prefill(sg_gpu *g, const sg_model *m, const int32_t *tokens,
  * in their reported throughput. */
 void sg_gpu_set_prefill_rest(sg_gpu *g, uint32_t work_budget_ms, uint32_t rest_ms);
 uint64_t sg_gpu_prefill_rest_ms(const sg_gpu *g);
+
+/*
+ * sg_gpu_set_prefill_max_burst sets a TARGET ceiling, in milliseconds, for how
+ * long any one prefill command buffer holds the GPU. 0 (the default) disables
+ * it: one command buffer per chunk, exactly as before.
+ *
+ * A target, not a cap, and not a promise of a single overrun. The check is
+ * reactive: each overrunning submission runs in full and only then halves the
+ * segment, so a 64-layer sweep can overrun at 64, then 32, then 16, converging
+ * over up to log2(layers) overruns rather than stopping after one. A segment
+ * already at the 1-layer floor cannot shrink further and will keep overrunning.
+ * Pick a ceiling well under the watchdog window so the overruns along the way
+ * still land inside it.
+ *
+ * Separate mechanism from the duty-cycle rest, for a problem the rest cannot
+ * reach. The rest yields the GPU between chunks; it cannot help once a single
+ * chunk's command buffer runs longer than macOS lets WindowServer go without
+ * rendering (80 s). At 220k context one 256-token chunk measured ~130 s, and
+ * WindowServer was watchdog-killed twice on 2026-08-14. When a submission
+ * overruns the ceiling, the layer sweep is split across more command buffers.
+ *
+ * Cannot change computed output. Command buffer boundaries carry no state: the
+ * same kernels run with the same arguments in the same order, and buffers
+ * committed in sequence on one queue execute in order. This is why the split
+ * may adapt mid-run, which changing `chunk` could not safely do.
+ */
+void sg_gpu_set_prefill_max_burst(sg_gpu *g, uint32_t max_burst_ms);
+
+/*
+ * Command buffers submitted by the most recent sg_gpu_prefill call, reset at
+ * the start of every call. With segmentation off this equals the chunk count.
+ * Exposed so a test can prove segmentation engaged, rather than asserting
+ * output parity against a run where nothing actually split.
+ */
+uint64_t sg_gpu_prefill_segments(const sg_gpu *g);
 
 /* ---------------------------------------------------------------------
  * Standalone KV-cache + DeltaNet-state module (Task M5.1, src/kv.c)
@@ -1224,7 +1285,11 @@ typedef struct {
                                  * own now_s()..now_s() span around the
                                  * decode loop, independent of the per-token
                                  * t_wall_cum series used for the slope fit. */
-    double prefill_rest_s;     /* Task B8: total time slept for the firmware
+    /* Command buffers the prefill submitted. Equals the chunk count unless
+     * --prefill-max-burst-ms split the layer sweep. Reported so a run's log
+     * shows whether segmentation engaged. */
+    unsigned long long prefill_segments;
+    double prefill_rest_s;     /* Task B8: total time slept by the duty cycle
                                  * GPU-clamp duty cycle, seconds, INCLUDED in
                                  * prefill_wall_s (a subset of it, not
                                  * additional). 0 when the feature is disabled

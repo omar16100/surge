@@ -358,8 +358,22 @@ static void prefill_rest_reset_on_error(void) {
                       "chunk=1, work_budget=1ms, rest=5ms) reported 0ms slept",
                       n_ids);
 
+            /* Same first-mutation contract for the segment counter. Review
+             * caught this reset sitting far later in the function, past every
+             * validation branch, so an early-failing call reported a prior
+             * call's count. */
+            uint64_t seg1 = sg_gpu_prefill_segments(g_gpu);
+            tt_assert(seg1 > 0, "b8: a successful prefill reported 0 command "
+                      "buffers submitted");
+
             e = sg_gpu_prefill(g_gpu, &m, ids, 0, 1, &lg);
             tt_assert(sg_failed(e), "b8: n_tokens==0 should be rejected, was accepted");
+            uint64_t seg2 = sg_gpu_prefill_segments(g_gpu);
+            tt_assert(seg2 == 0, "b8: a FAILED prefill call (n_tokens==0, "
+                      "rejected before the chunk loop) reported a stale segment "
+                      "count (%llu) carried over from the PRIOR successful call "
+                      "(%llu) instead of resetting to 0",
+                      (unsigned long long)seg2, (unsigned long long)seg1);
             uint64_t rest2 = sg_gpu_prefill_rest_ms(g_gpu);
             tt_assert(rest2 == 0, "b8: a FAILED prefill call (n_tokens==0, "
                       "rejected before the chunk loop) reported stale rest "

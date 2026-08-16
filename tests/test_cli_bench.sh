@@ -604,9 +604,62 @@ else
     fi
 fi
 
+# ------------------------------------------------------------------
+# Command-buffer segmentation (--prefill-max-burst-ms).
+#
+# The duty-cycle rest can only yield the GPU BETWEEN chunks. It cannot help
+# once ONE chunk's command buffer outlasts the macOS watchdog window on its
+# own, which is what killed WindowServer twice on 2026-08-14 (~130 s for a
+# single 256-token chunk at 220k context). Segmentation splits the layer
+# sweep across several command buffers so no single submission holds the GPU
+# that long.
+#
+# The safety claim is that this CANNOT change output: command buffer
+# boundaries carry no state, so the same kernels run with the same arguments
+# in the same order. Two things are checked, because either alone is weak:
+#
+#   (1) gen_ids with segmentation on must equal gen_ids with it off, over an
+#       uneven chunk schedule (12 tokens at --chunk 5 gives 5,5,2) so the
+#       final short chunk and the logits-carrying final segment are both
+#       exercised.
+#   (2) prefill_segments must actually GO UP. Without this the parity check
+#       would pass vacuously if segmentation silently never engaged, which is
+#       the failure mode that makes a "cannot change output" test worthless.
+# ------------------------------------------------------------------
+SEG_CHUNK=5            # 12 tokens -> 5,5,2, so the last chunk is short
+SEG_BURST_MS=1         # low enough that every command buffer overruns it
+
+ncase=$((ncase + 1))
+seg_off_json="$(mktemp)"; seg_on_json="$(mktemp)"
+seg_off="$("$BENCH" "$GGUF" --ids "$IDS12" -n 16 --max-ctx 512 --chunk "$SEG_CHUNK" \
+    --gemm-gate-tflops 100 --quiet --json "$seg_off_json" 2>/dev/null | sed -n 's/^gen_ids: //p')"
+seg_on="$("$BENCH" "$GGUF" --ids "$IDS12" -n 16 --max-ctx 512 --chunk "$SEG_CHUNK" \
+    --prefill-max-burst-ms "$SEG_BURST_MS" \
+    --gemm-gate-tflops 100 --quiet --json "$seg_on_json" 2>/dev/null | sed -n 's/^gen_ids: //p')"
+seg_n_off="$(sed -n 's/.*"prefill_segments":\([0-9]*\).*/\1/p' "$seg_off_json")"
+seg_n_on="$(sed -n 's/.*"prefill_segments":\([0-9]*\).*/\1/p' "$seg_on_json")"
+rm -f "$seg_off_json" "$seg_on_json"
+
+if [ -z "$seg_off" ] || [ -z "$seg_on" ]; then
+    echo "FAIL seg segmentation-doesnt-change-output: empty gen_ids (off='$seg_off' on='$seg_on')" >&2
+    fail=1
+elif [ "$seg_off" != "$seg_on" ]; then
+    echo "FAIL seg segmentation-doesnt-change-output: segmented gen_ids != unsegmented" >&2
+    echo "  off: $seg_off" >&2
+    echo "  on : $seg_on" >&2
+    fail=1
+elif [ -z "$seg_n_off" ] || [ -z "$seg_n_on" ] || [ "$seg_n_on" -le "$seg_n_off" ]; then
+    echo "FAIL seg segmentation-engaged: prefill_segments did not rise " \
+         "(off='$seg_n_off' on='$seg_n_on'); the parity check above was vacuous" >&2
+    fail=1
+else
+    echo "  ok seg segmentation-doesnt-change-output: gen_ids=$seg_on " \
+         "(command buffers $seg_n_off -> $seg_n_on)" >&2
+fi
+
 if [ "$fail" -ne 0 ]; then
     echo "test_cli_bench: FAILED ($ncase cases)" >&2
     exit 1
 fi
-echo "test_cli_bench: $ncase cases passed (gen_ids parity, VOID/exit-3, admit, $b6_label, B8 duty-cycle)" >&2
+echo "test_cli_bench: $ncase cases passed (gen_ids parity, VOID/exit-3, admit, $b6_label, B8 duty-cycle, segmentation)" >&2
 exit 0

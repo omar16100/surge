@@ -156,6 +156,7 @@ void sg_bench_format_json(const sg_bench_row *row, char *buf, size_t cap) {
         "\"decode_tps_slope\":%.6g,\"decode_tps_avg\":%.6g,"
         "\"prefill_wall_s\":%.6g,\"decode_wall_s\":%.6g,"
         "\"prefill_rest_s\":%.6g,\"prefill_compute_tps\":%.6g,"
+        "\"prefill_segments\":%llu,"
         "\"peak_ram_gib\":%.6g,\"gpu_alloc_gib\":%.6g,"
         "\"recall_hits\":%u,\"recall_total\":%u,\"assoc_hits\":%u,"
         "\"n_prompt_tok\":%llu,\"n_gen\":%u,\"wall_s\":%.6g,"
@@ -165,6 +166,7 @@ void sg_bench_format_json(const sg_bench_row *row, char *buf, size_t cap) {
         row->decode_tps_slope, row->decode_tps_avg,
         row->prefill_wall_s, row->decode_wall_s,
         row->prefill_rest_s, row->prefill_compute_tps,
+        (unsigned long long)row->prefill_segments,
         row->peak_ram_gib, row->gpu_alloc_gib,
         row->recall_hits, row->recall_total, row->assoc_hits,
         (unsigned long long)row->n_prompt_tok, row->n_gen, row->wall_s,

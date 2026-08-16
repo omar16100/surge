@@ -12,9 +12,13 @@
  * PREFILL DUTY-CYCLE (Task B8): --prefill-work-ms W and --prefill-rest-ms R
  * (both must be > 0 to take effect) arm sg_gpu_set_prefill_rest before the
  * prefill call, so sg_gpu_prefill sleeps R ms (GPU fully idle) after every
- * W ms of accumulated chunk GPU-busy time -- the fix for the Mac Studio M3
- * firmware GPU limiter, which clamps the clock after ~3-4 min of continuous
- * load and only recovers after 60-120s idle. Duty-cycling is pure timing
+ * W ms of accumulated chunk GPU-busy time. This yields the GPU so the
+ * compositor keeps rendering; a saturated GPU got WindowServer watchdog-killed
+ * twice on 2026-08-14, taking the GUI session down with it. (It was originally
+ * justified as dodging a firmware clock clamp; the telemetry does not support
+ * that, see surge.h.) Pair it with --prefill-max-burst-ms at long context,
+ * where ONE chunk can outlast the watchdog window on its own and no amount of
+ * resting BETWEEN chunks helps. Duty-cycling is pure timing
  * (see surge.h); it does not change gen_ids, only wall time. The JSON's
  * prefill_wall_s stays the TOTAL span (rests included, as always);
  * prefill_rest_s is the slept subset of it, and prefill_compute_tps =
@@ -99,7 +103,13 @@ static void usage(void) {
         "  --prefill-work-ms W   duty-cycle work budget before a rest (needs\n"
         "                        --prefill-rest-ms too; 0/unset = disabled)\n"
         "  --prefill-rest-ms R   duty-cycle idle sleep, ms, once W ms of GPU work\n"
-        "                        has accumulated (firmware GPU-clamp mitigation)\n"
+        "                        has accumulated (yields the GPU between chunks)\n"
+        "  --prefill-max-burst-ms M  target for how long ONE prefill command\n"
+        "                        buffer holds the GPU; splits the layer sweep after\n"
+        "                        a submission overruns it (0/unset = disabled).\n"
+        "                        Reactive, so the first overrun still happens in\n"
+        "                        full: set it well under 80000, past which macOS\n"
+        "                        watchdog-kills WindowServer\n"
         "  --engine STR      engine label for the row (default \"surge\")\n"
         "  --model STR       model label for the row (default: basename of path)\n"
         "  --log-id STR      log id recorded in the JSON\n"
@@ -230,7 +240,7 @@ int main(int argc, char **argv) {
     const char *json_path = NULL, *ts_path = NULL;
     uint32_t n_gen = 300, max_ctx_arg = 0, chunk_size = SG_PREFILL_CHUNK_DEFAULT;
     uint32_t warmup_arg = 0;
-    uint32_t prefill_work_ms = 0, prefill_rest_ms = 0;
+    uint32_t prefill_work_ms = 0, prefill_rest_ms = 0, prefill_max_burst_ms = 0;
     bool has_warmup = false, no_prefill = false, quiet = false;
     uint64_t expect_min = 0, expect_max = 0;
     bool has_expect_min = false, has_expect_max = false;
@@ -271,6 +281,7 @@ int main(int argc, char **argv) {
         else if (strcmp(argv[i], "--chunk") == 0) PARSE_U32("--chunk", chunk_size);
         else if (strcmp(argv[i], "--no-prefill") == 0) no_prefill = true;
         else if (strcmp(argv[i], "--prefill-work-ms") == 0) PARSE_U32("--prefill-work-ms", prefill_work_ms);
+        else if (strcmp(argv[i], "--prefill-max-burst-ms") == 0) PARSE_U32("--prefill-max-burst-ms", prefill_max_burst_ms);
         else if (strcmp(argv[i], "--prefill-rest-ms") == 0) PARSE_U32("--prefill-rest-ms", prefill_rest_ms);
         else if (strcmp(argv[i], "--engine") == 0) { NEED_VALUE("--engine"); engine = argv[++i]; }
         else if (strcmp(argv[i], "--model") == 0) { NEED_VALUE("--model"); model_name = argv[++i]; }
@@ -463,11 +474,22 @@ int main(int argc, char **argv) {
     /* ---- prefill ---- */
     /* Task B8: only armed when BOTH are > 0 (sg_gpu_set_prefill_rest's own
      * disabled rule); harmless to call unconditionally otherwise, since
-     * --no-prefill's serial sg_gpu_forward loop never reads these fields. */
+     * --no-prefill's serial sg_gpu_forward loop never reads these fields.
+     * Purpose is compositor protection, not the firmware clamp this was
+     * originally written for; see the note on sg_gpu_set_prefill_rest. */
     if (prefill_work_ms > 0 && prefill_rest_ms > 0) {
         sg_gpu_set_prefill_rest(gpu, prefill_work_ms, prefill_rest_ms);
         if (!quiet) fprintf(stderr, "  prefill duty-cycle: work-budget %u ms, "
                             "rest %u ms\n", prefill_work_ms, prefill_rest_ms);
+    }
+    /* Bounds a SINGLE command buffer, which the duty-cycle rest cannot: the
+     * rest only yields between chunks, and one chunk at long context outlasts
+     * the watchdog window on its own. Independent of the rest, so armed
+     * separately. */
+    if (prefill_max_burst_ms > 0) {
+        sg_gpu_set_prefill_max_burst(gpu, prefill_max_burst_ms);
+        if (!quiet) fprintf(stderr, "  prefill max burst: %u ms per command "
+                            "buffer\n", prefill_max_burst_ms);
     }
     const float *lg = NULL;
     double t_run_start = now_s();
@@ -492,6 +514,7 @@ int main(int argc, char **argv) {
      * entirely); prefill_compute_tps excludes it from the throughput
      * denominator, the fair full-clock number under duty-cycling. */
     row.prefill_rest_s = (!no_prefill) ? (double)sg_gpu_prefill_rest_ms(gpu) / 1000.0 : 0.0;
+    row.prefill_segments = (!no_prefill) ? sg_gpu_prefill_segments(gpu) : 0;
     double prefill_compute_wall = row.prefill_wall_s - row.prefill_rest_s;
     row.prefill_compute_tps = (prefill_compute_wall > 0.0)
         ? (double)n_ids / prefill_compute_wall : -1.0;

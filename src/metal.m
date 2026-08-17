@@ -381,7 +381,13 @@ struct sg_gpu {
      * counts exposes them so the gate can assert WHICH kernel ran, the way
      * P2.3's wiring subtest asserted the threshold. Reset by sg_gpu_state_new
      * and by gpu_free_state; they count ENCODER dispatches only, never the
-     * one-shot entry points. */
+     * one-shot entry points.
+     *
+     * P2.7: with the switch ON, BOTH counters are expected to be nonzero over a
+     * run that starts short, because the threadgroup floor in splitk_gqa_use
+     * declines the GQA kernel until the grid is big enough. The split between
+     * them is exactly where that floor sits, which is what makes them a
+     * two-sided gate on the floor itself and not only on the selection. */
     uint64_t splitk_partial_dispatches;
     uint64_t splitk_gqa_dispatches;
     /* The largest n_splits any decode step at this max_ctx can ask for, i.e.
@@ -1199,29 +1205,78 @@ static uint32_t splitk_use(const sg_gpu *g, uint32_t seq) {
  *     shrinks the grid by `repeat`.
  * Both real shapes sit inside the band (27B 24/4 = 6, 4B dense 32/8 = 4).
  *
- * WHAT IS NOT DECIDED HERE, on purpose: there is no threadgroup-count floor.
- * The GQA grid is `repeat` times smaller than the per-head one (at seq 1024 on
- * the 27B shape that is 4 kv * 4 splits = 16 threadgroups against 96, on a
- * machine with 80 GPU cores), so a crossover like P2.3's seq-1024 one probably
- * exists. Inventing a threshold without the measurement is exactly what P2.3's
- * gate doc refused to do, so the switch stays off until bench_splitk --gqa has
- * been run and the crossover is a table rather than an argument. */
-static bool splitk_gqa_use(const sg_gpu *g, uint32_t n_heads, uint32_t n_kv) {
+ * AND THE GRID MUST STILL FILL THE MACHINE (task P2.7). Collapsing `repeat`
+ * per-head threadgroups into one DIVIDES THE GRID BY `repeat`, so at short
+ * context the GQA kernel trades redundant traffic for an idle GPU and loses.
+ * The floor below is on the THREADGROUP COUNT the dispatch will actually have,
+ * splitk_gqa_n_splits(seq, cap) * n_kv (computed here through the same two
+ * functions enc_attn_splitk dispatches with, never restated), because that is
+ * the quantity that starves; it is NOT on seq, and the measurement says so.
+ *
+ * MEASURED 2026-08-17, `./tests/bench_splitk.bin --reps 20` both arms, 3
+ * alternating rounds, GPU idle-checked. Speedup is per-head time / GQA time at
+ * the split count the decode policy would dispatch, so below 1.000 the GQA
+ * kernel is the wrong choice. Median of the 3 rounds, by threadgroup count:
+ *
+ *   threadgroups     32    40    48    56    64    80    96   112   128   256   512
+ *   27B 24h/4kv   0.938 0.867 0.980 0.971 0.990 0.988 1.025 1.110 1.148 1.248     -
+ *   4B  32h/8kv       -     -     -     - 0.975 0.925 0.975 1.008 1.004 1.056 1.182
+ *
+ * THE 4B SHAPE IS THE BINDING ONE: it still loses at 96 threadgroups (0.975,
+ * and 0.974 in a second study of 6 rounds at --reps 50) and only reaches parity
+ * at 128 (1.004 in both studies). The 27B crosses earlier (0.956 at 80, 1.040
+ * at 96 in that second study) because repeat 6 and head_dim 256 save more
+ * traffic per threadgroup given up. 128 is the smallest floor that leaves NO
+ * measured loss inside the GQA region on EITHER shape: the crossover is
+ * bracketed in (112, 128] for the 4B and (80, 96] for the 27B, and this takes
+ * the higher of the two rather than a floor that scales with `repeat`, which
+ * two `repeat` values do not justify and which would extrapolate to 64
+ * threadgroups -- below this machine's 80 GPU cores -- at repeat 8. It costs
+ * the 27B its measured 1.03x and 1.11x at 96 and 112 threadgroups (seq 6144 and
+ * 7168), deliberately: a wrong-way error there is a slowdown, and this switch
+ * exists to be flippable without one.
+ *
+ * A SEQ THRESHOLD WOULD NOT FIT. The same crossovers in seq are 5120..6144 (27B)
+ * and 3072..4096 (4B): 1.7x apart, and in the OPPOSITE order from the
+ * threadgroup view, because the 4B has twice the kv heads. So one seq threshold
+ * must either admit the 27B's 0.956 at seq 5120 or reject the 4B's wins from
+ * 4096 up, while one threadgroup threshold separates all 20 measured points.
+ * See docs/17082026_splitk_gqa_threadgroups.md for the full table and the
+ * per-round numbers. */
+#define SG_SPLITK_GQA_MIN_TG 128u  /* measured occupancy floor, see above */
+
+/* P2.7 needs the DISPATCHED split count inside splitk_gqa_use, and the two
+ * functions that produce it belong to the P2.5/P2.6 sections below (moving them
+ * up here would separate splitk_gqa_n_splits from the measured table that
+ * justifies it). Declared, not restated: the guard must see the same grid the
+ * dispatch will use, or it guards a shape that never runs. */
+static uint32_t splitk_gqa_n_splits(uint32_t seq, uint32_t cap);
+static uint32_t splitk_gqa_cap_of(const sg_gpu *g);
+
+static bool splitk_gqa_use(const sg_gpu *g, uint32_t n_heads, uint32_t n_kv,
+                           uint32_t seq) {
     if (!g->attn_splitk_gqa) return false;
     if (n_kv == 0 || n_heads % n_kv != 0) return false;
     uint32_t repeat = n_heads / n_kv;
-    return repeat >= 2 && repeat <= SG_SPLITK_GQA_MAX;
+    if (repeat < 2 || repeat > SG_SPLITK_GQA_MAX) return false;
+    /* uint64_t so a caller's absurd n_kv cannot wrap the product into a pass. */
+    uint64_t tgs = (uint64_t)splitk_gqa_n_splits(seq, splitk_gqa_cap_of(g)) * n_kv;
+    return tgs >= SG_SPLITK_GQA_MIN_TG;
 }
 
 /* The same predicate, for the gate (P2.4 fix round 1, review finding I1/M4).
  * It CALLS splitk_gqa_use rather than restating it, so a test of the [2, 8]
- * band, of the repeat == 1 decline or of the not-a-multiple decline is a test of
- * the function the encoder actually consults, not of a copy that could drift
- * from it. Read-only; a NULL g answers false rather than crashing, since this is
- * reachable from a test harness. */
-bool sg_gpu_splitk_gqa_selected(const sg_gpu *g, uint32_t n_heads, uint32_t n_kv_heads) {
+ * band, of the repeat == 1 decline, of the not-a-multiple decline or of P2.7's
+ * threadgroup floor is a test of the function the encoder actually consults,
+ * not of a copy that could drift from it. Read-only; a NULL g answers false
+ * rather than crashing, since this is reachable from a test harness.
+ *
+ * P2.7 gave it `seq`, because the floor cannot be answered without one: the same
+ * shape is a GQA shape at depth and a per-head shape at short context. */
+bool sg_gpu_splitk_gqa_selected(const sg_gpu *g, uint32_t n_heads,
+                                uint32_t n_kv_heads, uint32_t seq) {
     if (!g) return false;
-    return splitk_gqa_use(g, n_heads, n_kv_heads);
+    return splitk_gqa_use(g, n_heads, n_kv_heads, seq);
 }
 
 /* What enc_attn_splitk actually encoded since the last sg_gpu_state_new, split
@@ -2606,8 +2661,13 @@ static void enc_attn_splitk(sg_enc *E, void *q, void *k, void *v, void *out,
      * element ONCE instead of once per query head sharing it; it writes the
      * same m/s/acc bytes into the same layout, so nothing else here (the
      * combine, the buffers, the scratch) changes with the choice. Off unless
-     * SURGE_ATTN_SPLITK_GQA=1 selects it; see splitk_gqa_use. */
-    bool gqa = splitk_gqa_use(g, p[0], p[1]);
+     * SURGE_ATTN_SPLITK_GQA=1 selects it; see splitk_gqa_use.
+     *
+     * P2.7: p[3] is seq, and the predicate needs it for the measured
+     * threadgroup floor, so the SAME step can pick the per-head partial early
+     * in a sequence and the GQA one later. That is why the two dispatch
+     * counters below are BOTH nonzero over a long run with the switch on. */
+    bool gqa = splitk_gqa_use(g, p[0], p[1], p[3]);
     NSUInteger rows = gqa ? (NSUInteger)p[1] : n_heads;
     /* Record WHICH kernel this dispatch is, for the gate (finding I1): the two
      * are contracted to produce the same bytes, so nothing downstream can tell

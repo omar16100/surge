@@ -941,11 +941,20 @@ sg_err sg_gpu_run_attn_splitk_partial_gqa(sg_gpu *g, void *q, void *k, void *v,
  * same hazard by asserting its threshold in both directions.
  *
  * sg_gpu_splitk_gqa_selected answers the POLICY question for a (n_heads,
- * n_kv_heads) pair by calling the same internal predicate the decode encoder
- * consults, so a test of the group band (2 to 8), of the repeat == 1 decline or
- * of the not-a-multiple decline tests the real rule rather than a copy of it. It
- * reflects the CURRENT state's SURGE_ATTN_SPLITK_GQA and KV dtype, so it answers
- * false for every shape while the switch is off. A NULL g answers false.
+ * n_kv_heads, seq) triple by calling the same internal predicate the decode
+ * encoder consults, so a test of the group band (2 to 8), of the repeat == 1
+ * decline, of the not-a-multiple decline or of P2.7's threadgroup floor tests
+ * the real rule rather than a copy of it. It reflects the CURRENT state's
+ * SURGE_ATTN_SPLITK_GQA, KV dtype and SURGE_SPLITK_GQA_CAP, so it answers false
+ * for every shape while the switch is off. A NULL g answers false.
+ *
+ * `seq` is required because the answer DEPENDS on it (task P2.7): the GQA kernel
+ * gives one threadgroup the whole GQA group, which divides the grid by `repeat`,
+ * and below a measured floor of 128 threadgroups
+ * (sg_gpu_splitk_gqa_n_splits_at(g, seq) * n_kv_heads) that costs more than the
+ * traffic it saves, so the same shape is selected at depth and declined at short
+ * context. Measured both ways on both real shapes; the table is in metal.m next
+ * to splitk_gqa_use and in docs/17082026_splitk_gqa_threadgroups.md.
  *
  * sg_gpu_splitk_dispatch_counts reports how many split-K partial dispatches
  * sg_gpu_forward has ENCODED since the last sg_gpu_state_new, split by kernel:
@@ -953,8 +962,10 @@ sg_err sg_gpu_run_attn_splitk_partial_gqa(sg_gpu *g, void *q, void *k, void *v,
  * k_attn_decode_splitk_partial_gqa. Steps below the split-K threshold dispatch
  * k_attn_decode_f16 and increment neither. The one-shot entry points above are
  * NOT counted; this is about what the decode path chose. Either pointer may be
- * NULL. */
-bool sg_gpu_splitk_gqa_selected(const sg_gpu *g, uint32_t n_heads, uint32_t n_kv_heads);
+ * NULL. With the GQA switch on, a run that starts short is EXPECTED to increment
+ * both, and where it stops incrementing `per_head` is where the P2.7 floor is. */
+bool sg_gpu_splitk_gqa_selected(const sg_gpu *g, uint32_t n_heads,
+                                uint32_t n_kv_heads, uint32_t seq);
 void sg_gpu_splitk_dispatch_counts(const sg_gpu *g, uint64_t *per_head, uint64_t *gqa);
 
 /* Task P2.5: the GQA partial's OWN split count, the diagnostic counterpart of

@@ -583,4 +583,207 @@ byte-identical at any fixed `n_splits` (P2.4, per-op and end to end), the GQA sp
 measured (P2.5, mean regret 0.43%), and where the policies diverge the greedy tokens still
 match, gated in `make check` and on a real model (P2.6). `attn_splitk_gqa` nevertheless still
 defaults to `false`: flipping it is an outward-facing change to a public engine and is the
-user's decision, which none of P2.4, P2.5 or P2.6 makes.
+user's decision, which none of P2.4, P2.5, P2.6 or P2.7 makes.
+
+## P2.7: the occupancy floor, so flipping the default cannot regress short context
+
+Task brief `.superpowers/sdd/2026-08-09-surge-m3-m5/task-P2.7-brief.md`, report
+`.superpowers/sdd/2026-08-09-surge-m3-m5/task-P2.7-report.md`. This closes the item every
+section above left open by name ("whether `splitk_gqa_use` needs a short-sequence
+threadgroup-count floor"). It does NOT flip the default.
+
+**The problem, measured.** The GQA kernel's whole trick is collapsing `repeat` query-head
+threadgroups into one, which divides the grid by `repeat`. At short context the collapsed grid
+no longer fills this machine's 80 GPU cores, and the kernel is SLOWER than the per-head one it
+replaces: at seq 2048 on the 27B shape the GQA grid is 8 splits x 4 kv = 32 threadgroups, and
+the measured speedup there is 0.918x to 0.938x. That is the same shape of crossover P2.3 found
+for split-K itself (slower than `k_attn_decode_f16` below seq 1024) and it was never guarded.
+
+### The rule
+
+```c
+#define SG_SPLITK_GQA_MIN_TG 128u
+/* in splitk_gqa_use, after the [2, 8] group-band checks: */
+uint64_t tgs = (uint64_t)splitk_gqa_n_splits(seq, splitk_gqa_cap_of(g)) * n_kv;
+return tgs >= SG_SPLITK_GQA_MIN_TG;
+```
+
+The floor is on the THREADGROUP COUNT the dispatch will actually have, not on `seq`, and it is
+computed by CALLING the same `splitk_gqa_n_splits` / `splitk_gqa_cap_of` pair
+`enc_attn_splitk` dispatches with, so the guard cannot guard a grid the encoder does not use
+(there is a `make check` assertion for exactly that mutation, below). `splitk_gqa_use` and its
+public diagnostic `sg_gpu_splitk_gqa_selected` both gained a `seq` parameter; the accessor
+still CALLS the predicate rather than restating it, as P2.4 and P2.5 established.
+
+### The measurement the 128 comes from
+
+`./tests/bench_splitk.bin --reps 20 --seqs 2048,2560,3072,3584,4096,5120,6144,7168,8192,16384`,
+run once per arm (with and without `--gqa`) per round, rounds ALTERNATED between arms so
+thermal drift cannot land on one arm, GPU idle-checked with `pgrep` before and after. Speedup =
+per-head time / GQA time at the split count the decode policy would dispatch
+(`n_splits = seq / SG_TG` here, where the 256 cap does not bind), so below 1.000 the GQA kernel
+is the wrong choice. Three studies:
+
+- **A**: `--reps 20`, 3 rounds per arm, before the code change.
+- **B**: `--reps 50`, 6 rounds per arm, on the 6 seqs around the crossover.
+- **C**: `--reps 20`, 3 rounds per arm, after the code change (the harness calls the one-shot
+  entry points, not `splitk_gqa_use`, so C is a reproduction, not a re-decision).
+
+Medians per study, by threadgroup count (`n_splits * n_kv_heads`):
+
+| threadgroups | 27B `24h/4kv` seq | A | B | C | pooled median (n) |
+|---|---|---|---|---|---|
+| 32 | 2048 | 0.938 | - | 0.918 | 0.928 (6) |
+| 40 | 2560 | 0.867 | - | 0.884 | 0.884 (6) |
+| 48 | 3072 | 0.980 | 0.992 | 0.991 | 0.987 (12) |
+| 56 | 3584 | 0.971 | 0.949 | 0.987 | 0.966 (12) |
+| 64 | 4096 | 0.990 | 0.967 | 0.985 | 0.980 (12) |
+| 80 | 5120 | 0.988 | 0.956 | 0.958 | 0.961 (12) |
+| 96 | 6144 | 1.025 | 1.040 | 1.033 | **1.032** (12) |
+| 112 | 7168 | 1.110 | 1.104 | 1.103 | **1.108** (12) |
+| 128 | 8192 | 1.148 | - | 1.162 | **1.155** (6) |
+| 256 | 16384 | 1.248 | - | 1.187 | **1.213** (6) |
+
+| threadgroups | 4B dense `32h/8kv` seq | A | B | C | pooled median (n) |
+|---|---|---|---|---|---|
+| 64 | 2048 | 0.975 | - | 0.922 | 0.965 (6) |
+| 80 | 2560 | 0.925 | - | 0.923 | 0.923 (6) |
+| 96 | 3072 | 0.975 | 0.974 | 0.975 | 0.974 (12) |
+| 112 | 3584 | 1.008 | 0.991 | 0.989 | 0.997 (12) |
+| 128 | 4096 | 1.004 | 1.004 | 0.994 | **1.003** (12) |
+| 160 | 5120 | 1.029 | 1.018 | 1.053 | **1.027** (12) |
+| 192 | 6144 | 1.019 | 1.014 | 1.049 | **1.026** (12) |
+| 224 | 7168 | 1.065 | 1.021 | 1.055 | **1.043** (12) |
+| 256 | 8192 | 1.056 | - | 1.074 | **1.065** (6) |
+| 512 | 16384 | 1.182 | - | 1.149 | **1.166** (6) |
+
+Raw harness output for all 24 runs is committed next to the report as
+`.superpowers/sdd/2026-08-09-surge-m3-m5/task-P2.7-{bench,bound,confirm}-{perhead,gqa}-r*.txt`.
+
+**Why 128, and what it costs.** The 4B shape is the binding one. Its pooled ratio crosses 1.000
+between 112 threadgroups (0.997) and 128 (1.003), and at 96 it is a clear 0.974 loss in all
+three studies. The 27B crosses lower, between 80 (0.961) and 96 (1.032), because repeat 6 and
+head_dim 256 save more traffic per threadgroup given up. 128 is the smallest single constant
+that admits no measured loss on EITHER shape. The cost, stated rather than hidden: the 27B's
+pooled +3.2% at 96 threadgroups and +10.8% at 112 (seq 6144 to 8191) are left unclaimed. That
+is the right direction to err in, since a wrong-way error is a slowdown on a switch whose whole
+purpose is to be flippable without one.
+
+**A `seq` threshold does not fit, and this is the fit that was asked for.** The same crossovers
+in `seq` are 5120..6144 (27B) and 3072..4096 (4B): 1.7x apart and in the OPPOSITE order from
+the threadgroup view, because the 4B has twice the kv heads. Any single `seq` threshold must
+either admit the 27B's 0.961 at seq 5120 or reject the 4B's wins from 4096 up. One threadgroup
+threshold separates all 20 measured points; the only admitted point that is not a clear win is
+the 4B at exactly 128 threadgroups, which is LEVEL (pooled 1.003 over 12 rounds, individual
+rounds 0.963 to 1.049, i.e. inside this machine's noise).
+
+**The better-fitting rule that was NOT shipped**, recorded so it is not re-derived: the
+per-head grid `n_splits * n_heads >= 512` (equivalently `tgs >= 512 / repeat`) also classifies
+all 20 points correctly AND keeps the 27B's 96- and 112-threadgroup wins, because it lets a
+bigger `repeat` buy a smaller grid. It was rejected because it is a two-parameter rule fit from
+exactly two `repeat` values, and at repeat 8 it extrapolates to a floor of 64 threadgroups,
+BELOW this machine's 80 cores, which is precisely the starved region the measurement says to
+avoid. A third shape (repeat 8, e.g. 64 heads over 8 kv) measured across the same threadgroup
+sweep would settle it; until then the shipped floor is the shape-independent one.
+
+**REPETITIONS ARE NOT OPTIONAL HERE.** The brief recorded that a single-rep sweep of these
+points reported the 4B losing at 8192 and the 27B losing at 4096, both of which reversed under
+20 reps. This task saw the same instability at the margin from the other side: the 4B at 128
+threadgroups came out 1.004, 1.004 and 0.994 in the three studies. Any conclusion drawn from
+one rep per point at this scale is a conclusion drawn from noise.
+
+**Not measured, and not claimed:** whether the end-to-end decode gain moves. The brief's
+corroborating real-27B run (decode 6.57 to 7.04 t/s at 21120 tokens, 1.07x) sits at
+`n_splits = 82`, i.e. 328 threadgroups, far above the floor, so this guard cannot have changed
+it; that was not re-run for this task.
+
+### What P2.7 changed in the two existing GQA gates, and why it had to
+
+Both GQA subtests ran at `SPLITK_GATE_N == 1600`. The mini fixture has 2 kv heads, so at seq
+1600 its GQA grid is 6 splits x 2 kv = 12 threadgroups, far under the new floor: the guard
+declines, both arms run the PER-HEAD kernel, and both gates would have gone green while
+comparing a kernel with itself. That is the worst possible outcome for a positive control, so
+the fixtures moved rather than the floor:
+
+| | before | after | why |
+|---|---|---|---|
+| GQA gates' run length | `SPLITK_GATE_N` 1600 | `SPLITK_GQA_GATE_N` 16896 (66 x SG_TG) | 2 kv heads need 64 splits to reach 128 threadgroups, i.e. seq >= 16384; decode is sequential, so the gate has to walk there. Adds about 45 s to `make check`. |
+| P2.6 cap override | `SURGE_SPLITK_GQA_CAP=4` | `=64` | The cap CEILINGS the GQA grid at `cap * n_kv` threadgroups. At cap 4 that is 8, under the floor at every seq, so the GQA kernel would never be selected and the cap gate would be vacuous. 64 is the smallest cap that can reach the floor on this fixture. |
+| P2.6 divergence seq | 1280 (`SG_TG * 5`) | 16640 (`SG_TG * 65`) | Same closed form `SG_TG * (cap + 1)`, moved by the cap. |
+| P2.6 split-count ratio under test | 6 vs 4 (1.5x) | 66 vs 64 (1.031x), 65 vs 64 at the boundary | Consequence of the bigger cap. SMALLER perturbation than P2.6 tested, and much closer to the natural 257-vs-256 case; still detected at every position (257 of 257). |
+| P2.3's split-K subtest | 1600 positions | unchanged | Its threshold is the split-K one (1024), untouched by this task. |
+
+The P2.3 subtest's output is byte-for-byte the same as the P2.4/P2.5/P2.6 runs recorded:
+`577/577 positions differ above seq 1024, 0 below; worst |delta| 9.537e-07 (scaled 4.608e-07)
+vs min top1-top2 margin 1.385e-03; argmax 1600/1600 agree`.
+
+The P2.4 positive control no longer reports 577 GQA dispatches, and it CANNOT: with the floor
+in place, a run that starts at seq 1 dispatches the per-head partial until seq 16384 and the GQA
+partial after it. The count is now asserted EXACTLY, on both sides, with the layer multiplier
+derived from the run rather than hardcoded:
+
+> split-K GQA decode: 513 GQA dispatches with the switch on (seq >= 16384, the P2.7 floor) +
+> 15360 per-head below it, 15873 per-head with it off, logits byte-identical at 16896/16896
+> positions
+
+513 = positions 16384..16896, 15360 = the split-K positions below the floor, 15873 = the total
+in both arms. That is a strictly STRONGER control than `gqa > 0`: it pins WHERE the floor is
+with the dispatch counters, so a floor at the wrong seq fails even though the GQA kernel ran.
+
+The P2.6 cap gate reports:
+
+> split-K GQA cap override: cap 64 so the policies split 66 (per-head) vs 64 (GQA) at seq 16896
+> and diverge from seq 16640; 513 GQA dispatches with the switch on (+15360 per-head below the
+> P2.7 floor seq 16384), 15873 per-head with it off; 257/257 positions differ above the
+> divergence seq, 0 of 16639 below; worst |delta| 7.153e-07 (scaled 4.206e-07) vs min top1-top2
+> margin 2.400e-04; greedy argmax 16896/16896 agree
+
+Its "identical below the divergence" half now also covers positions 16384 to 16639, where the
+GQA KERNEL runs at the SAME `n_splits` as the per-head one: P2.4's byte-identity contract,
+gated inside the real decode path at a grid the guard admits, which no previous gate did.
+
+### New assertions (gate 3 of the brief)
+
+`splitk_gqa_floor_policy` (`tests/test_gpu_fwd.c`) asserts the predicate against the measured
+table itself: FALSE at every shape/seq where a loss was measured (27B at 2048/2560/4096/5120,
+4B at 2048/2560/3072/3584), TRUE where a win was (27B at 8192/16384/262144, 4B at
+4096/8192/16384), the fixture's own boundary from both sides (63 splits x 2 kv = 126
+threadgroups declined, 64 x 2 = 128 selected), monotonicity in `seq` for a fixed shape over 300
+steps, and the state's resolved cap, since the whole table shifts at a different cap. Each case
+carries its measured speedup in the failure message, so a future retune has to argue with the
+measurement rather than with a constant.
+
+`splitk_gqa_floor_uses_state_cap` closes a mutation the two long runs cannot see: at cap 64 on
+a 2-kv fixture the capped and uncapped split counts both clear the floor, so a guard reading
+`splitk_n_splits(seq)` instead of the capped count would pass. At cap 4 they differ by 16x, and
+one call settles it: the 4B shape at seq 262144 must be DECLINED (4 splits x 8 kv = 32
+threadgroups) while the same shape with the default cap must be SELECTED.
+
+### Gates run, all on hardware, GPU idle-checked (`pgrep` empty before each)
+
+1. `clang -fsyntax-only -std=c11 -Wall -Wextra -Werror` on `src/metal.m` and
+   `tests/test_gpu_fwd.c`, with and without `-DSURGE_NO_METAL`: clean.
+2. `make check`: **86099 checks, 0 failures** (86067 at the parent commit, +32, all in
+   `tests/test_gpu_fwd.bin`, which went 165 -> 197). `test_cli_prefill` 11 cases and
+   `test_cli_bench` 14 cases green. 1 min 15 s wall.
+3. `make debug` (`-DSURGE_NO_METAL`, ASan + UBSan): rc 0, **83523 checks, 0 failures, 0
+   sanitizer diagnostics** -- identical to the P2.4/P2.5/P2.6 baseline.
+4. P2.4's byte-identity and 100x determinism subtest (`metal_attn_splitk_gqa_bit_identical`)
+   and P2.5's `splitk_gqa_n_splits_policy`: unchanged, 0 failures (both are per-op and never
+   reach the selection predicate).
+5. Bench re-run after the change, study C above: the admitted region (>= 128 threadgroups)
+   contains no measured loss. Weakest admitted point 4B at 128 threadgroups, pooled 1.003 over
+   12 rounds; every other admitted point 1.03x to 1.21x.
+
+### Mutation-proved (each patched into `src/metal.m`, built, run, reverted)
+
+| mutation | observed |
+|---|---|
+| `SG_SPLITK_GQA_MIN_TG 0` (i.e. the pre-P2.7 behaviour, no floor) | **16 failures**: 10 in the floor table (every measured-loss shape reported SELECTED, including the 126-threadgroup boundary case), both dispatch-count gates ("expected 513 dispatches, got 15873" and "expected 15360 per-head, got 0"), and both cap-awareness assertions |
+| `SG_SPLITK_GQA_MIN_TG 64` (a floor that admits measured losses) | **12 failures**: the 4B's 64/80/96/112-threadgroup losses and the 27B's 64/80 reported SELECTED, plus "expected 513, got 8705" and "expected 15360, got 7168" from the two dispatch gates |
+
+### Still not this task's decision
+
+`attn_splitk_gqa` still defaults to `false`. P2.7 removes the last measured reason not to flip
+it (a short-context regression) and makes the flip non-regressive on both real shapes; the flip
+itself remains the user's call.

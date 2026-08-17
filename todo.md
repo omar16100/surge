@@ -3007,3 +3007,47 @@ GPU and 9.1 GiB of KV per arm, and use `--margins` so the result is falsifiable.
 
 **KEPT OFF.** `attn_splitk_gqa` default is still `false`. This task makes the flip safe to
 CONSIDER by closing the last correctness gate; performing it is the user's decision.
+
+## Task P2.7: occupancy floor for the GQA kernel (2026-08-17)
+
+`splitk_gqa_use` previously decided on ONE criterion, `repeat` in [2, 8]. It never received
+`seq`, so it could not know how many threadgroups the dispatch would have. Since the GQA
+kernel's whole trick is collapsing `repeat` query-head threadgroups into one, the grid is
+divided by `repeat`, and at short context there were too few threadgroups to fill the machine:
+the GQA kernel was measurably SLOWER than the per-head one it replaces.
+
+Measured with `bench_splitk --reps 20`, per-head time over GQA time (below 1.000 the GQA kernel
+is the wrong choice):
+
+| seq | 27B 24h/4kv (repeat 6) | 4B dense 32h/8kv (repeat 4) |
+|---|---|---|
+| 2048 | **0.822x** (32 TGs) | 1.059x (64 TGs) |
+| 4096 | 0.993x (64 TGs) | 1.018x (128 TGs) |
+| 8192 | 1.116x (128 TGs) | 1.036x (256 TGs) |
+| 16384 | 1.260x (256 TGs) | 1.019x (512 TGs) |
+| 32768 | 1.387x (512 TGs) | 1.195x (1024 TGs) |
+
+**The rule is `n_splits * n_kv_heads >= 128`, a THREADGROUP floor, not a seq threshold.** A seq
+threshold cannot fit both shapes: the crossovers are 1.7x apart in seq (5120-6144 on the 27B,
+3072-4096 on the 4B) and in the OPPOSITE order from the threadgroup view, because the 4B has
+twice the kv heads. One threadgroup threshold separates all measured points; one seq threshold
+must either admit a 27B loss or reject 4B wins.
+
+The floor is deliberately conservative: it excludes the 4B's 1.059x win at 64 threadgroups. A
+wrong-way error here is a slowdown in the shipped engine, and this switch exists to be
+flippable without one.
+
+Gates: `make check` **86099 checks, 0 failures** (86067 at parent, +32); `make debug` rc 0,
+**83523 checks, 0 failures**, 0 sanitizer diagnostics, identical to the P2.4/P2.5/P2.6 baseline.
+Independently re-verified after the fact, not just self-reported.
+
+**The two existing GQA gates had to be retuned, and this was the main risk of the task.** Both
+sat at seq 1600, far below the new floor, so the guard would have silently stopped them from
+exercising the GQA path at all. They were moved above the floor rather than left vacuous, and
+they are now STRONGER than before because they test both sides of it: the P2.4 positive control
+reports `513 GQA dispatches with the switch on (seq >= 16384, the P2.7 floor) + 15360 per-head
+below it`, and P2.6's cap-override test was retuned to cap 64 at seq 16896.
+
+**KEPT OFF.** `attn_splitk_gqa` default is still `false`. P2.7 removes the last measured reason
+not to flip it, a short-context regression, and makes the flip non-regressive on both real
+shapes. Performing the flip is the user's decision.

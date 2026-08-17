@@ -1986,11 +1986,11 @@ kernel void k_attn_decode_splitk_partial_gqa(device const float *q [[buffer(0)]]
  * split the way the four-pass kernel already splits them, and the streaming
  * state is attached to the role that makes it small:
  *
- *   - (m, s) are UNIFORM across the threadgroup (they come off a fold tree), so
- *     every thread holds its own copy: 2*R registers.
- *   - acc[d] is owned by EXACTLY ONE thread, the one that owns output dim d
- *     (thread lid owns d = dbase + lid, see the dbase loop), so a thread needs
- *     ONE accumulator per head, not head_dim of them: R registers.
+ *   - (m, s) are UNIFORM across a KEY GROUP (they come off a fold tree over that
+ *     group's lanes), so every thread holds its own copy: 2*R registers.
+ *   - acc[d] is owned by EXACTLY ONE thread per key group, the one that owns
+ *     output dim d (thread lid owns d = dbase + lid % kw, see the dbase loop), so
+ *     a thread needs ONE accumulator per head, not head_dim of them: R registers.
  *
  * Total streaming state is 4*R floats per thread (m, s, acc and the score of
  * the thread's own key), 32 at R = 8, which is a register file rather than a
@@ -2017,18 +2017,92 @@ kernel void k_attn_decode_splitk_partial_gqa(device const float *q [[buffer(0)]]
  * hold is a TIMING question that has not been measured; if it costs occupancy,
  * the fix is a host-provided [[threadgroup(0)]] length of exactly R*SG_TG*4.
  *
+ * KEY GROUPS, SO THE V PHASE HAS NO IDLE HALF (Task P2.9). One output dim per
+ * thread means that at head_dim < SG_TG the threads with lid >= head_dim own
+ * nothing: at head_dim 128 that is half the threadgroup sitting on a barrier
+ * through the whole V phase of every tile, at head_dim 64 three quarters, and
+ * P2.8's timing named it as a cause of the 0.690x-0.984x this kernel measured on
+ * the 4B dense shape. The fix partitions the KEYS as well as the dims:
+ *
+ *   - kw, the KEY-GROUP WIDTH, is the smallest power of two >= head_dim, capped
+ *     at SG_TG and floored at SG_SPLITK_ONLINE_KW_MIN. n_kgroups = SG_TG / kw.
+ *   - thread lid belongs to key group lid / kw and owns output dim lid % kw, so
+ *     EVERY thread owns a dim again (or, when head_dim is not a power of two,
+ *     as few as possible do not: at head_dim 96, kw is 128 and 32 lanes per
+ *     group still idle, which is strictly better than 128 of 256 idling).
+ *   - a tile is still SG_TG keys and thread lid still scores key base + lid, so
+ *     the score phase, its coalescing and its key-to-lane map are UNCHANGED.
+ *     What changes is that the folds run per group over kw lanes instead of once
+ *     over SG_TG, and the V phase walks only its own group's kw keys, so the
+ *     serial length of the V phase drops by n_kgroups while the number of lanes
+ *     issuing V loads rises by the same factor. The bytes are identical; the
+ *     memory-level parallelism is not.
+ *   - each group therefore ends the band with its OWN (m, s, acc[d]) over its own
+ *     fixed subset of the split's keys, and those n_kgroups partials are merged
+ *     by exactly the log-sum-exp merge k_attn_decode_splitk_combine already
+ *     performs across splits (attn_combine_weight, shared, not re-derived),
+ *     in FIXED group order 0, 1, ... so the result is data-independent. No
+ *     division: the partial's contract is unnormalized acc, and the combine
+ *     divides by S. An empty group (a split shorter than kw*n_kgroups leaves
+ *     later groups no keys) carries m = -INFINITY, s = 0, acc = 0, whose weight
+ *     against a finite M is exactly 0.0, so it contributes nothing without a
+ *     special case; if EVERY group were empty the merge reproduces the
+ *     -INFINITY/0/0 empty encoding, which is why the early return above is the
+ *     only place that needs to write it.
+ *   - THE MERGE COSTS NO THREADGROUP MEMORY. kw * n_kgroups == SG_TG, so the R
+ *     group-local fold regions tile the SAME R x SG_TG buffer, and the acc
+ *     exchange (R floats per thread) is exactly that buffer again. The 8 KB
+ *     allocation above is unchanged, which matters because it is the OTHER
+ *     suspect for the 4B loss and this task must not trade one for the other.
+ *   - n_kgroups == 1 (head_dim >= SG_TG, the 27B's path) SKIPS the merge
+ *     entirely and every expression above degenerates to P2.8's: kw == SG_TG
+ *     makes lid % kw == lid, the fold's lane mask lid & (kw-1) == lid, and the
+ *     group's key offset 0. That path was measured winning and must not move.
+ *
  * DETERMINISM (the rule at the top of this file) is unchanged. Every thread
- * streams its OWN fixed subset of keys (lid, lid+SG_TG, ..., the same subset the
- * four-pass kernel gives it), the per-lane partials are combined only by
- * fixed-shape trees with a data-independent stride schedule, and every acc slot
- * has exactly one writer. No atomics, no simd_sum/simd_max, no read-modify-write
- * of a shared accumulator, and no cross-thread update whose result depends on
- * which thread got there first. The rescale is a multiply by a value every
- * thread computes identically from the tree's output. */
+ * SCORES its OWN fixed subset of keys (lid, lid+SG_TG, ..., the same subset the
+ * four-pass kernel gives it), accumulates V over its own key group's keys in
+ * increasing order, the per-lane partials are combined only by fixed-shape trees
+ * with a data-independent stride schedule, the key groups are merged in fixed
+ * index order, and every acc slot has exactly one writer. No atomics, no
+ * simd_sum/simd_max, no read-modify-write of a shared accumulator, and no
+ * cross-thread update whose result depends on which thread got there first. The
+ * rescale is a multiply by a value every thread computes identically from the
+ * tree's output.
+ *
+ * P2.9 makes the fold WIDTH (and therefore the number of tree levels) a function
+ * of head_dim, which is a shape parameter, uniform across the threadgroup and
+ * known before the first barrier. That is the same kind of dependence the tile
+ * loop already has on `len`: two dispatches of the SAME shape fold identically,
+ * which is what the byte-exact gates and the 100x determinism check assert. What
+ * the file's rule forbids, a shape that depends on the DATA or on the dispatched
+ * threads_per_threadgroup, is still absent. */
 
-/* The fold-tree and transpose scratch, shared (see the header). One row of
- * SG_TG floats per head of the widest supported group. */
+/* The fold-tree, transpose and key-group-exchange scratch, shared (see the
+ * header). One row of SG_TG floats per head of the widest supported group. */
 constant uint SG_SPLITK_ONLINE_RED = SG_SPLITK_GQA_MAX * SG_TG;
+
+/* P2.9: the narrowest key group the V phase will split into, which is what bounds
+ * n_kgroups at SG_TG / SG_SPLITK_ONLINE_KW_MIN. 32 for two reasons:
+ *
+ *   - a simdgroup is 32 lanes on Apple silicon, so a fold narrower than 32 does
+ *     not remove a single SIMD step from the tree, while every extra key group
+ *     adds a log-sum-exp merge term and its rounding;
+ *   - the merge publishes 2*n_kgroups floats per head into ONE SG_TG-wide row of
+ *     the scratch (m then s), so n_kgroups must stay well under SG_TG/2. The
+ *     static_assert below is that bound, not a style check.
+ *
+ * head_dim below 32 is not a shape surge dispatches (the smallest real one is
+ * 128), so this floor only ever costs idle V lanes on toy shapes, never
+ * correctness: a group whose lane owns no dim simply skips the V phase. */
+constant uint SG_SPLITK_ONLINE_KW_MIN = 32u;
+static_assert(2u * (SG_TG / SG_SPLITK_ONLINE_KW_MIN) <= SG_TG,
+              "the key-group merge publishes 2*n_kgroups floats per head into one "
+              "SG_TG-wide scratch row: raise SG_SPLITK_ONLINE_KW_MIN");
+static_assert((SG_TG & (SG_TG - 1u)) == 0u
+              && (SG_SPLITK_ONLINE_KW_MIN & (SG_SPLITK_ONLINE_KW_MIN - 1u)) == 0u,
+              "the fold's lane mask (lid & (kw-1)) and n_kgroups == SG_TG/kw both "
+              "need SG_TG and SG_SPLITK_ONLINE_KW_MIN to be powers of two");
 
 /* R fixed-shape trees at once, one per head of the group, over the R x SG_TG
  * scratch. Folding R heads together rather than calling tg_max R times is what
@@ -2037,22 +2111,31 @@ constant uint SG_SPLITK_ONLINE_RED = SG_SPLITK_GQA_MAX * SG_TG;
  * tiles-per-split multiplier.
  *
  * BIT-IDENTICAL TO R SEPARATE tg_max CALLS BY CONSTRUCTION: head j's row is
- * folded by the same stride schedule (SG_TG/2, ..., 1), over the same per-lane
+ * folded by the same stride schedule (kw/2, ..., 1), over the same per-lane
  * values, with the same NaN-wins comparison, and no row ever reads another
  * row's data. Only the barriers are shared.
  *
- * THE RESULT IS LEFT IN red[j*SG_TG], not returned: the caller needs the R
+ * kw IS THE FOLD WIDTH (P2.9), a power of two dividing SG_TG. Each of the
+ * SG_TG/kw KEY GROUPS folds its own kw-lane region [g*kw, g*kw+kw) of row j
+ * independently, and (lid & (kw-1)) < stride keeps every read inside the region
+ * that owns it ((lid & (kw-1)) + stride < 2*stride <= kw). At kw == SG_TG this is
+ * P2.8's function operation for operation: lid < SG_TG makes lid & (kw-1) == lid,
+ * so the mask, the schedule and the result slot are all the earlier ones.
+ *
+ * THE RESULT IS LEFT IN red[j*SG_TG + g*kw], not returned: the caller needs the R
  * results and an out-parameter array would be R more live registers in the
- * hottest loop in the kernel. Every thread may read red[j*SG_TG] from the
+ * hottest loop in the kernel. Every thread may read its own group's slot from the
  * trailing barrier below until the next fold's LEADING barrier, which is the
  * same contract tg_max/tg_sum already have with their red[0]. */
 template <uint R>
-static inline void tg_max_group(threadgroup float *red, uint lid, thread const float *v) {
+static inline void tg_max_group(threadgroup float *red, uint lid, thread const float *v,
+                                uint kw) {
+    uint lane = lid & (kw - 1u);
     threadgroup_barrier(mem_flags::mem_threadgroup);
     SG_UNROLL_R for (uint j = 0; j < R; j++) red[j * SG_TG + lid] = v[j];
-    for (uint stride = SG_TG / 2u; stride > 0u; stride >>= 1u) {
+    for (uint stride = kw / 2u; stride > 0u; stride >>= 1u) {
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        if (lid < stride) {
+        if (lane < stride) {
             SG_UNROLL_R for (uint j = 0; j < R; j++) {
                 float a = red[j * SG_TG + lid], b = red[j * SG_TG + lid + stride];
                 red[j * SG_TG + lid] = (a != a) ? a : ((b != b) ? b : ((b > a) ? b : a));
@@ -2064,12 +2147,14 @@ static inline void tg_max_group(threadgroup float *red, uint lid, thread const f
 
 /* Same tree, same contract, addition. tg_sum's own comment applies verbatim. */
 template <uint R>
-static inline void tg_sum_group(threadgroup float *red, uint lid, thread const float *v) {
+static inline void tg_sum_group(threadgroup float *red, uint lid, thread const float *v,
+                                uint kw) {
+    uint lane = lid & (kw - 1u);
     threadgroup_barrier(mem_flags::mem_threadgroup);
     SG_UNROLL_R for (uint j = 0; j < R; j++) red[j * SG_TG + lid] = v[j];
-    for (uint stride = SG_TG / 2u; stride > 0u; stride >>= 1u) {
+    for (uint stride = kw / 2u; stride > 0u; stride >>= 1u) {
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        if (lid < stride) {
+        if (lane < stride) {
             SG_UNROLL_R for (uint j = 0; j < R; j++) {
                 red[j * SG_TG + lid] = red[j * SG_TG + lid] + red[j * SG_TG + lid + stride];
             }
@@ -2095,6 +2180,16 @@ static void splitk_partial_group_online(device const float *q,
                                         uint n_kv, uint hd, uint seq, uint q_stride,
                                         float scale, uint n_splits)
 {
+    /* EVERY red index below is j * SG_TG + something < SG_TG, so R rows must fit
+     * the caller's allocation. The switch that instantiates this only reaches 8,
+     * and SG_SPLITK_ONLINE_RED is sized from the same constant, but a future arm
+     * added past the bound would silently write into another kernel's threadgroup
+     * memory rather than fail to build. This is that failure, at compile time.
+     * (P2.9 review finding: the bound was previously implicit.) */
+    static_assert(R * SG_TG <= SG_SPLITK_ONLINE_RED,
+                  "splitk_partial_group_online<R> indexes R rows of SG_TG floats: "
+                  "R exceeds SG_SPLITK_ONLINE_RED / SG_TG");
+
     /* The partition rule, in 64-bit, IDENTICAL to the four-pass kernels' and to
      * sg_ref_attn_decode_splitk's. */
     uint t0 = (uint)(((ulong)part * (ulong)seq) / (ulong)n_splits);
@@ -2123,13 +2218,37 @@ static void splitk_partial_group_online(device const float *q,
     device const float *qh = q + (size_t)h0 * q_stride;
     uint len = t1 - t0;
 
-    /* Output dims are handed out SG_TG at a time, and thread lid owns exactly
-     * ONE of them per band (d = dbase + lid), which is what makes acc[R] fit in
-     * registers. head_dim <= SG_TG (every shape metal.m sends here) runs this
-     * loop once; a wider head_dim re-streams the split per band, which is
-     * correct but re-reads K, and is why the policy declines it. */
-    for (uint dbase = 0; dbase < hd; dbase += SG_TG) {
-        uint d = dbase + lid;
+    /* THE KEY-GROUP SPLIT (P2.9, see the header). kw is the smallest power of two
+     * >= hd, capped at SG_TG and floored at SG_SPLITK_ONLINE_KW_MIN; n_kg is how
+     * many groups of that width the threadgroup holds. Every term is uniform
+     * across the threadgroup (hd is a param), so the loop trip count, every
+     * barrier below and the n_kg > 1 merge are reached by all threads or none.
+     *
+     * hd >= SG_TG (the 27B's 256, and the multi-band path above it) gives
+     * kw == SG_TG and n_kg == 1, which is P2.8's shape exactly: kgroup 0,
+     * kg_off 0, dlane == lid. */
+    uint kw = SG_TG;
+    if (hd < SG_TG) {
+        kw = SG_SPLITK_ONLINE_KW_MIN;
+        /* Doubles from the floor, so it stops at the smallest power of two that
+         * is >= hd and >= SG_SPLITK_ONLINE_KW_MIN. It cannot overrun SG_TG: hd is
+         * < SG_TG here and SG_TG is itself a power of two, so the last doubling
+         * that can happen lands exactly on SG_TG (n_kg 1, the P2.8 path). */
+        while (kw < hd) kw <<= 1u;
+    }
+    uint n_kg = SG_TG / kw;
+    uint kgroup = lid / kw;
+    uint kg_off = kgroup * kw;          /* this group's key offset inside a tile */
+    uint dlane = lid - kg_off;          /* lid % kw: this thread's slot in its group */
+
+    /* Output dims are handed out kw at a time, and thread lid owns exactly ONE of
+     * them per band (d = dbase + dlane), which is what makes acc[R] fit in
+     * registers. head_dim <= kw (which n_kg > 1 guarantees by construction, and
+     * which every shape metal.m sends here satisfies) runs this loop once; a
+     * head_dim wider than SG_TG re-streams the split per band, which is correct
+     * but re-reads K, and is why the policy declines it. */
+    for (uint dbase = 0; dbase < hd; dbase += kw) {
+        uint d = dbase + dlane;
         bool mine = (d < hd);
 
         /* The entire streaming state: R running maxima, R running sums, R
@@ -2140,11 +2259,19 @@ static void splitk_partial_group_online(device const float *q,
         /* One tile of at most SG_TG keys per pass, thread lid taking key
          * base+lid: over the whole split that is keys lid, lid+SG_TG, ..., the
          * SAME subset of the same split the four-pass kernel gives thread lid,
-         * folded by the same trees over the same lanes. That is why a split
-         * short enough to be ONE tile comes out bit-identical to the four-pass
-         * kernel: with one key per lane there is no per-lane serial sum to
-         * reorder, the tile maximum IS the split maximum, and the acc loop
-         * walks t in the same increasing order. */
+         * scored by the same operations in the same order. The tile width is
+         * SG_TG whatever kw is, which is why P2.9's key groups leave the score
+         * phase and its coalescing untouched: group g simply owns the tile's
+         * keys [g*kw, g*kw+kw), and thread lid = g*kw + dlane owns key base+lid
+         * within it.
+         *
+         * At n_kg == 1 a split short enough to be ONE tile comes out
+         * bit-identical to the four-pass kernel: with one key per lane there is
+         * no per-lane serial sum to reorder, the tile maximum IS the split
+         * maximum, and the acc loop walks t in the same increasing order. At
+         * n_kg > 1 that no longer holds even for one tile, because the exponential
+         * sum is now per group and then merged; the bar for this kernel has always
+         * been the CPU oracle and determinism, never memcmp (see the header). */
         for (uint base = 0; base < len; base += SG_TG) {
             uint tlen = len - base;
             if (tlen > SG_TG) tlen = SG_TG;
@@ -2167,8 +2294,9 @@ static void splitk_partial_group_online(device const float *q,
                 SG_UNROLL_R for (uint j = 0; j < R; j++) sc[j] = -INFINITY;
             }
 
-            /* 2. The tile's maximum per head, one R-wide fixed tree. */
-            tg_max_group<R>(red, lid, sc);
+            /* 2. This KEY GROUP's maximum over its slice of the tile, per head,
+             *    one R-wide fixed tree per group over kw lanes. */
+            tg_max_group<R>(red, lid, sc, kw);
 
             /* 3. The online update. Every thread computes the SAME m_new and
              *    the SAME rescale factor from the tree's output, so this is a
@@ -2177,18 +2305,19 @@ static void splitk_partial_group_online(device const float *q,
              *
              *    m_new == m_old gives an EXACT 1.0 rather than exp(0.0), which
              *    is not just cheaper: it makes the rescale a no-op bit for bit
-             *    for every tile that does not move the maximum, so a split
-             *    whose maximum sits in its first tile keeps the four-pass
+             *    for every tile that does not move the maximum, so at n_kg == 1 a
+             *    split whose maximum sits in its first tile keeps the four-pass
              *    kernel's acc exactly. It also defines the m_old == m_new ==
              *    -INFINITY case, where exp(-INF - -INF) would be a NaN
-             *    manufactured out of two legitimate values.
+             *    manufactured out of two legitimate values, which is what a key
+             *    group with NO keys in this tile hits on every one of them.
              *
              *    NaN PROPAGATES rather than being laundered: a NaN maximum
              *    fails the == test, so corr becomes NaN and carries into s and
              *    acc, which is the same NaN-out answer tg_max's rule gives the
              *    four-pass kernel. */
             SG_UNROLL_R for (uint j = 0; j < R; j++) {
-                float mo = m[j], tmax = red[j * SG_TG];
+                float mo = m[j], tmax = red[j * SG_TG + kg_off];
                 float mn = (mo != mo) ? mo : ((tmax != tmax) ? tmax : ((tmax > mo) ? tmax : mo));
                 float corr = (mn == mo) ? 1.0f : precise::exp(mo - mn);
                 m[j] = mn;
@@ -2202,43 +2331,137 @@ static void splitk_partial_group_online(device const float *q,
                 sc[j] = (lid < tlen) ? precise::exp(sc[j] - mn) : 0.0f;
             }
 
-            /* 4. The tile's sum per head, same R-wide tree, added to the
-             *    already-rescaled running sum. */
-            tg_sum_group<R>(red, lid, sc);
-            SG_UNROLL_R for (uint j = 0; j < R; j++) s[j] += red[j * SG_TG];
+            /* 4. This key group's sum over its slice of the tile, per head, same
+             *    R-wide tree, added to the already-rescaled running sum. */
+            tg_sum_group<R>(red, lid, sc, kw);
+            SG_UNROLL_R for (uint j = 0; j < R; j++) s[j] += red[j * SG_TG + kg_off];
 
             /* 5. The transpose: the exponentials were computed by the thread
              *    that owns the KEY and are consumed by the threads that own the
              *    output DIMS, so the R x tlen block changes hands here. The
              *    leading barrier is what lets this overwrite the fold scratch
-             *    (every thread has read red[j*SG_TG] above by then). */
+             *    (every thread has read its own group's slot above by then).
+             *    Thread lid writes slot lid, which puts group g's exponentials in
+             *    exactly the slots [g*kw, g*kw+kw) its own V phase reads. */
             threadgroup_barrier(mem_flags::mem_threadgroup);
             SG_UNROLL_R for (uint j = 0; j < R; j++) red[j * SG_TG + lid] = sc[j];
             threadgroup_barrier(mem_flags::mem_threadgroup);
 
-            /* 6. acc[d] += sum_t p_t * v[t][d] over THIS tile, increasing t,
-             *    one output dim per thread so there is no cross-thread
-             *    reduction and the per-head summation order is fixed. ONE read
-             *    of the V element feeds all R heads. The loop stops at tlen, so
-             *    no thread reads a V row past the split. */
+            /* 6. acc[d] += sum_t p_t * v[t][d] over THIS GROUP's slice of THIS
+             *    tile, increasing t, one output dim per thread per group so there
+             *    is no cross-thread reduction and the per-head summation order is
+             *    fixed. ONE read of the V element feeds all R heads.
+             *
+             *    glen is how many of the group's kw keys the tile actually holds,
+             *    which is kw for every full group, a remainder for at most one
+             *    group, and ZERO for the groups past the end of a short tile. That
+             *    is the only clamp needed for a split shorter than SG_TG: no
+             *    thread reads a V row past the split, and a group with glen == 0
+             *    keeps the -INFINITY/0/0 state the merge below weights out. */
+            uint glen = (tlen > kg_off) ? (tlen - kg_off) : 0u;
+            if (glen > kw) glen = kw;
             if (mine) {
-                for (uint t = 0; t < tlen; t++) {
-                    float vf = (float)vc[((size_t)(t0 + base + t) * n_kv + hk) * hd + d];
-                    SG_UNROLL_R for (uint j = 0; j < R; j++) a[j] += red[j * SG_TG + t] * vf;
+                for (uint t = 0; t < glen; t++) {
+                    float vf = (float)vc[((size_t)(t0 + base + kg_off + t) * n_kv + hk) * hd + d];
+                    SG_UNROLL_R for (uint j = 0; j < R; j++) {
+                        a[j] += red[j * SG_TG + kg_off + t] * vf;
+                    }
                 }
             }
         }
 
-        /* m and s are uniform, so this is a store from a designated thread, not
-         * a reduction. Bands past the first recompute the identical values (same
-         * inputs, same order), so only the first stores them. */
+        /* 7. MERGE THE KEY GROUPS (P2.9). Each group now holds its own
+         *    (m, s, acc[d]) over a disjoint, fixed subset of the split's keys, and
+         *    combining those is exactly what k_attn_decode_splitk_combine does
+         *    across splits, so this is that same log-sum-exp merge over
+         *    attn_combine_weight (the shared helper, not a second copy):
+         *
+         *        M      = max_g m_g                (fixed order, NaN-propagating)
+         *        s      = sum_g s_g   * w(m_g, M)  (fixed order)
+         *        acc[d] = sum_g acc_g[d] * w(m_g, M)
+         *
+         *    with NO division: the partial's contract is the unnormalized acc and
+         *    the combine kernel divides by S. The three degenerate cases need no
+         *    special case, which is why there is none: an empty group's
+         *    m_g == -INFINITY weights to exactly 0.0 against a finite M; a NaN
+         *    anywhere makes M NaN and every weight NaN, which propagates to m/s/acc
+         *    and then through the combine; and if every group were empty the result
+         *    is the -INFINITY/0/0 empty encoding itself.
+         *
+         *    n_kg == 1 SKIPS this entirely (a uniform branch, so no thread waits on
+         *    a barrier no other thread reaches), which is what keeps the
+         *    head_dim >= SG_TG path bit for bit P2.8's. */
+        if (n_kg > 1u) {
+            /* 7a. Publish each group's (m, s): 2*n_kg floats per head, m in slots
+             *     [0, n_kg) of row j and s in [n_kg, 2*n_kg), which fits because
+             *     n_kg <= SG_TG / SG_SPLITK_ONLINE_KW_MIN (static_assert above).
+             *     One designated thread per group, so no slot has two writers. The
+             *     leading barrier is what lets this overwrite the transpose. */
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (dlane == 0u) {
+                SG_UNROLL_R for (uint j = 0; j < R; j++) {
+                    red[j * SG_TG + kgroup] = m[j];
+                    red[j * SG_TG + n_kg + kgroup] = s[j];
+                }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            /* 7b. EVERY thread folds the same n_kg values in the same order into
+             *     the same M and S, so this is a private recomputation of a
+             *     uniform value rather than a shared reduction, exactly like the
+             *     rescale in step 3. Each thread then scales its OWN group's
+             *     accumulator, which is the multiplication that makes 7c a plain
+             *     sum in group order. */
+            SG_UNROLL_R for (uint j = 0; j < R; j++) {
+                threadgroup const float *row = red + (size_t)j * SG_TG;
+                float mm = -INFINITY;
+                for (uint g = 0; g < n_kg; g++) {
+                    float v = row[g];
+                    mm = (v != v) ? v : ((v > mm) ? v : mm);
+                }
+                float ss = 0.0f;
+                for (uint g = 0; g < n_kg; g++) {
+                    ss += row[n_kg + g] * attn_combine_weight(row[g], mm);
+                }
+                a[j] *= attn_combine_weight(m[j], mm);
+                m[j] = mm;
+                s[j] = ss;
+            }
+
+            /* 7c. Exchange the weighted accumulators and sum them in group order.
+             *     Thread lid publishes slot lid, so group g's dim dlane sits at
+             *     g*kw + dlane, and group 0's thread for each dim collects the
+             *     column. It re-reads its own contribution out of the scratch
+             *     rather than using the register it already holds, so the summation
+             *     order is g = 0, 1, ... for every dim with no special first term. */
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            SG_UNROLL_R for (uint j = 0; j < R; j++) red[j * SG_TG + lid] = a[j];
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (kgroup == 0u && mine) {
+                SG_UNROLL_R for (uint j = 0; j < R; j++) {
+                    float sum = 0.0f;
+                    for (uint g = 0; g < n_kg; g++) sum += red[j * SG_TG + g * kw + dlane];
+                    a[j] = sum;
+                }
+            }
+        }
+
+        /* m and s are uniform across the threadgroup once step 7 has run (before
+         * it they are uniform only within a key group), so this is a store from a
+         * designated thread, not a reduction. Thread 0 is in key group 0 either
+         * way. Bands past the first recompute the identical values (same inputs,
+         * same order), so only the first stores them; bands only exist at
+         * n_kg == 1, where step 7 is skipped. */
         if (lid == 0u && dbase == 0u) {
             SG_UNROLL_R for (uint j = 0; j < R; j++) {
                 m_out[part_idx + (size_t)j * ms_stride] = m[j];
                 s_out[part_idx + (size_t)j * ms_stride] = s[j];
             }
         }
-        if (mine) {
+        /* Exactly one writer per acc slot: at n_kg == 1 every thread that owns a
+         * dim, and at n_kg > 1 the group-0 thread that owns it, which is the one
+         * step 7c left the merged value in. */
+        if (kgroup == 0u && mine) {
             SG_UNROLL_R for (uint j = 0; j < R; j++) acc[(size_t)j * acc_stride + d] = a[j];
         }
     }

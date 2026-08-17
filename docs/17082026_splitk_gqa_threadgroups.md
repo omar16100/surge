@@ -986,3 +986,197 @@ path simply never mentions it.
   27B-Q8_0 run is a separate manual gate.
 - Occupancy directly (no Metal capture was taken), which is why the explanation above is labelled
   a hypothesis.
+
+---
+
+## P2.9: key groups, so the online kernel's V phase has no idle half
+
+P2.8 ended with the online kernel a win on the 27B and a loss on the 4B, and named two suspects.
+This task fixes the second one and MEASURES the first, which turned out to be the smaller of the
+two by an order of magnitude. The SDD report is
+`.superpowers/sdd/2026-08-09-surge-m3-m5/task-P2.9-report.md`. Both switches are still OFF by
+default and `src/metal.m` was not touched at all: the whole change is inside
+`k_attn_decode_splitk_partial_gqa_online` plus its two fold helpers, and the four-pass kernels are
+untouched by design (see "why the four-pass kernels were left alone" below).
+
+### The defect
+
+One output dim per thread is what keeps the online kernel's running `acc` in registers, and it is
+also what left half the threadgroup idle: at `head_dim` 128 the threads with `lid >= 128` own no
+output dim, so they sat on a barrier through the V phase of every tile. At `head_dim` 64 that is
+three quarters of the threadgroup.
+
+### The fix
+
+Partition the KEYS as well as the dims. `kw`, the key-group width, is the smallest power of two
+`>= head_dim`, capped at `SG_TG` and floored at `SG_SPLITK_ONLINE_KW_MIN` (32, a simdgroup);
+`n_kgroups = SG_TG / kw`. Thread `lid` belongs to key group `lid / kw` and owns output dim
+`lid % kw`, so every thread owns a dim again.
+
+- A tile is still `SG_TG` keys and thread `lid` still scores key `base + lid`, so the score phase,
+  its coalescing and its key-to-lane map are UNCHANGED. What changes is that the two folds run per
+  group over `kw` lanes instead of once over `SG_TG` (one fewer tree level at `kw` 128), and the V
+  phase walks only its own group's `kw` keys. The bytes issued are identical; the serial length of
+  the V phase drops by `n_kgroups` and the number of lanes issuing V loads rises by the same
+  factor.
+- Each group therefore ends with its own `(m, s, acc[d])` over a disjoint, fixed subset of the
+  split's keys, and those are merged by exactly the log-sum-exp merge
+  `k_attn_decode_splitk_combine` already performs across splits, through the SAME shared
+  `attn_combine_weight` helper, in fixed group order. No division: the partial's contract is the
+  unnormalized `acc` and the combine divides by `S`.
+- Three degenerate cases need no special case and have none: an empty group (a split shorter than
+  one tile leaves later groups no keys) carries `m = -INFINITY`, whose weight against a finite `M`
+  is exactly 0.0; a NaN anywhere makes `M` NaN and every weight NaN, which propagates; and if every
+  group were empty the merge reproduces the `-INFINITY/0/0` empty encoding itself.
+- **The merge costs no extra threadgroup memory.** `kw * n_kgroups == SG_TG`, so the group-local
+  fold regions tile the same `R x SG_TG` scratch, and the acc exchange is that same scratch again.
+  The 8 KB allocation is unchanged, which matters because it was the other suspect: this task must
+  not trade one cause for the other.
+- `n_kgroups == 1` (`head_dim >= SG_TG`, the 27B's path) SKIPS the merge entirely and every
+  expression degenerates to P2.8's, including the fold's lane mask (`lid & (kw-1) == lid` at
+  `kw == SG_TG`). That path was measured winning and had to not move.
+
+Determinism is unchanged in kind. P2.9 does make the fold WIDTH a function of `head_dim`, which is
+a shape parameter, uniform across the threadgroup and known before the first barrier, exactly like
+the tile loop's existing dependence on `len`. Two dispatches of the same shape fold identically,
+which is what the gates assert; a shape that depended on the DATA or on the dispatched
+`threads_per_threadgroup` is still absent.
+
+### Gate 8, the point of the task: before and after on the same machine, same session
+
+`./tests/bench_splitk.bin --reps 20 --seqs 8192,32768,131072,262144`, three alternating rounds of
+three arms (four-pass `--gqa`; P2.8's online kernel; P2.9's online kernel), median of the three
+rounds per cell, speedup relative to the SAME four-pass arm. The P2.8 arm is a metallib built from
+the parent commit's `src/kernels.metal`, so the two online arms differ only in this task's change.
+
+At the split count the decode policy dispatches (`clamp(seq / SG_TG, 4, 256)`):
+
+| shape | seq | n_splits | 4-pass us | P2.8 online | P2.9 online | P2.8 speedup | P2.9 speedup |
+|---|---|---|---|---|---|---|---|
+| 27B 24h/4kv/256d | 8192 | 32 | 587.30 | 532.90 | 543.90 | 1.102x | 1.080x |
+| 27B 24h/4kv/256d | 32768 | 128 | 996.35 | 1007.20 | 979.30 | 0.989x | 1.017x |
+| 27B 24h/4kv/256d | 131072 | 256 | 2400.65 | 2227.70 | 2206.35 | 1.078x | 1.088x |
+| 27B 24h/4kv/256d | 262144 | 256 | 4198.80 | 3896.40 | 3892.90 | 1.078x | 1.079x |
+| 4B 32h/8kv/128d | 8192 | 32 | 528.05 | 518.60 | 515.45 | 1.018x | 1.024x |
+| 4B 32h/8kv/128d | 32768 | 128 | 924.65 | 933.45 | 927.25 | 0.991x | 0.997x |
+| 4B 32h/8kv/128d | 131072 | 256 | 1982.00 | 2597.75 | 2078.00 | 0.763x | **0.954x** |
+| 4B 32h/8kv/128d | 262144 | 256 | 3482.40 | 5045.00 | 3431.65 | 0.690x | **1.015x** |
+
+The 4B's deep regression is gone: 0.690x to 1.015x at 262144 and 0.763x to 0.954x at 131072, and
+the P2.9 kernel is **1.25x to 1.57x faster than the P2.8 kernel** at every 4B point where P2.8
+lost. Away from the policy point the gain is larger, because a lower split count means a longer
+split and therefore a deeper V phase: at `n_splits` 4 to 16 the 4B goes from 1.00x-1.05x to
+1.16x-1.71x (seq 262144, `n_splits` 4: 30535 us four-pass, 30017 P2.8, 17914 P2.9).
+
+The 27B path is unchanged, as designed: the P2.9/P2.8 ratio over all 27 of its (seq, n_splits)
+cells is 0.980x to 1.033x, inside the round-to-round spread of a single arm (the 27B at seq 8192
+`n_splits` 32 measured 1.142/1.102/1.058 across three rounds of the SAME arm).
+
+### The 4B still does not win outright, and here is the honest version
+
+Best-`n_splits` against best-`n_splits`, the 4B four-pass kernel is still ahead at depth: 1982 us
+(`n_splits` 256) against the online kernel's 2046-2078 at seq 131072, and 3366 us (`n_splits` 512)
+against 3431 at seq 262144, i.e. 2% to 5%. At the policy split count the two now trade places by
+seq (0.954x at 131072, 1.015x at 262144). What P2.9 removed is the large loss, not the last few
+percent.
+
+**P2.8's leading suspect is now measured and it is small.** A diagnostic metallib with the online
+scratch cut from 8 KB to 4 KB (`SG_SPLITK_ONLINE_RED = 4*SG_TG`, group arms above 4 removed so
+nothing can over-run it, 4B rows only, three alternating rounds) is **0.4% to 1.8% faster**, median
+about 0.8%, across all 17 (seq, n_splits) cells at seq 131072 and 262144. So the static worst-case
+allocation costs about 1%, not the tens of percent the V-phase waste cost, and P2.8's follow-up 1
+(a host-provided `[[threadgroup(0)]]` length, whose failure mode is threadgroup memory corruption)
+buys about 1% for that risk. That is a much weaker case than it looked before this measurement.
+
+The remaining few percent on the 4B is therefore NOT the allocation and NOT thread waste. The
+shape of the numbers points at the per-tile synchronization the four-pass kernel does not pay: the
+online kernel folds twice and transposes once per 256-key tile, and at the policy split count a
+split is only about four tiles, so the score-row traffic it saves no longer covers that fixed cost.
+(That saving is `R` floats per key against `head_dim` K and V elements per key, touched about five
+times across the four passes: an upper bound of roughly `5R/head_dim` of the K+V bytes, 16% on the
+4B, and only an upper bound because the score row is small enough per split to be partly cached.)
+That is consistent with the online kernel winning by 1.5x-1.7x at low split counts, where a split
+is hundreds of tiles and the V phase dominates. It was not measured directly and no Metal capture
+was taken.
+
+### Why the four-pass kernels were left alone
+
+The four-pass GQA partial has the same idle half in its phase 4, and fixing it the same way is
+cheaper in one respect: its exponentials are already normalized to the split's single `m`, so
+merging key groups would be a plain SUM of `n_kgroups` partial accumulators with no weights. It is
+more expensive in three:
+
+1. **It breaks a gate.** `metal_attn_splitk_gqa_bit_identical` asserts the four-pass GQA partial is
+   byte-identical to the per-head partial, and blocking the acc sum changes its summation order.
+2. **Keeping that gate means touching the DEFAULT decode path.** The per-head partial is what
+   `SURGE_ATTN_SPLITK` (on by default) dispatches above seq 1024, so re-ordering its sums to match
+   would change the default logits in the last bits. That needs a P2.6-style greedy-token gate and
+   a re-freeze of the M3.4 27B fixtures (`tools/gate_q8.sh`, a ~10 minute scalar-C forward plus the
+   llama.cpp cross-check).
+3. **It imports the occupancy question.** The four-pass kernel reserves 1 KB of threadgroup memory
+   (`red[SG_TG]`); a key-group acc exchange needs `R x SG_TG` floats, so it would go to 8 KB, which
+   the paragraph above prices at about 1%. Its phase 4 also has no barriers, so its idle lanes
+   RETIRE rather than wait, which is why the same defect costs it less than it cost the streaming
+   kernel.
+
+Expected value is a few percent on one shape, against a byte-identity gate, the default decode
+path and a manual 27B re-freeze. Not a good trade, and not this task's scope.
+
+### Gates run, all on hardware, GPU idle-checked (`pgrep` empty before each)
+
+| # | gate | result |
+|---|---|---|
+| 1 | `xcrun metal -fno-fast-math -Wall -c` + `metallib` | clean, rc 0; `metal-nm` still lists `k_attn_decode_splitk_partial_gqa_online` |
+| 2 | `clang -fsyntax-only -std=c11 -Wall -Wextra -Werror`, with and without `-DSURGE_NO_METAL`, on `metal.m` + the three affected test/bench files | clean, all 8 combinations |
+| 3 | `make debug` | rc 0, **83523 checks, 0 failures, 0 sanitizer diagnostics**, identical to the P2.8 baseline |
+| 4 | `make check` | rc 0, **87509 checks, 0 failures** (87257 at the parent commit, +252 from three new shapes) |
+| 4b | every P2.4-P2.8 gate | unchanged, same numbers: 513 GQA dispatches + 15360 per-head with the switch on, 15873 with it off, logits byte-identical at 16896/16896; P2.6 cap gate 257/257 above the divergence seq, 0 of 16639 below, argmax 16896/16896; four-pass GQA partial still byte-identical to the per-head partial; both 100x determinism subtests byte-identical |
+| 5 | accuracy vs `sg_ref_attn_decode_splitk` AND `sg_ref_attn_decode` | worst **rel 2.109e-06** over 15 shapes x 7 split counts x 2 oracles, exactly P2.8's worst and at P2.8's point (`head_dim` 256, the path this task does not change). The `head_dim < SG_TG` paths that P2.9 does change are all at or below **1.267e-06** |
+| 6 | 100x determinism on the NEW path (`head_dim` 128, `n_kgroups` 2) | `m/s/acc/out` byte-identical over 100 reruns |
+| 7 | real-model greedy A/B, 4B Q8_0, 5267-token prompt (above the P2.7 floor) | `gen_ids` **byte-identical** across all three arms, sha256 `70f22515...`, the same digest P2.8 recorded. 0 of 64 token mismatches. **63 of 64 margins differ**, largest perturbation 1.520e-03; smallest decision margin 1.068974e-02 at position 56 where the perturbation is 1.013e-03, **10.6x headroom**. The four-pass control arm is byte-identical in the MARGINS too (0 of 64 differ), which is what proves the perturbation comes from the online kernel alone. Reproduced exactly in a second independent run |
+| 8 | timing A/B, `--reps 20`, both shapes, 8192/32768/131072/262144, 3 alternating rounds | the table above |
+
+One thing came out of an external adversarial review of the kernel (kimi; codex was out of credits
+until 2026-08-20): the safety of every `red[j*SG_TG + ...]` index rested on `R <= 8` being true only
+because the switch that instantiates the template stops there. A ninth arm added later would have
+written past the scratch silently. `splitk_partial_group_online<R>` now carries
+`static_assert(R * SG_TG <= SG_SPLITK_ONLINE_RED)`. It emits no code: the metallib built with it is
+BYTE-IDENTICAL to the one every gate above ran against, and the negative control (shrinking
+`SG_SPLITK_ONLINE_RED` to `4*SG_TG`) fails the build at arms 5 through 8 as intended.
+
+Three new accuracy shapes were added for the paths P2.9 introduces that no existing shape reached:
+`head_dim` 96 (`kw` 128, 2 groups, 32 lanes per group own no dim), 40 (`kw` 64, 4 groups) and 16
+(below the 32 floor, 8 groups, half of each group idle). The existing shapes already reach
+`n_kgroups` 1, 2, 4 and 8 and, at their higher split counts, both a partial last group and groups
+that are EMPTY for a whole split.
+
+### A positive control, since nothing on the host can observe the split
+
+P2.8's kernel was bit-identical to the four-pass kernel whenever a split fitted one 256-key tile.
+That is no longer true at `head_dim < SG_TG`, because the exponential sum is now per group, and
+that is the one externally visible signature that the key groups are real. The same test binary
+against the two metallibs, same shape, same inputs, `32x8x128 seq200 n_splits 1` (one tile, two key
+groups):
+
+| kernel | `s` vs four-pass | `out` vs four-pass |
+|---|---|---|
+| P2.8 | 0/32 floats differ | 0/4096 floats differ |
+| P2.9 | 13/32 floats differ, worst 3.815e-06 | 3545/4096 differ, worst 1.341e-07 |
+
+And at `n_splits` 2 on the same shape, where the split is 100 keys so group 1 is EMPTY, P2.9 is
+back to 0/64 and 0/4096: an empty key group is a bit-level no-op through the merge, which is the
+degenerate case the merge has no special case for.
+
+### Not measured, still
+
+- Occupancy directly. No Metal capture was taken, so the "per-tile synchronization" reading of the
+  remaining few percent is a hypothesis bounded by the sweep, exactly as P2.8's was.
+- The 27B end to end. Gate 7 is the 4B checkpoint; the 27B-Q8_0 greedy A/B with the online switch
+  on is still a separate manual gate.
+- Whether the split policy should be re-fitted for the streaming kernel. P2.8 left this open and it
+  is still open, and P2.9 moves the 4B's best split count (the four-pass prefers 512 at seq 262144,
+  the online kernel 256).
+- End-to-end decode throughput per arm. Gate 7's `decode tok/s` column is NOT usable for that: two
+  runs of the identical three arms gave 38.47/25.40/16.71 and then 39.72/41.16/34.66 tok/s, because
+  each arm's 64 decode tokens follow its own 70-second prefill and the M3 Ultra's power state has
+  not settled. Gate 8 is the timing authority; gate 7 is a correctness gate.

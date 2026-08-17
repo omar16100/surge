@@ -3237,7 +3237,17 @@ static void metal_attn_splitk_gqa_bit_identical(void) {
  * The s/acc/out byte differences against the four-pass kernel are REPORTED
  * rather than asserted, because the interesting number is how small they are,
  * and because "zero differences" is a legitimate outcome for the shapes whose
- * splits fit one tile (one key per lane, same trees, same order). */
+ * splits fit one tile (one key per lane, same trees, same order).
+ *
+ * P2.9 NARROWS THAT LAST SENTENCE, deliberately. With head_dim < SG_TG the kernel
+ * now splits the tile's keys across SG_TG/kw KEY GROUPS so that every thread owns
+ * an output dim in the V phase, and each group's exponential sum is folded
+ * separately and then merged by the split-K combine's own log-sum-exp weights. So
+ * a ONE-TILE split at head_dim 128 is no longer bit-identical to the four-pass
+ * kernel, while at head_dim 256 (n_kgroups 1, the path P2.8 measured winning) it
+ * still is. That change of ORDER is exactly what the reported diff lines below
+ * make visible, and it is why `m` (a maximum, order-independent) is the only thing
+ * still asserted exact. */
 static void online_report_diff(const char *label, const float *a, const float *b, size_t n) {
     size_t ndiff = 0;
     double worst = 0.0;
@@ -3564,7 +3574,20 @@ static void metal_attn_splitk_online_matches_ref(void) {
      *     256 + 64), so only 64 of 256 threads own an output dim in it.
      * seq 1000 with n_splits 1 gives four tiles in one split, which is where the
      * rescale is live; every row also gets a split count above its seq, so the
-     * empty-split encoding is exercised at every group size. */
+     * empty-split encoding is exercised at every group size.
+     *
+     * P2.9 ADDS THE KEY-GROUP COVERAGE. n_kgroups = SG_TG / kw with kw the
+     * smallest power of two >= head_dim (floor SG_SPLITK_ONLINE_KW_MIN 32), so the
+     * rows above already reach n_kgroups 1 (head_dim 256 and 320), 2 (128), 4 (64)
+     * and 8 (32), and every one of them at a seq/n_splits pair where the LAST
+     * group's slice of a tile is partial (seq 200 or 300 with n_splits 1) and
+     * where later groups are EMPTY for the whole split (n_splits 2 and up, where
+     * a split is shorter than one tile). What they do NOT reach is a head_dim that
+     * is not a power of two, where kw > head_dim and some lanes of EVERY group own
+     * no dim, and a head_dim below the 32 floor. Three rows for that:
+     *   head_dim 96  -> kw 128, 2 groups, 32 of each group's 128 lanes idle;
+     *   head_dim 40  -> kw 64,  4 groups, 24 of each group's 64 lanes idle;
+     *   head_dim 16  -> kw 32 (the floor), 8 groups, half of each group idle. */
     splitk_online_shape("32x8x128 seq200 dense r4", 32, 8, 128, 200, 128, 0x7C0A1u);
     splitk_online_shape("32x8x128 seq1000 gated r4", 32, 8, 128, 1000, 256, 0x7C0A2u);
     splitk_online_shape("24x4x256 seq1000 dense r6", 24, 4, 256, 1000, 256, 0x7C0A3u);
@@ -3577,6 +3600,9 @@ static void metal_attn_splitk_online_matches_ref(void) {
     splitk_online_shape("16x2x32 seq300 r8", 16, 2, 32, 300, 32, 0x7C0AAu);
     splitk_online_shape("16x1x64 seq300 r16", 16, 1, 64, 300, 64, 0x7C0ABu);
     splitk_online_shape("8x2x320 seq600 r4 hd>SG_TG", 8, 2, 320, 600, 320, 0x7C0ACu);
+    splitk_online_shape("8x2x96 seq300 r4 kw>hd", 8, 2, 96, 300, 96, 0x7C0ADu);
+    splitk_online_shape("6x2x40 seq300 r3 kw>hd", 6, 2, 40, 300, 80, 0x7C0AEu);
+    splitk_online_shape("4x2x16 seq300 r2 kw floor", 4, 2, 16, 300, 16, 0x7C0AFu);
     splitk_online_determinism();
     splitk_online_rejects_bad_arguments();
     splitk_online_off_by_default();

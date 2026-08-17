@@ -26,6 +26,22 @@
  * kernel-speed number with the sleep excluded -- prefill_tps is the one
  * that falls when duty-cycling is active, since it is plain wall-clock.
  *
+ * DECODE DUTY-CYCLE + CLAMP DETECTION (Task P3.0): --decode-work-ms W and
+ * --decode-rest-ms R (both > 0 to take effect) are the decode analogue,
+ * sleeping R ms between tokens after every W ms of accumulated decode step
+ * time. The policy is src/sched.c's, not this file's; see surge.h for the
+ * contract and the clamp signal's exact rule. It exists because decode
+ * throughput here is partly a function of how recently the GPU was busy:
+ * P2.9 measured 38.47 / 25.40 / 16.71 tok/s across three IDENTICAL arms and,
+ * after 150 s of idle, 39.72 / 41.16 / 34.66 on the same three. Like the
+ * prefill rest it is PURE TIMING and does not change gen_ids, and it is OFF
+ * unless asked for. The JSON reports decode_rest_s (the slept subset of
+ * decode_wall_s) and decode_compute_tps (rest excluded from the denominator)
+ * exactly as the prefill pair does, plus decode_clamp_events and
+ * decode_baseline_ms, which are filled in on EVERY run whether paced or not
+ * -- a nonzero clamp count means that row's decode tok/s mixes two GPU clock
+ * states and should not be ranked against another row's.
+ *
  * This is the harness B7 runs to produce surge's row in the 256K comparison
  * (/Users/macmini/projects/llm-rnd/docs/256k_comparison.md). It wires the
  * pure-C bench math of src/bench.c (B1-B4 + the B2 peak-memory probe) to the
@@ -88,6 +104,7 @@ static void usage(void) {
         "         [--prompt-file PATH | -p TEXT | --ids LIST]\n"
         "         [--max-ctx N] [-n N] [--chunk N] [--no-prefill]\n"
         "         [--prefill-work-ms W] [--prefill-rest-ms R]\n"
+        "         [--decode-work-ms W] [--decode-rest-ms R]\n"
         "         [--engine STR] [--model STR] [--log-id STR]\n"
         "         [--expect-min N] [--expect-max N] [--bos | --no-bos]\n"
         "         [--gemm-gate-tflops F] [--json PATH]\n"
@@ -110,6 +127,18 @@ static void usage(void) {
         "                        Reactive, so the first overrun still happens in\n"
         "                        full: set it well under 80000, past which macOS\n"
         "                        watchdog-kills WindowServer\n"
+        "  --decode-work-ms W    decode duty-cycle work budget before a rest\n"
+        "                        (needs --decode-rest-ms too; 0/unset = disabled)\n"
+        "  --decode-rest-ms R    decode duty-cycle idle sleep, ms, once W ms of\n"
+        "                        decode step time has accumulated. Pure timing:\n"
+        "                        gen_ids are unchanged, only wall time moves\n"
+        "  --decode-clamp-div D  when the clamp detector latches, divide the work\n"
+        "                        budget by D so rests get D times denser\n"
+        "                        (default 1 = the detector only reports)\n"
+        "  --decode-baseline-ms B  compare decode step times against B instead of\n"
+        "                        measuring a baseline from this run's own first\n"
+        "                        steps, which is the only way to detect a run that\n"
+        "                        was ALREADY slow at its first token\n"
         "  --engine STR      engine label for the row (default \"surge\")\n"
         "  --model STR       model label for the row (default: basename of path)\n"
         "  --log-id STR      log id recorded in the JSON\n"
@@ -222,7 +251,12 @@ static int emit_row(const sg_bench_row *row, const char *json_path) {
     printf("%s\n", md);
 
     if (json_path) {
-        char js[2048];
+        /* 4096, not 2048: P3.0's five decode fields pushed the worst case
+         * (every byte of model/engine/status/log_id escaping to \u00XX, so
+         * 1420 bytes of strings alone, plus ~790 of keys and numbers) past
+         * 2048, and sg_bench_format_json truncates silently rather than
+         * failing. Sized with room for the next few fields. */
+        char js[4096];
         sg_bench_format_json(row, js, sizeof js);
         FILE *jf = fopen(json_path, "wb");
         if (!jf) { fprintf(stderr, "surge-bench: cannot write %s\n", json_path); return 1; }
@@ -241,6 +275,9 @@ int main(int argc, char **argv) {
     uint32_t n_gen = 300, max_ctx_arg = 0, chunk_size = SG_PREFILL_CHUNK_DEFAULT;
     uint32_t warmup_arg = 0;
     uint32_t prefill_work_ms = 0, prefill_rest_ms = 0, prefill_max_burst_ms = 0;
+    /* Task P3.0 decode pacing. All 0 = disabled, which is the default. */
+    uint32_t decode_work_ms = 0, decode_rest_ms = 0, decode_clamp_div = 0;
+    double decode_baseline_ms = 0.0;
     bool has_warmup = false, no_prefill = false, quiet = false;
     uint64_t expect_min = 0, expect_max = 0;
     bool has_expect_min = false, has_expect_max = false;
@@ -283,6 +320,19 @@ int main(int argc, char **argv) {
         else if (strcmp(argv[i], "--prefill-work-ms") == 0) PARSE_U32("--prefill-work-ms", prefill_work_ms);
         else if (strcmp(argv[i], "--prefill-max-burst-ms") == 0) PARSE_U32("--prefill-max-burst-ms", prefill_max_burst_ms);
         else if (strcmp(argv[i], "--prefill-rest-ms") == 0) PARSE_U32("--prefill-rest-ms", prefill_rest_ms);
+        else if (strcmp(argv[i], "--decode-work-ms") == 0) PARSE_U32("--decode-work-ms", decode_work_ms);
+        else if (strcmp(argv[i], "--decode-rest-ms") == 0) PARSE_U32("--decode-rest-ms", decode_rest_ms);
+        else if (strcmp(argv[i], "--decode-clamp-div") == 0) PARSE_U32("--decode-clamp-div", decode_clamp_div);
+        else if (strcmp(argv[i], "--decode-baseline-ms") == 0) {
+            NEED_VALUE("--decode-baseline-ms");
+            char *end = NULL;
+            decode_baseline_ms = strtod(argv[++i], &end);
+            if (!end || *end != '\0' || argv[i][0] == '\0' || !(decode_baseline_ms > 0.0)) {
+                fprintf(stderr, "surge-bench: --decode-baseline-ms expects a positive "
+                                "number of milliseconds, got '%s'\n", argv[i]);
+                return 2;
+            }
+        }
         else if (strcmp(argv[i], "--engine") == 0) { NEED_VALUE("--engine"); engine = argv[++i]; }
         else if (strcmp(argv[i], "--model") == 0) { NEED_VALUE("--model"); model_name = argv[++i]; }
         else if (strcmp(argv[i], "--log-id") == 0) { NEED_VALUE("--log-id"); log_id = argv[++i]; }
@@ -491,6 +541,42 @@ int main(int argc, char **argv) {
         if (!quiet) fprintf(stderr, "  prefill max burst: %u ms per command "
                             "buffer\n", prefill_max_burst_ms);
     }
+
+    /* Task P3.0: the decode pacer, armed here next to the prefill one so all
+     * the duty-cycle configuration is in one place, but it only ever acts
+     * inside the decode loop below. sg_decode_pace_init with either field 0
+     * (the default when the flags are absent) leaves pacing OFF: the pacer
+     * then never sleeps, decode_rest_s stays exactly 0, and the decode path
+     * behaves as it did before this task. The DETECTOR runs either way,
+     * because it costs no wall time and its output is what tells a reader
+     * whether this row's decode number was taken under a rising step time. */
+    sg_decode_pacer pacer;
+    sg_decode_pace_init(&pacer, decode_work_ms, decode_rest_ms);
+    if (decode_clamp_div > 0) {
+        sg_decode_pace_tune(&pacer, SG_PACE_DEF_BASELINE_N, SG_PACE_DEF_CONFIRM_N,
+                            SG_PACE_DEF_CLAMP_RATIO, decode_clamp_div);
+    }
+    if (decode_baseline_ms > 0.0) sg_decode_pace_set_baseline(&pacer, decode_baseline_ms);
+    /* A half-armed pair is DISABLED (sg_decode_pace_init's rule, mirroring
+     * B8's), which is the safe default but is indistinguishable from "armed
+     * and never tripped" if the operator mistyped one flag. Say so rather
+     * than leaving them to infer it from decode_rests being 0. Not a hard
+     * error: unlike P2.6's env value, both orderings here are legitimate for
+     * a caller that sets one flag from a script variable that happens to be
+     * empty, and B8's equivalent accepts it silently. */
+    if ((decode_work_ms > 0) != (decode_rest_ms > 0)) {
+        fprintf(stderr, "surge-bench: WARNING: decode pacing needs BOTH "
+                        "--decode-work-ms (%u) and --decode-rest-ms (%u) to be > 0; "
+                        "it is DISABLED for this run\n", decode_work_ms, decode_rest_ms);
+    }
+    if (!quiet && decode_work_ms > 0 && decode_rest_ms > 0) {
+        fprintf(stderr, "  decode duty-cycle: work-budget %u ms, rest %u ms, "
+                        "clamp-div %u\n", decode_work_ms, decode_rest_ms, pacer.clamp_div);
+    }
+    if (!quiet && decode_baseline_ms > 0.0) {
+        fprintf(stderr, "  decode clamp baseline: %.3f ms (seeded, not measured "
+                        "from this run)\n", decode_baseline_ms);
+    }
     const float *lg = NULL;
     double t_run_start = now_s();
     double t0 = t_run_start;
@@ -550,8 +636,24 @@ int main(int argc, char **argv) {
             if (tok && (int32_t)arg == sg_tok_eos(tok)) break;
             if (i + 1 == n_gen) break;                  /* last token needs no logits */
             if ((uint64_t)n_ids + i >= max_ctx) break;
+            /* Task P3.0: this pair of clock reads brackets sg_gpu_forward
+             * ALONE, deliberately. The cheaper option was to difference the
+             * t_wall series above, but that measures the whole loop iteration
+             * (argmax over the vocab, the periodic sample_mem, the progress
+             * fprintf), and feeding the detector a step time that includes
+             * work whose cost varies for its own reasons is exactly how a
+             * clamp detector acquires false positives. The reads cost two
+             * clock_gettime calls per token and feed nothing that reaches a
+             * logit, a KV entry or a token id. */
+            double t_step = now_s();
             e = sg_gpu_forward(gpu, &m, (int32_t)arg, (uint32_t)(n_ids + i), &lg);
             if (sg_failed(e)) { fprintf(stderr, "surge-bench: %s\n", e.msg); goto done; }
+            /* The rest lands HERE: after this step's forward has completed
+             * (GPU idle at this instant) and before the next one is encoded,
+             * the decode analogue of B8's between-chunks placement. When
+             * pacing is disabled -- the default -- sg_decode_pace_step
+             * returns 0 without sleeping and this is a no-op. */
+            sg_decode_pace_step(&pacer, (now_s() - t_step) * 1000.0);
             if (!quiet && (i % 32 == 0 || i + 2 == n_gen)) {
                 fprintf(stderr, "\r  generated %u/%u", i + 1, n_gen);
             }
@@ -562,6 +664,28 @@ int main(int argc, char **argv) {
     row.decode_wall_s = now_s() - t_decode_phase_start;
     row.n_gen = produced;   /* the ACTUAL number generated (EOS may stop early) */
     sample_mem(gpu, &mt_phys, &mt_alloc);      /* after decode */
+
+    /* Task P3.0, the decode mirror of B8's prefill rest accounting.
+     * decode_rest_s is the slept SUBSET of decode_wall_s (0 when pacing is
+     * disabled, which is the default), and decode_compute_tps excludes it
+     * from the denominator: the fair full-clock decode rate, as opposed to
+     * decode_tps_slope / decode_tps_avg, which are wall-clock and therefore
+     * fall when pacing is active. The detector's two fields are filled in on
+     * every run, paced or not. */
+    row.decode_rest_s = (double)sg_decode_pace_rest_ms(&pacer) / 1000.0;
+    double decode_compute_wall = row.decode_wall_s - row.decode_rest_s;
+    row.decode_compute_tps = (decode_compute_wall > 0.0)
+        ? (double)produced / decode_compute_wall : -1.0;
+    row.decode_rests = sg_decode_pace_rests(&pacer);
+    row.decode_clamp_events = sg_decode_pace_clamp_events(&pacer);
+    row.decode_baseline_ms = sg_decode_pace_baseline_ms(&pacer);
+    if (!quiet && (row.decode_rest_s > 0.0 || row.decode_clamp_events > 0)) {
+        fprintf(stderr, "bench: decode rested %.3f s over %u rests; clamp detector "
+                        "fired %u time(s) over %u step(s) against a %.3f ms baseline\n",
+                row.decode_rest_s, row.decode_rests,
+                row.decode_clamp_events, sg_decode_pace_clamp_steps(&pacer),
+                row.decode_baseline_ms);
+    }
 
     /* ---- decode-by-slope + mlx-style average ---- */
     uint32_t warmup = has_warmup ? warmup_arg : sg_bench_default_warmup(produced);

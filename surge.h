@@ -1505,6 +1505,276 @@ void *sg_kv_s(const sg_kv *kv, uint32_t layer);
 uint32_t sg_argmax_f32(const float *v, uint32_t n);
 
 /* ---------------------------------------------------------------------
+ * Decode pacing + clamp detection (Task P3.0, src/sched.c)
+ * ---------------------------------------------------------------------
+ *
+ * PURE C, no Metal, no GPU, no Foundation. The DECISION LOGIC is a function
+ * of (step timings, work budget, rest) with no clock read and no sleep
+ * inside it, so it is unit-exact under `make debug` (SURGE_NO_METAL +
+ * ASan/UBSan) with no GPU anywhere in the picture. Only
+ * sg_decode_pace_step's optional nanosleep touches the outside world.
+ *
+ * WHY THIS EXISTS. Decode throughput on this machine is partly a function
+ * of how recently the GPU was busy. P2.9 (2026-08-18) ran THREE IDENTICAL
+ * decode arms on the same binary and prompt and measured 38.47, 25.40 and
+ * 16.71 tok/s; after 150 s of idle it re-ran the same three arms and the
+ * order REVERSED, at 39.72, 41.16 and 34.66 tok/s. Nothing about the
+ * kernels changed between those runs. That 2.4x spread on identical work is
+ * why P2.9 declared surge-bench decode tok/s unusable for A/B ranking.
+ * Prefill has a mitigation for the related problem (B8's duty cycle, which
+ * yields the GPU between chunks); decode had none. This is decode's.
+ *
+ * TWO PARTS, and they are separable:
+ *
+ *   (1) A DUTY CYCLE, the direct analogue of sg_gpu_set_prefill_rest: after
+ *       work_budget_ms of accumulated decode step time, rest rest_ms with
+ *       nothing in flight. OFF unless both fields are > 0, exactly like
+ *       B8's, because a decode path that silently inserted sleeps would
+ *       corrupt every timing number this project has recorded.
+ *
+ *   (2) A CLAMP DETECTOR, which needs no configuration and never sleeps on
+ *       its own. surge cannot read GPU frequency, so the signal is the only
+ *       thing surge can observe: per-step decode wall time rising against
+ *       its own baseline, PERSISTENTLY. See sg_decode_pace_decide for the
+ *       exact rule and, importantly, for what else can trip it.
+ *
+ * NOT A GPU OBJECT. Unlike B8's prefill rest, which lives on `sg_gpu`
+ * because the chunk loop it paces is inside sg_gpu_prefill, there is no
+ * decode loop inside src/metal.m: sg_gpu_forward is ONE step and the
+ * per-token loop belongs to the caller (src/cli_bench.c, src/cli_metal.c).
+ * So the pacer is a caller-owned value, and src/metal.m is not involved.
+ *
+ * The struct is transparent (like sg_mem_tracker) so it needs no allocator
+ * and a test can inspect its state directly rather than inferring it. Treat
+ * the fields as read-only outside src/sched.c; use the accessors. */
+
+/* Upper bound on baseline_n, so the sample ring is inline and the whole
+ * pacer is a plain value with no ownership. */
+#define SG_PACE_MAX_BASELINE 32u
+
+/* Defaults sg_decode_pace_init installs. See sg_decode_pace_decide for the
+ * reasoning behind each, and docs/18082026_decode_pacing.md for the
+ * measurement the ratio was chosen against. */
+#define SG_PACE_DEF_BASELINE_N 8u
+#define SG_PACE_DEF_CONFIRM_N  3u
+#define SG_PACE_DEF_CLAMP_RATIO 1.5
+
+/* DEFAULT 1, meaning a confirmed clamp changes no rest schedule at all: the
+ * detector REPORTS by default and drives nothing. That default is deliberate
+ * and it is the conservative one. A divisor d > 1 makes a confirmed clamp
+ * drop the rest threshold to work_budget_ms / d, so rests get up to d times
+ * denser while the signal persists.
+ *
+ * Why it is not on by default. The detector cannot identify a cause (see
+ * sg_decode_pace_decide), so every false positive it has would be multiplied
+ * into d times the idle time, spent for nothing. And the obvious rationale
+ * for escalating -- "rest harder and the clock comes back" -- is the one this
+ * project's own telemetry does NOT support: over 376 burst pairs in the
+ * 2026-08-14 256K run, rest length did not predict the next burst's clock
+ * (r = +0.017), which is why B8's rationale in this header was corrected away
+ * from clock recovery and toward compositor protection.
+ *
+ * The rationale that does survive is contention. If the slowdown is another
+ * process taking a share of the GPU, yielding more is the right response and
+ * is exactly what B8 yields for. An operator who knows that is the case can
+ * set d; surge will not guess it.
+ *
+ * The divisor form (rather than "rest after every step while clamped") is
+ * what bounds the cost: at most one rest_ms per work_budget_ms / d of work,
+ * so the worst-case idle fraction a confirmed clamp can add is
+ * rest_ms / (work_budget_ms / d + rest_ms), computable before the run. */
+#define SG_PACE_DEF_CLAMP_DIV 1u
+
+typedef struct {
+    /* --- configuration (sg_decode_pace_init / sg_decode_pace_tune) --- */
+    uint32_t work_budget_ms;  /* 0 => pacing disabled (never sleeps) */
+    uint32_t rest_ms;         /* 0 => pacing disabled (never sleeps) */
+    uint32_t baseline_n;      /* steps per baseline, 1..SG_PACE_MAX_BASELINE */
+    uint32_t confirm_n;       /* consecutive steps to confirm/clear a clamp */
+    double   clamp_ratio;     /* "over" means step_ms > baseline_ms * ratio */
+    uint32_t clamp_div;       /* 1 => a clamp changes no rest schedule */
+
+    /* --- detector state, not configuration --- */
+    bool     baseline_seeded; /* baseline came from sg_decode_pace_set_baseline
+                               * rather than from this run's own first steps.
+                               * Deliberately NOT among the fields
+                               * sg_decode_pace_reset preserves: a reset means
+                               * "measure the next phase fresh", and silently
+                               * keeping a baseline seeded for the previous
+                               * phase would be the opposite of that. */
+
+    /* --- state --- */
+    double   work_acc_ms;     /* decode step time since the last rest */
+    double   baseline_ms;     /* 0.0 until baseline_n samples have arrived */
+    double   samples[SG_PACE_MAX_BASELINE];
+    uint32_t n_samples;       /* samples collected toward the baseline */
+    uint32_t over_run;        /* consecutive over-threshold steps */
+    uint32_t under_run;       /* consecutive under-threshold steps */
+    uint32_t clamp_events;    /* times the detector LATCHED (edges, not steps) */
+    uint32_t clamp_steps;     /* steps observed while latched */
+    uint32_t rests;           /* rests emitted */
+    uint64_t rest_total_ms;   /* accumulated rest, ms */
+    uint64_t steps;           /* real step measurements fed in; a non-finite
+                               * or non-positive step is dropped before this
+                               * is incremented, so it is not "calls made" */
+    bool     clamped;         /* detector latched right now */
+} sg_decode_pacer;
+
+/* Zeroes all state, installs the SG_PACE_DEF_* detector defaults, and sets
+ * the duty cycle. Either argument 0 leaves pacing DISABLED: no threshold is
+ * ever crossed, sg_decode_pace_decide always returns 0, and
+ * sg_decode_pace_step never sleeps. The detector still runs when disabled
+ * (it costs a few doubles per step and no syscall), so clamp_events is
+ * meaningful on an unpaced run too, which is the point: it tells a bench row
+ * whether its own decode measurement was taken under a rising step time.
+ * A NULL pacer is a no-op, matching this file's defensive-NULL convention. */
+void sg_decode_pace_init(sg_decode_pacer *p, uint32_t work_budget_ms, uint32_t rest_ms);
+
+/* Overrides the detector's four constants and resets the detector's state
+ * (baseline, sample ring, run counters, clamped flag) so the new settings
+ * take effect from the next step rather than being mixed with samples
+ * gathered under the old ones. Leaves the duty cycle and the accumulated
+ * totals (rest_total_ms, rests, steps, clamp_events) alone. Call it AFTER
+ * sg_decode_pace_init, which installs the defaults and would otherwise
+ * overwrite these. Out-of-range arguments are CLAMPED, not rejected:
+ * baseline_n into [1, SG_PACE_MAX_BASELINE], confirm_n and clamp_div to at
+ * least 1, clamp_ratio to at least 1.0 (a ratio below 1 would make an
+ * at-baseline step "over" its own baseline, latching the detector on every
+ * clean run). Exists so a test can force the detector to fire on a short
+ * synthetic series, so the ratio can be retuned against fresh measurement
+ * without touching this header, and so an operator who has established that
+ * a slowdown is GPU contention can opt into clamp_div > 1. */
+void sg_decode_pace_tune(sg_decode_pacer *p, uint32_t baseline_n, uint32_t confirm_n,
+                         double clamp_ratio, uint32_t clamp_div);
+
+/* Seeds the detector's baseline from OUTSIDE the run instead of measuring it
+ * from the run's own first steps, and exists to cover the detector's worst
+ * blind spot.
+ *
+ * THE BLIND SPOT. A self-measured baseline defines this run's own opening
+ * steps as normal BY CONSTRUCTION. So a run that is already slow when it
+ * starts -- the GPU still in a low clock state from whatever ran before it,
+ * which is precisely the P2.9 case that motivated this task (its second and
+ * third arms were slow from their first token, at 25.40 and 16.71 tok/s
+ * against 38.47) -- reports ZERO clamp events, because nothing about it ever
+ * rises. Within-run detection cannot see a constant. Seeding a baseline
+ * measured on a known-idle machine is what makes that case visible.
+ *
+ * baseline_ms > 0 (and finite) installs it and marks the detector live
+ * immediately, so the very first step is classified rather than spent
+ * measuring. baseline_ms <= 0 (or non-finite) reverts to self-measurement
+ * and clears the detector. Either way the run counters and the latch reset.
+ *
+ * The second half of the mitigation needs no API: surge-bench reports the
+ * effective baseline as decode_baseline_ms in its JSON row, so comparing
+ * that field ACROSS runs shows a clamped-from-start run for what it is even
+ * when no baseline was seeded. */
+void sg_decode_pace_set_baseline(sg_decode_pacer *p, double baseline_ms);
+
+/* THE POLICY. Pure: no clock read, no sleep, no Metal. Call once per decode
+ * step with that step's measured wall time in ms; returns the number of ms
+ * the caller should now rest (0 = do not rest), and adds that to
+ * rest_total_ms on the caller's promise to honour it. Use
+ * sg_decode_pace_step in a real loop, which cannot break that promise; use
+ * this directly in tests, where the whole point is to drive the policy from
+ * a synthetic series with no wall clock involved.
+ *
+ * THE CLAMP SIGNAL, exactly. The baseline is the MEDIAN of the FIRST
+ * baseline_n steps fed in after init/tune/reset (or whatever
+ * sg_decode_pace_set_baseline was given), and is then FIXED. A step is
+ * "over" if step_ms > baseline_ms * clamp_ratio. The detector LATCHES
+ * (clamp_events++, clamped = true) only after confirm_n CONSECUTIVE over
+ * steps, and CLEARS after confirm_n consecutive not-over steps. Any single
+ * step of the other kind resets the corresponding run counter, so one slow
+ * step -- a page fault, a scheduler preemption, a mem sample -- cannot latch
+ * it and one fast step cannot clear it.
+ *
+ * WHY MEDIAN: the first decode steps after a prefill include first-touch
+ * and pipeline warm-up and can be several times the steady-state cost. A
+ * mean over baseline_n=8 would inherit that; a median cannot unless most of
+ * the window is affected. And the failure direction matters: a baseline
+ * biased HIGH desensitises the detector (fewer rests than warranted), a
+ * baseline biased LOW would insert rests that cost throughput for nothing,
+ * so the estimator is chosen to fail toward the former.
+ *
+ * WHAT ELSE TRIPS IT (the honest part). The signal is "sustained slowdown",
+ * which is NOT specific to a firmware clock clamp. Everything below fires it
+ * too, and surge cannot tell them apart from inside a decode loop:
+ *   - another process taking a share of the GPU,
+ *   - thermal throttling,
+ *   - legitimate drift as decode extends the KV cache the attention kernels
+ *     read (small within one decode run of a few hundred tokens, but real,
+ *     and unbounded if a caller feeds a long enough run against one fixed
+ *     baseline),
+ *   - a caller feeding step times that include non-GPU work whose cost grows
+ *     (which is why the wiring in src/cli_bench.c times sg_gpu_forward ALONE
+ *     and not the whole loop iteration).
+ * The detector's claim is therefore only "step time has persistently risen
+ * against this run's own baseline", which is exactly what makes a decode
+ * measurement untrustworthy. It is not a claim about a cause.
+ *
+ * WHAT IT CANNOT SEE, which matters more. It detects a RISE, so it cannot
+ * see a run that was slow before its first token. See
+ * sg_decode_pace_set_baseline for that blind spot, why it is the motivating
+ * case rather than a corner one, and the two ways to cover it.
+ *
+ * WHAT A CONFIRMED CLAMP DOES. By default (clamp_div == 1) nothing: it is
+ * counted and reported and the rest schedule is unchanged. With clamp_div
+ * > 1 the rest threshold drops to work_budget_ms / clamp_div while the
+ * signal persists. Nothing here is claimed to un-clamp anything: recovery
+ * from the M3 GPU clock limiter was observed to need 60-120 s of idle,
+ * orders of magnitude more than a per-token rest, and this project's own
+ * burst telemetry found no correlation between rest length and the next
+ * burst's clock. See SG_PACE_DEF_CLAMP_DIV.
+ *
+ * CANNOT CHANGE OUTPUT. The pacer reads only step times and writes only its
+ * own counters. Nothing it touches feeds a logit, a KV entry, or a token id,
+ * and resting happens with no work in flight. A paced decode and an unpaced
+ * decode over the same (model, prompt, n) emit byte-identical gen_ids; only
+ * wall time differs. tests/test_cli_bench.sh asserts that on a real model.
+ *
+ * A NULL pacer returns 0. A non-finite or non-positive step_ms is IGNORED
+ * (not counted, not accumulated, not fed to the baseline) rather than
+ * poisoning the baseline with it. */
+uint32_t sg_decode_pace_decide(sg_decode_pacer *p, double step_ms);
+
+/* sg_decode_pace_decide, then actually sleep whatever it returned. This is
+ * the entry point a real decode loop uses, and the reason it exists is that
+ * rest_total_ms must not be able to drift from reality: a caller cannot
+ * accidentally take the accounting without taking the sleep. Returns the ms
+ * slept (0 = none). The sleep is restarted on EINTR so a signal cannot cut
+ * it short and leave the accounting overstated. */
+uint32_t sg_decode_pace_step(sg_decode_pacer *p, double step_ms);
+
+/* Accumulated rest in ms across every step since init (NOT reset per call,
+ * unlike sg_gpu_prefill_rest_ms, which resets at the start of each prefill:
+ * a pacer instance IS the decode phase, so there is no enclosing call whose
+ * boundary would define a reset). sg_decode_pace_reset zeroes it. */
+uint64_t sg_decode_pace_rest_ms(const sg_decode_pacer *p);
+
+/* Number of times the detector LATCHED, i.e. rising edges, not steps spent
+ * clamped (sg_decode_pace_clamp_steps is that). > 0 on a run means the run's
+ * own step time persistently rose, so its throughput number mixes two clock
+ * states and should not be compared against another run's. */
+uint32_t sg_decode_pace_clamp_events(const sg_decode_pacer *p);
+uint32_t sg_decode_pace_clamp_steps(const sg_decode_pacer *p);
+
+/* Detector state right now, the baseline it is measuring against (0.0 until
+ * baseline_n steps have been fed), and the number of rests emitted. */
+bool sg_decode_pace_clamped(const sg_decode_pacer *p);
+double sg_decode_pace_baseline_ms(const sg_decode_pacer *p);
+uint32_t sg_decode_pace_rests(const sg_decode_pacer *p);
+
+/* Zeroes every counter and the detector state, keeping the configuration
+ * (both duty-cycle fields and all FOUR detector constants: baseline_n,
+ * confirm_n, clamp_ratio, clamp_div). A SEEDED baseline is NOT kept -- a
+ * reset means "measure the next phase fresh", and carrying a baseline seeded
+ * for the previous phase into it would be the opposite of that. For a caller
+ * that runs several decode phases through one pacer and wants each phase's
+ * baseline measured at that phase's own context length. */
+void sg_decode_pace_reset(sg_decode_pacer *p);
+
+/* ---------------------------------------------------------------------
  * Bench math (Task B1, src/bench.c)
  * ---------------------------------------------------------------------
  *
@@ -1586,6 +1856,42 @@ typedef struct {
                                  * duty-cycling is active). < 0 if the
                                  * denominator is <= 0 (not measured, or the
                                  * whole prefill was spent resting). */
+    /* Task P3.0, the decode-side mirror of the two fields above. Same
+     * discipline, same reason: with pacing armed, decode_tps_slope and
+     * decode_tps_avg are wall-clock and so FALL, and these are what let a
+     * reader separate compute from idle. */
+    double decode_rest_s;      /* total time the decode duty cycle slept,
+                                * seconds, a SUBSET of decode_wall_s (not
+                                * additional). 0 when pacing is disabled,
+                                * which is the default. */
+    double decode_compute_tps; /* n_gen / (decode_wall_s - decode_rest_s),
+                                * the fair full-clock decode rate with the
+                                * pacing idle excluded. < 0 if the
+                                * denominator is <= 0. */
+    uint32_t decode_rests;     /* rests the duty cycle emitted. Reported next
+                                * to decode_rest_s so a test can check the
+                                * accounting IDENTITY (rest_s == rests *
+                                * rest_ms) without depending on how long a
+                                * decode step happens to take on the machine
+                                * running it, and can bound the count by the
+                                * number of per-token pacing points, which
+                                * catches a rest emitted from the wrong place
+                                * in the loop. */
+    /* Detector output. These are populated on EVERY run, paced or not,
+     * because they cost no wall time and their job is to tell a reader
+     * whether the decode number next to them is trustworthy. */
+    uint32_t decode_clamp_events; /* times per-step decode time persistently
+                                   * rose against this run's own baseline.
+                                   * > 0 means the run mixes two GPU clock
+                                   * states and its decode tok/s should not
+                                   * be compared with another run's. */
+    double decode_baseline_ms;    /* the baseline those events were measured
+                                   * against, ms; 0 if decode was too short
+                                   * to establish one. Comparable ACROSS
+                                   * runs, which is the only way to see a run
+                                   * that was already slow at its first
+                                   * token: within-run detection cannot see a
+                                   * constant (see sg_decode_pace_set_baseline). */
     double peak_ram_gib;       /* process phys_footprint peak, Task B2 */
     double gpu_alloc_gib;      /* Metal currentAllocatedSize peak, Task B2 */
     uint32_t recall_hits;      /* NIAH direct-retrieval hits, Task B4 */
@@ -1616,7 +1922,11 @@ void sg_bench_format_md_row(const sg_bench_row *row, char *buf, size_t cap);
  * (model, engine, status, log_id) are JSON-escaped (quote, backslash, and
  * control bytes as \u00XX) so the output stays valid JSON even if one of
  * them ever contains a quote. snprintf-truncates into cap like the md
- * formatter. */
+ * formatter, so SIZE THE BUFFER for the worst case rather than the typical
+ * one: about 1.5 KB of escaped strings (every byte of model/engine/status/
+ * log_id becoming a 6-byte \u00XX) plus about 0.8 KB of keys and numbers.
+ * src/cli_bench.c uses 4096; anything under ~3 KB can silently drop the
+ * closing brace on a row with long, escape-heavy string fields. */
 void sg_bench_format_json(const sg_bench_row *row, char *buf, size_t cap);
 
 /* The GEMM-gate floor: a row is admissible only when its measured GEMM

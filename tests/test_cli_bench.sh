@@ -18,6 +18,10 @@
 #       tokenizer): `--bos` vs `--no-bos` change n_prompt_tokens by exactly 1.
 #       Skipped cleanly when the env var is unset (make check stays hermetic).
 #
+# Later tasks appended their own blocks below: B6's decode-slope verification,
+# B8's prefill duty-cycle, command-buffer segmentation, and P3.0's decode
+# duty-cycle + clamp detector.
+#
 # Wired into `make check` (Metal only) and `make bench-check`. Skips cleanly
 # (exit 0) if the binaries are missing or the machine has no Metal device.
 #
@@ -657,9 +661,304 @@ else
          "(command buffers $seg_n_off -> $seg_n_on)" >&2
 fi
 
+# ------------------------------------------------------------------
+# P3.0: decode duty-cycle + clamp detection (src/sched.c).
+#
+# The decode analogue of the B8 block above, and it exists for a measured
+# reason: P2.9 ran three IDENTICAL decode arms and got 38.47 / 25.40 / 16.71
+# tok/s, then after 150 s of idle re-ran the same three and got 39.72 /
+# 41.16 / 34.66. Decode throughput here is partly a function of how recently
+# the GPU was busy, and decode had no mitigation.
+#
+# Five checks. The first two mirror B8's exactly; the last three exist
+# because a pacing switch that is enabled and silently does nothing is this
+# project's established failure mode (P2.4's GQA gate).
+#
+#   (1) RESTS DON'T CHANGE OUTPUT: a forced-rest run (--decode-work-ms 1
+#       --decode-rest-ms 50, so the 1 ms budget is exhausted by every single
+#       decode step) must emit gen_ids BYTE-IDENTICAL to the same run with
+#       pacing off. Resting is timing, never arithmetic.
+#   (2) REST ACCOUNTING, in the parts that do not depend on this machine's
+#       clock. -n 16 with no EOS produces 16 tokens and therefore 15
+#       sg_gpu_forward calls (the last token needs no logits), so there are
+#       exactly 15 pacing points. Four assertions, none of them timing-
+#       dependent: decode_rest_s == decode_rests * rest_ms (the accounting
+#       IDENTITY -- the reported seconds cannot drift from the reported
+#       count); 1 <= decode_rests <= 15 (more rests than pacing points would
+#       mean the pacer is being called from somewhere other than the
+#       per-token boundary); the UNPACED run has decode_rest_s and
+#       decode_rests both exactly 0; decode_compute_tps (rest excluded from
+#       the denominator) exceeds decode_tps_avg (wall-clock); and, the one
+#       assertion here that is not bookkeeping, the paced run's decode_wall_s
+#       is at least its own decode_rest_s, so the reported rest was actually
+#       spent and not merely counted.
+#
+#       An exact expected COUNT is deliberately NOT asserted here, and the
+#       reason is measured: a decode step on this 8-layer fixture costs about
+#       1 ms, which is the smallest budget the flag can express, so over 8
+#       repeats one run in eight rested 14 times and the rest 15. The exact
+#       accumulator semantics (200 steps x 10 ms against a 100 ms budget =
+#       exactly 20 rests; an oversized step rests once, not repeatedly) are
+#       pinned deterministically instead in tests/test_sched.c, which runs
+#       under `make check` AND `make debug`, and an exact count IS asserted
+#       in the real-model arm below, where a step is 20x the budget.
+#   (3) THE DETECTOR IS WIRED IN, two-sided and deterministic. Seeding an
+#       absurdly small baseline (--decode-baseline-ms 0.001) makes every
+#       step "over" it, so decode_clamp_events MUST rise; seeding an absurdly
+#       large one makes no step over it, so it MUST stay 0. Without this the
+#       detector could report 0 forever because it was never fed a step, and
+#       nothing else here would notice.
+#   (4) THE ESCALATION IS NOT INERT. Same seeded-clamp run, a budget
+#       calibrated to be larger than the whole decode phase:
+#       --decode-clamp-div 1 must rest 0 times (the detector alone changes no
+#       schedule, which is the default), and --decode-clamp-div 4 must rest at
+#       least once (a confirmed clamp quarters the budget). One run proves the
+#       default is passive, the other proves the knob does something.
+#   (5) REAL MODEL (env-gated on SURGE_PACE_MODEL): the same
+#       gen_ids-unchanged proof on a real GGUF rather than the 8-layer
+#       fixture, PLUS the exact rest count that the fixture cannot give: a
+#       real decode step is tens of ms against the 1 ms budget, so every
+#       pacing point must rest and decode_rests must equal n_gen - 1
+#       exactly. Skipped cleanly when the env var is unset, so `make check`
+#       stays hermetic.
+# ------------------------------------------------------------------
+P30_REST_MS=50
+P30_PACE_POINTS=15     # 16 tokens produced -> 15 forwards -> 15 pacing points
+P30_REAL_N=24          # the real-model arm decodes 24 -> 23 pacing points
+P30_REAL_REST_MS=20
+
+p30_off="$(bench_gen "$GGUF" --ids "$IDS12" -n 16 --max-ctx 512)"
+p30_on="$(bench_gen "$GGUF" --ids "$IDS12" -n 16 --max-ctx 512 \
+    --decode-work-ms 1 --decode-rest-ms "$P30_REST_MS")"
+ncase=$((ncase + 1))
+if [ -z "$p30_off" ] || [ -z "$p30_on" ]; then
+    echo "FAIL p30 decode-rests-dont-change-output: empty gen_ids (off='$p30_off' on='$p30_on')" >&2
+    fail=1
+elif [ "$p30_off" != "$p30_on" ]; then
+    echo "FAIL p30 decode-rests-dont-change-output: paced gen_ids != unpaced gen_ids" >&2
+    echo "  off: $p30_off" >&2
+    echo "  on : $p30_on" >&2
+    fail=1
+else
+    echo "  ok p30 decode-rests-dont-change-output: gen_ids=$p30_on" >&2
+fi
+
+# $1 = output json path; remaining args appended to a standard 16-token run.
+p30_run() {
+    local out="$1"; shift
+    "$BENCH" "$GGUF" --ids "$IDS12" -n 16 --max-ctx 512 --gemm-gate-tflops 100 \
+        --json "$out" --quiet "$@" >/dev/null 2>/dev/null
+}
+p30_get() { sed -n "s/.*\"$2\":\([0-9.eE+-]*\).*/\1/p" "$1"; }
+# Same, with -n overridable: the escalation case below wants a longer decode
+# phase so its budget arithmetic is not dominated by per-step variance and
+# integer-millisecond truncation.
+p30_run_n() {
+    local out="$1" n="$2"; shift 2
+    "$BENCH" "$GGUF" --ids "$IDS12" -n "$n" --max-ctx 512 --gemm-gate-tflops 100 \
+        --json "$out" --quiet "$@" >/dev/null 2>/dev/null
+}
+
+ncase=$((ncase + 1))
+p30_on_json="$(mktemp)"; p30_off_json="$(mktemp)"
+p30_run "$p30_on_json" --decode-work-ms 1 --decode-rest-ms "$P30_REST_MS"
+p30_run "$p30_off_json"
+p30_rest_on="$(p30_get "$p30_on_json" decode_rest_s)"
+p30_rest_off="$(p30_get "$p30_off_json" decode_rest_s)"
+p30_n_on="$(p30_get "$p30_on_json" decode_rests)"
+p30_n_off="$(p30_get "$p30_off_json" decode_rests)"
+p30_ctps="$(p30_get "$p30_on_json" decode_compute_tps)"
+p30_wtps="$(p30_get "$p30_on_json" decode_tps_avg)"
+p30_base_off="$(p30_get "$p30_off_json" decode_baseline_ms)"
+p30_wall_on="$(p30_get "$p30_on_json" decode_wall_s)"
+rm -f "$p30_on_json" "$p30_off_json"
+if [ -z "$p30_rest_on" ] || [ -z "$p30_rest_off" ] || [ -z "$p30_n_on" ] || \
+   [ -z "$p30_n_off" ] || [ -z "$p30_ctps" ] || [ -z "$p30_wtps" ] || [ -z "$p30_wall_on" ]; then
+    echo "FAIL p30 decode-rest-accounting: could not read JSON fields " \
+         "(rest_on='$p30_rest_on' rest_off='$p30_rest_off' n_on='$p30_n_on' " \
+         "n_off='$p30_n_off' ctps='$p30_ctps' wtps='$p30_wtps')" >&2
+    fail=1
+elif [ "$p30_rest_off" != "0" ] || [ "$p30_n_off" != "0" ]; then
+    echo "FAIL p30 decode-rest-accounting: pacing off, yet decode_rest_s=$p30_rest_off " \
+         "and decode_rests=$p30_n_off (both must be exactly 0)" >&2
+    fail=1
+elif [ "$p30_n_on" -lt 1 ]; then
+    echo "FAIL p30 decode-rest-accounting: armed with a 1ms budget over $P30_PACE_POINTS " \
+         "decode steps, yet decode_rests=$p30_n_on -- the pacer never rested" >&2
+    fail=1
+elif [ "$p30_n_on" -gt "$P30_PACE_POINTS" ]; then
+    echo "FAIL p30 decode-rest-accounting: decode_rests=$p30_n_on exceeds the " \
+         "$P30_PACE_POINTS per-token pacing points in this run -- the pacer is being " \
+         "called from somewhere other than the per-token boundary" >&2
+    fail=1
+else
+    # The wall-clock arm. Everything above is bookkeeping, and bookkeeping
+    # alone cannot tell a real sleep from a reported one: the accounting lives
+    # in sg_decode_pace_decide, so a decode loop that took the accounting and
+    # skipped the sleep (calling _decide instead of _step, say) would satisfy
+    # the identity above AND still make decode_compute_tps exceed
+    # decode_tps_avg, because decode_rest_s is subtracted from the denominator
+    # either way. That is exactly the P2.4 silently-inert shape. So: the paced
+    # run's decode_wall_s must be at least its own decode_rest_s. On this
+    # fixture the unpaced decode phase is ~15 ms against 750 ms of prescribed
+    # rest, so a non-sleeping implementation misses this by ~50x.
+    p30_ok="$(awk -v got="$p30_rest_on" -v n="$p30_n_on" -v r="$P30_REST_MS" \
+        -v c="$p30_ctps" -v w="$p30_wtps" -v wall="$p30_wall_on" \
+        'BEGIN { want = n * r / 1000.0; d = got - want; if (d < 0) d = -d;
+                 print (d <= 1e-6 && c > w && wall >= got) ? "1" : "0" }')"
+    if [ "$p30_ok" != "1" ]; then
+        echo "FAIL p30 decode-rest-accounting: decode_rest_s=$p30_rest_on does not equal " \
+             "decode_rests=$p30_n_on x ${P30_REST_MS}ms, or decode_compute_tps=$p30_ctps " \
+             "is not > decode_tps_avg=$p30_wtps, or decode_wall_s=$p30_wall_on is less than " \
+             "the ${p30_rest_on}s it claims to have slept (which would mean it never slept)" >&2
+        fail=1
+    else
+        echo "  ok p30 decode-rest-accounting: decode_rests=$p30_n_on/$P30_PACE_POINTS, " \
+             "decode_rest_s=$p30_rest_on (= rests x ${P30_REST_MS}ms), unpaced=0, " \
+             "decode_wall_s=$p30_wall_on (>= the rest, so it really slept), " \
+             "decode_compute_tps=$p30_ctps > decode_tps_avg=$p30_wtps" >&2
+    fi
+fi
+
+# (3) The detector, two-sided. Both arms are unpaced, so this isolates the
+#     detector from the duty cycle entirely.
+ncase=$((ncase + 1))
+p30_lo_json="$(mktemp)"; p30_hi_json="$(mktemp)"
+p30_run "$p30_lo_json" --decode-baseline-ms 0.001
+p30_run "$p30_hi_json" --decode-baseline-ms 1000000
+p30_ev_lo="$(p30_get "$p30_lo_json" decode_clamp_events)"
+p30_ev_hi="$(p30_get "$p30_hi_json" decode_clamp_events)"
+rm -f "$p30_lo_json" "$p30_hi_json"
+if [ -z "$p30_ev_lo" ] || [ -z "$p30_ev_hi" ]; then
+    echo "FAIL p30 clamp-detector-wired: could not read decode_clamp_events " \
+         "(lo='$p30_ev_lo' hi='$p30_ev_hi')" >&2
+    fail=1
+elif [ "$p30_ev_lo" -lt 1 ]; then
+    echo "FAIL p30 clamp-detector-wired: every decode step is over a 0.001 ms baseline, " \
+         "yet decode_clamp_events=$p30_ev_lo -- the detector is never fed a step" >&2
+    fail=1
+elif [ "$p30_ev_hi" -ne 0 ]; then
+    echo "FAIL p30 clamp-detector-wired: no decode step can exceed a 1000000 ms baseline, " \
+         "yet decode_clamp_events=$p30_ev_hi -- the detector fires unconditionally" >&2
+    fail=1
+elif [ -z "$p30_base_off" ] || [ "$p30_base_off" = "0" ]; then
+    echo "FAIL p30 clamp-detector-wired: decode_baseline_ms=$p30_base_off on an unseeded run, " \
+         "so no baseline was ever measured from real steps" >&2
+    fail=1
+else
+    echo "  ok p30 clamp-detector-wired: events lo=$p30_ev_lo hi=$p30_ev_hi, " \
+         "self-measured baseline=${p30_base_off}ms" >&2
+fi
+
+# (4) The escalation. The budget is deliberately larger than the whole decode
+#     phase, so ONLY a clamp-shortened threshold can produce a rest at all:
+#     --decode-clamp-div 1 must rest zero times (the default, where the
+#     detector changes no schedule) and --decode-clamp-div 4 must rest.
+#
+#     The budget is CALIBRATED from a probe run rather than hard-coded,
+#     because "larger than the decode phase" is a property of the machine and
+#     not of the fixture: a decode step here measured 0.7 ms on an idle
+#     machine and 101 ms while a long prefill held the GPU.
+#
+#     budget = 1.5x the probed decode wall. The accumulated STEP time is
+#     roughly 0.85x the decode wall (the wall also covers the argmax, the
+#     periodic memory sample and the progress print), so the div-1 arm has
+#     about 1.75x of headroom before it would rest and the div-4 arm (whose
+#     threshold is budget/4) has about 2.3x before it would not. A first
+#     attempt used 2.5x, which left the div-4 side only ~16% of margin once
+#     the integer-millisecond truncation was counted, and it flaked 1 run in
+#     3. -n 48 rather than 16 for the same reason: a longer decode phase
+#     makes both the probe and the paced arms less sensitive to a single
+#     slow step.
+ncase=$((ncase + 1))
+P30_ESC_N=48
+p30_probe_json="$(mktemp)"
+p30_run_n "$p30_probe_json" "$P30_ESC_N"
+p30_probe_w="$(p30_get "$p30_probe_json" decode_wall_s)"
+rm -f "$p30_probe_json"
+p30_budget="$(awk -v w="$p30_probe_w" 'BEGIN { b = int(w * 1000 * 1.5); if (b < 8) b = 8; print b }')"
+p30_d1_json="$(mktemp)"; p30_d4_json="$(mktemp)"
+p30_run_n "$p30_d1_json" "$P30_ESC_N" --decode-work-ms "$p30_budget" --decode-rest-ms 20 \
+    --decode-baseline-ms 0.001 --decode-clamp-div 1
+p30_run_n "$p30_d4_json" "$P30_ESC_N" --decode-work-ms "$p30_budget" --decode-rest-ms 20 \
+    --decode-baseline-ms 0.001 --decode-clamp-div 4
+p30_n_d1="$(p30_get "$p30_d1_json" decode_rests)"
+p30_n_d4="$(p30_get "$p30_d4_json" decode_rests)"
+p30_ev_d4="$(p30_get "$p30_d4_json" decode_clamp_events)"
+rm -f "$p30_d1_json" "$p30_d4_json"
+if [ -z "$p30_n_d1" ] || [ -z "$p30_n_d4" ] || [ -z "$p30_probe_w" ] || [ -z "$p30_ev_d4" ]; then
+    echo "FAIL p30 clamp-escalation: could not read JSON (probe_wall='$p30_probe_w' " \
+         "div1='$p30_n_d1' div4='$p30_n_d4' events='$p30_ev_d4')" >&2
+    fail=1
+elif [ "$p30_n_d1" -ne 0 ]; then
+    echo "FAIL p30 clamp-escalation: --decode-clamp-div 1 rested $p30_n_d1 time(s) against a " \
+         "${p30_budget}ms budget (1.5x the ${p30_probe_w}s probed decode phase) -- the " \
+         "detector must not drive rests by default" >&2
+    fail=1
+elif [ "$p30_ev_d4" -lt 1 ]; then
+    echo "FAIL p30 clamp-escalation: the div-4 arm never latched the detector " \
+         "(decode_clamp_events=$p30_ev_d4), so it proves nothing about escalation" >&2
+    fail=1
+elif [ "$p30_n_d4" -lt 1 ]; then
+    echo "FAIL p30 clamp-escalation: --decode-clamp-div 4 with a confirmed clamp rested " \
+         "$p30_n_d4 times (want >= 1) against the same ${p30_budget}ms budget the div-1 arm " \
+         "never reached -- the escalation is inert" >&2
+    fail=1
+else
+    echo "  ok p30 clamp-escalation: budget=${p30_budget}ms (1.5x probe ${p30_probe_w}s over " \
+         "$P30_ESC_N tokens), div1 rests=$p30_n_d1, div4 rests=$p30_n_d4 over " \
+         "$p30_ev_d4 clamp event(s)" >&2
+fi
+
+# (5) Same determinism proof on a real model, env-gated so `make check` stays
+#     hermetic. This is the arm the P3.0 brief names (the 4B dense Q8_0).
+#
+#     Its OWN variable, not SURGE_BENCH_TOK_MODEL, because the two want
+#     different things from a model: the BOS-toggle case above needs a GGUF
+#     that carries tokenizer.ggml.bos_token_id (Qwen3-4B-Instruct-2507-Q8_0
+#     does not, and --bos is a hard error there), while this case needs only
+#     a real model with real decode-step costs. Sharing one variable would
+#     make pointing it at the P3.0 model fail an unrelated B5 gate.
+PACE_MODEL="${SURGE_PACE_MODEL:-}"
+if [ -n "$PACE_MODEL" ] && [ -e "$PACE_MODEL" ]; then
+    ncase=$((ncase + 1))
+    p30_real_json="$(mktemp)"
+    p30_real_off="$("$BENCH" "$PACE_MODEL" --ids "$IDS12" -n "$P30_REAL_N" --max-ctx 512 \
+        --gemm-gate-tflops 100 --quiet 2>/dev/null | sed -n 's/^gen_ids: //p')"
+    p30_real_on="$("$BENCH" "$PACE_MODEL" --ids "$IDS12" -n "$P30_REAL_N" --max-ctx 512 \
+        --gemm-gate-tflops 100 --quiet --json "$p30_real_json" \
+        --decode-work-ms 1 --decode-rest-ms "$P30_REAL_REST_MS" \
+        2>/dev/null | sed -n 's/^gen_ids: //p')"
+    p30_real_n="$(p30_get "$p30_real_json" decode_rests)"
+    p30_real_ngen="$(p30_get "$p30_real_json" n_gen)"
+    rm -f "$p30_real_json"
+    if [ -z "$p30_real_off" ] || [ -z "$p30_real_on" ] || [ -z "$p30_real_n" ]; then
+        echo "FAIL p30 real-model-rests-dont-change-output: empty gen_ids or JSON " \
+             "(rests='$p30_real_n')" >&2
+        fail=1
+    elif [ "$p30_real_off" != "$p30_real_on" ]; then
+        echo "FAIL p30 real-model-rests-dont-change-output: paced gen_ids != unpaced" >&2
+        echo "  off: $p30_real_off" >&2
+        echo "  on : $p30_real_on" >&2
+        fail=1
+    # A real model's decode step is tens of ms against a 1 ms budget, so
+    # unlike the fixture EVERY pacing point must rest and the count is exact.
+    elif [ "$p30_real_n" -ne "$((p30_real_ngen - 1))" ]; then
+        echo "FAIL p30 real-model rest count: decode_rests=$p30_real_n, want " \
+             "$((p30_real_ngen - 1)) (one per pacing point: every decode step on a real " \
+             "model exceeds the 1 ms budget many times over)" >&2
+        fail=1
+    else
+        echo "  ok p30 real-model-rests-dont-change-output: gen_ids=$p30_real_on " \
+             "(decode_rests=$p30_real_n/$((p30_real_ngen - 1)), exact)" >&2
+    fi
+else
+    echo "  skip p30 real-model parity: set SURGE_PACE_MODEL to a real GGUF to run it" >&2
+fi
+
 if [ "$fail" -ne 0 ]; then
     echo "test_cli_bench: FAILED ($ncase cases)" >&2
     exit 1
 fi
-echo "test_cli_bench: $ncase cases passed (gen_ids parity, VOID/exit-3, admit, $b6_label, B8 duty-cycle, segmentation)" >&2
+echo "test_cli_bench: $ncase cases passed (gen_ids parity, VOID/exit-3, admit, $b6_label, B8 duty-cycle, segmentation, P3.0 decode pacing)" >&2
 exit 0

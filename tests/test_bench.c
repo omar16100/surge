@@ -234,6 +234,11 @@ static void test_format_json(void) {
     row.prefill_wall_s = 5700.0;
     row.prefill_rest_s = 5400.0;         /* Task B8 */
     row.prefill_compute_tps = 873.13;    /* Task B8 */
+    row.decode_rest_s = 12.5;            /* Task P3.0 */
+    row.decode_compute_tps = 3.71;       /* Task P3.0 */
+    row.decode_rests = 250;              /* Task P3.0 */
+    row.decode_clamp_events = 3;         /* Task P3.0 */
+    row.decode_baseline_ms = 26.375;     /* Task P3.0 */
     row.peak_ram_gib = 75.5;
     row.gpu_alloc_gib = 70.25;
     row.recall_hits = 2;
@@ -247,7 +252,7 @@ static void test_format_json(void) {
     snprintf(row.status, sizeof row.status, "DONE");
     snprintf(row.log_id, sizeof row.log_id, "ctx256k_qwen27b_surge_20260811_120000");
 
-    char buf[1024];
+    char buf[2048];
     sg_bench_format_json(&row, buf, sizeof buf);
 
     tt_assert(strstr(buf, "\"model\":\"Qwen3.6-27B\"") != NULL, "model key: %s", buf);
@@ -269,6 +274,9 @@ static void test_format_json(void) {
     CHECK_D("\"prefill_wall_s\":", row.prefill_wall_s);
     CHECK_D("\"prefill_rest_s\":", row.prefill_rest_s);         /* Task B8 */
     CHECK_D("\"prefill_compute_tps\":", row.prefill_compute_tps); /* Task B8 */
+    CHECK_D("\"decode_rest_s\":", row.decode_rest_s);             /* Task P3.0 */
+    CHECK_D("\"decode_compute_tps\":", row.decode_compute_tps);   /* Task P3.0 */
+    CHECK_D("\"decode_baseline_ms\":", row.decode_baseline_ms);   /* Task P3.0 */
     CHECK_D("\"peak_ram_gib\":", row.peak_ram_gib);
     CHECK_D("\"gpu_alloc_gib\":", row.gpu_alloc_gib);
     CHECK_D("\"wall_s\":", row.wall_s);
@@ -280,6 +288,10 @@ static void test_format_json(void) {
     tt_assert(json_uint_after(buf, "\"assoc_hits\":") == row.assoc_hits, "assoc_hits");
     tt_assert(json_uint_after(buf, "\"n_prompt_tok\":") == row.n_prompt_tok, "n_prompt_tok");
     tt_assert(json_uint_after(buf, "\"n_gen\":") == row.n_gen, "n_gen");
+    tt_assert(json_uint_after(buf, "\"decode_rests\":") == row.decode_rests,
+              "decode_rests");          /* Task P3.0 */
+    tt_assert(json_uint_after(buf, "\"decode_clamp_events\":") == row.decode_clamp_events,
+              "decode_clamp_events");   /* Task P3.0 */
 
     /* NULL row -> empty string; zero cap -> untouched. */
     buf[0] = 'X'; buf[1] = '\0';
@@ -301,7 +313,7 @@ static void test_format_json_escaping(void) {
     snprintf(row.status, sizeof row.status, "DONE");
     snprintf(row.log_id, sizeof row.log_id, "id_with_tab\there");
 
-    char buf[512];
+    char buf[2048];
     sg_bench_format_json(&row, buf, sizeof buf);
 
     tt_assert(strstr(buf, "\"model\":\"Qwen\\\"3.6\\\\27B\"") != NULL,

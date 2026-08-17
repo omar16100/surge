@@ -3185,3 +3185,102 @@ that kernel's threadgroup reservation from 1 KB to 8 KB. Full reasoning and the 
 analysis: `docs/17082026_splitk_gqa_threadgroups.md`, section "P2.9".
 
 **KEPT OFF.** `attn_splitk_online` and `attn_splitk_gqa` both still default to `false`.
+
+---
+
+## Task P3.0 Results: decode pacing + clamp detection (`src/sched.c`), 2026-08-18
+
+**DONE AND GATED. OFF BY DEFAULT. THROUGHPUT EFFECT NOT MEASURED.**
+
+New file `src/sched.c` (324 lines, pure C11, no Metal/Foundation/GPU), declared in `surge.h`,
+wired into `surge-bench` only. `src/metal.m` is NOT touched: unlike prefill, whose chunk loop
+is inside `sg_gpu_prefill`, there is no decode loop inside `metal.m` at all, so the pacer is a
+caller-owned value fed at the per-token boundary in `src/cli_bench.c`. No fan/power/daemon hook
+of any kind, per the brief.
+
+Two separable parts:
+
+1. **Duty cycle**, the direct analogue of B8's `sg_gpu_set_prefill_rest`. `--decode-work-ms W`
+   `--decode-rest-ms R`, both > 0 to arm (B8's own rule), rest R ms between tokens after every
+   W ms of accumulated decode step time.
+2. **Clamp detector**, unconfigured and never sleeping on its own. Signal: per-step decode wall
+   time (a `clock_gettime` pair around `sg_gpu_forward` ALONE) against the MEDIAN of the run's
+   first 8 steps, then fixed. Over = `> 1.5x` baseline; latches after 3 CONSECUTIVE over steps,
+   clears after 3 consecutive under. By default (`clamp_div == 1`) a confirmed clamp drives NO
+   rest schedule; `--decode-clamp-div D` opts into a D-times denser schedule while it persists.
+
+**Why the escalation is off by default.** The obvious rationale (rest harder and the clock comes
+back) is refuted by this project's own telemetry: rest length did not predict the next burst's
+clock over 376 burst pairs (r = +0.017), which is why B8's rationale was corrected in 2026-08-15.
+The surviving rationale is contention, which an operator can know and surge cannot.
+
+**FALSE-POSITIVE RATE, measured, not argued.** Real per-token series from this machine
+(`--emit-timeseries`, 4B Q8_0) replayed offline through the exact policy:
+
+| series | steps | baseline | max step | max/baseline | steps over 1.5x | clamp events |
+|---|---|---|---|---|---|---|
+| 300-token decode | 299 | 19.75 ms | 24.39 ms | 1.235 | 0 | 0 |
+| 1024-token decode | 1023 | 19.21 ms | 52.10 ms | 2.712 | 375 | **1** |
+| 512-token decode at 16k ctx (contended) | 511 | 308.99 ms | 355.59 ms | 1.151 | 0 | 0 |
+
+Row 1 is the clean case: not one step of 299 reaches even 1.5x, so the threshold has real
+headroom over ordinary variance. Row 2 is a genuine positive on unpaced, uncontended work: step
+time climbed to 2.7x and stayed there for 375 of 1023 steps, one transition, and reported decode
+fell 45.86 -> 36.65 tok/s on the same prompt and binary. Row 3 is the BLIND SPOT: uniformly slow
+(16x row 1's baseline) but flat, so zero events. A run already slow at its first token is
+invisible to within-run detection by construction, and that is exactly the P2.9 case that
+motivated this task. Two things cover it, and `tests/test_sched.c` pins the limitation with an
+assertion rather than only a comment: `--decode-baseline-ms B` seeds the baseline from outside
+the run, and `decode_baseline_ms` is reported on every row so the comparison can be made ACROSS
+runs.
+
+**GATES.**
+
+| gate | result |
+|---|---|
+| 1. `clang -fsyntax-only -std=c11 -Wall -Wextra -Werror`, with and without `-DSURGE_NO_METAL`, on `src/sched.c` + `src/cli_bench.c` + `src/bench.c` + `tests/test_sched.c` | clean, 8 compiles |
+| 2. `make debug` (SURGE_NO_METAL + ASan/UBSan) | **rc 0, 83614 checks 0 failures, 0 sanitizer diagnostics**. `tests/test_sched.c` contributes 86 checks |
+| 3. `make check` | **rc 0**, `test_cli_bench: 19 cases passed`. Every P2.3-P2.9 gate unmoved: 513 GQA dispatches + 15360 per-head with the switch on, 15873 with it off, logits byte-identical 16896/16896; P2.6 257/257 above the divergence seq and 0 of 16639 below; 100x determinism byte-identical |
+| 4. determinism | paced `gen_ids` byte-identical to unpaced, on the mini fixture in every `make check` AND on the real 4B Q8_0 (`SURGE_PACE_MODEL`, 24 tokens) |
+| 5. not silently inert | five ways, all in `make check`: the accounting IDENTITY `decode_rest_s == decode_rests * rest_ms` with the unpaced arm exactly 0 and `decode_rests` bounded by the 15 per-token pacing points; the paced run's `decode_wall_s` (0.890825 s) at least its own `decode_rest_s` (0.75 s), so the rest was SPENT and not merely counted; a two-sided detector-wired check (0.001 ms seeded baseline must fire, 1000000 ms must not); a calibrated escalation check (`div 1` rests 0 times, `div 4` rests 2, six consecutive runs); and the real-model EXACT count, 23 rests over 23 pacing points |
+
+**A flaky gate caught and fixed before commit.** The first version asserted an exact rest count
+on the mini fixture with a 1 ms budget. Measured over 8 repeats, one run rested 14 times and
+seven rested 15: a fixture decode step costs about 1 ms, which is the smallest budget the flag
+can express. The exact accumulator semantics are pinned deterministically in `tests/test_sched.c`
+instead (200 steps x 10 ms against a 100 ms budget = exactly 20 rests), and the CLI gate now
+asserts only timing-independent properties. The escalation gate was likewise widened from a 2.5x
+to a 1.5x calibrated budget over 48 tokens after it flaked 1 run in 3.
+
+**Pre-existing, not this task:** `test_cli_bench.sh`'s b6 `check2` (a 3% bar on a
+slope-vs-avg timing ratio) fired 3 times across ~10 back-to-back runs while the GPU had no idle
+time between them, and passed in the clean `make check`. Separately, the B5 bos-toggle case is
+env-gated on `SURGE_BENCH_TOK_MODEL` and hard-fails on
+`Qwen3-4B-Instruct-2507-Q8_0.gguf`, which carries no `tokenizer.ggml.bos_token_id`; P3.0's
+real-model arm therefore uses its own `SURGE_PACE_MODEL` rather than dragging an unrelated gate
+along.
+
+
+**The hole review found, and the mutation that proves it is closed.** The accounting lives in
+`sg_decode_pace_decide`, so a decode loop that took the accounting and skipped the sleep (calling
+`_decide` instead of `_step`) would have satisfied the accounting identity AND kept
+`decode_compute_tps > decode_tps_avg`, because `decode_rest_s` is subtracted from the denominator
+either way. Every gate would have passed while the mechanism did nothing: the P2.4 shape exactly.
+Two wall-clock assertions now close it, one in `tests/test_sched.c` (case (k), a real clock held
+against `_step`) and one in the shell gate (`decode_wall_s >= decode_rest_s`). Applying the
+mutation to `src/cli_bench.c` and rebuilding fails the shell gate with `decode_wall_s=0.010504`
+against `decode_rest_s=0.4`.
+
+**Throughput: attempted twice, no claim made.** Experiment 1 (8 runs, counterbalanced
+A B B A B A A B, 512 tokens, B = 2000 ms budget / 200 ms rest): pacing cost 10.1% of wall-clock
+throughput, which is the configured duty, and did NOT raise compute throughput (A 40.48 vs B
+39.65 tok/s mean, and A ahead in all four adjacent pairs). Experiment 2 (4 runs, A B B A, 1536
+tokens, run in the regime where the slowdown actually develops) is uninterpretable: throughput
+rose monotonically 8.19 -> 10.15 -> 19.10 -> 22.07 tok/s across the sequence, a 2.7x drift that
+no 4-run counterbalancing removes. Raw rows in `task-P3.0-throughput.txt` and
+`task-P3.0-throughput-long.txt`. Experiment 2 does show BOTH detector modes live: run 2 started
+slow, self-measured a 164.5 ms baseline and reported ZERO clamp events while running 4x slower
+than run 4; run 4 was the FASTEST run and reported EIGHT, because it had a fast baseline to rise
+against.
+
+Full write-up: `docs/18082026_decode_pacing.md`.

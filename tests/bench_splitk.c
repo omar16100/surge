@@ -125,7 +125,7 @@
  * Purely additive: no kernel, no metal.m entry point, no sg_ref_*, no
  * existing gate is touched by this file.
  *
- * Usage: tests/bench_splitk.bin [--reps N] [--seqs A,B,C] [-h|--help]
+ * Usage: tests/bench_splitk.bin [--reps N] [--seqs A,B,C] [--gqa] [-h|--help]
  *   (built and run together by `make bench-splitk`; see the Makefile.)
  *
  * --seqs was added by task P2.3 to sweep sequence lengths the default list
@@ -134,6 +134,14 @@
  * stops handing each split a full SG_TG keys; a threshold there should be
  * measured like the rest of the curve rather than argued from the grid
  * arithmetic. The default sweep is unchanged when the flag is absent.
+ *
+ * --gqa was added by task P2.4 to time the GQA-shared partial
+ * (k_attn_decode_splitk_partial_gqa) in place of the per-head one. Same
+ * sweep, same shapes, same yardstick, same output bytes: the two runs differ
+ * only in which kernel is dispatched, so subtracting the two tables is the
+ * kernel-level A/B for that task, including the short-sequence end where the
+ * GQA grid is `repeat` times smaller and may lose. Default off, i.e. every
+ * pre-P2.4 invocation of this binary means exactly what it did before.
  */
 #ifdef SURGE_NO_METAL
 
@@ -322,15 +330,41 @@ static timing_t time_incumbent(sg_gpu *g, gbuf *q, gbuf *k, gbuf *v, gbuf *out,
     return r;
 }
 
-/* Times k_attn_decode_splitk_partial THEN k_attn_decode_splitk_combine as one
+/* Task P2.4's --gqa flag: time k_attn_decode_splitk_partial_gqa (one
+ * threadgroup per GQA GROUP, each K/V element read once for all the query heads
+ * that share it) instead of the per-head k_attn_decode_splitk_partial. The two
+ * produce the same bytes, so this only ever changes the timing; run the binary
+ * twice, once with and once without, for the A/B.
+ *
+ * WHAT IT DOES TO THE GB/s COLUMN, which the file header's accounting has to
+ * be read with: bytes_kv() counts n_heads * seq * head_dim * 2 dtypes * 2
+ * bytes, i.e. bytes ISSUED by the per-head grid. That is the right count for
+ * the incumbent and for the per-head partial, both of which really do issue
+ * one read per query head. The GQA partial issues n_kv_heads/n_heads of it
+ * (1/repeat), so its GB/s column is NOT achieved DRAM bandwidth; it stays on
+ * the same yardstick as the other two on purpose, so the columns remain
+ * comparable, and the traffic saving shows up as a shorter TIME rather than as
+ * a bigger bandwidth number. */
+static bool g_gqa = false;
+
+/* Times the chosen split-K partial THEN k_attn_decode_splitk_combine as one
  * unit (see the file header: that pair together is what reaches the same
  * "final attention output" the incumbent produces in a single dispatch). */
+static sg_err run_partial(sg_gpu *g, gbuf *q, gbuf *k, gbuf *v,
+                          gbuf *m, gbuf *s, gbuf *acc, const uint32_t params[8]) {
+    if (g_gqa) {
+        return sg_gpu_run_attn_splitk_partial_gqa(g, q->b, k->b, v->b,
+                                                  m->b, s->b, acc->b, params);
+    }
+    return sg_gpu_run_attn_splitk_partial(g, q->b, k->b, v->b, m->b, s->b, acc->b, params);
+}
+
 static timing_t time_splitk(sg_gpu *g, gbuf *q, gbuf *k, gbuf *v,
                             gbuf *m, gbuf *s, gbuf *acc, gbuf *out,
                             const uint32_t params[8], int reps) {
     timing_t r = {false, 0.0, 0.0, 0.0, {0}};
 
-    sg_err e = sg_gpu_run_attn_splitk_partial(g, q->b, k->b, v->b, m->b, s->b, acc->b, params);
+    sg_err e = run_partial(g, q, k, v, m, s, acc, params);
     if (!sg_failed(e)) {
         e = sg_gpu_run_attn_splitk_combine(g, m->b, s->b, acc->b, out->b, params);
     }
@@ -342,7 +376,7 @@ static timing_t time_splitk(sg_gpu *g, gbuf *q, gbuf *k, gbuf *v,
     double sum = 0.0, mn = 0.0, mx = 0.0;
     for (int i = 0; i < reps; i++) {
         double t0 = now_s();
-        e = sg_gpu_run_attn_splitk_partial(g, q->b, k->b, v->b, m->b, s->b, acc->b, params);
+        e = run_partial(g, q, k, v, m, s, acc, params);
         if (!sg_failed(e)) {
             e = sg_gpu_run_attn_splitk_combine(g, m->b, s->b, acc->b, out->b, params);
         }
@@ -552,14 +586,18 @@ static void run_shape(sg_gpu *g, const shape_t *sh, int reps,
 
 static void usage(const char *prog) {
     fprintf(stderr,
-        "usage: %s [--reps N] [--seqs A,B,C] [-h|--help]\n"
+        "usage: %s [--reps N] [--seqs A,B,C] [--gqa] [-h|--help]\n"
         "  --reps N     timed repetitions per (shape, n_splits), after 1 discarded\n"
         "               warm-up call (default %d)\n"
         "  --seqs LIST  comma-separated sequence lengths to sweep instead of the\n"
         "               default %d..%d (at most %d of them, each >= 1). Added by\n"
         "               task P2.3 to measure the SHORT-sequence end of the curve,\n"
         "               which the default list (>= 8192) does not reach and which\n"
-        "               decode's fallback threshold depends on.\n",
+        "               decode's fallback threshold depends on.\n"
+        "  --gqa        time k_attn_decode_splitk_partial_gqa (task P2.4, one\n"
+        "               threadgroup per GQA GROUP) instead of the per-head\n"
+        "               k_attn_decode_splitk_partial. Same output bytes, so the\n"
+        "               A/B is this binary run twice, with and without the flag.\n",
         prog, DEFAULT_REPS, (int)SEQS[0], (int)SEQS[N_SEQS - 1], MAX_SEQS);
 }
 
@@ -606,6 +644,8 @@ int main(int argc, char **argv) {
             }
             seqs = seq_buf;
             n_seqs = n;
+        } else if (strcmp(argv[i], "--gqa") == 0) {
+            g_gqa = true;
         } else if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
             usage(argv[0]);
             return 0;
@@ -625,8 +665,14 @@ int main(int argc, char **argv) {
 
     printf("P2.3a split-K decode-attention timing harness\n");
     printf("reps=%d (+1 discarded warm-up); incumbent=k_attn_decode_f16, "
-           "split-K=partial+combine dispatched together (the pair needed for "
-           "one decode step's answer)\n", reps);
+           "split-K=%s+combine dispatched together (the pair needed for "
+           "one decode step's answer)\n", reps,
+           g_gqa ? "k_attn_decode_splitk_partial_gqa" : "k_attn_decode_splitk_partial");
+    if (g_gqa) {
+        printf("P2.4 --gqa: the GQA partial issues 1/repeat of the KV reads the "
+               "per-head one does, so its splitk_GBps column is on the per-head "
+               "yardstick (see the file header), not achieved DRAM bandwidth\n");
+    }
     printf("speedup = incumbent_mean_time / splitk_mean_time (> 1.0 means split-K is faster)\n");
     printf("GB/s is decimal (1e9 bytes/s) achieved KV-read bandwidth, the same "
            "yardstick for both kernels; see the file header for the exact accounting\n");

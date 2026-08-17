@@ -82,11 +82,24 @@ enum {
      * express "one threadgroup per head" and nothing wider. Computed by hand
      * in sg_gpu_run_attn_splitk_partial, which is the only path that reaches
      * the kernel at all (it takes six device buffers, so sg_gpu_run_op's
-     * (a, b, out) shape cannot). */
+     * (a, b, out) shape cannot).
+     *
+     * P2.4's k_attn_decode_splitk_partial_gqa shares this kind with a params[6]
+     * x params[1] (split, KV head) grid: one threadgroup per GQA GROUP rather
+     * than per query head. Same class because the dispatchers compute both
+     * extents by hand anyway; the `kind` column is only read by sg_gpu_init's
+     * threadgroup-width check. */
     SG_K_HEADS2D
 };
 
 #define SG_TG 256u
+
+/* The largest GQA group (n_heads / n_kv_heads) k_attn_decode_splitk_partial_gqa
+ * keeps in registers, mirroring kernels.metal's SG_SPLITK_GQA_MAX constant of
+ * the same value (which static_asserts on it); keep both in sync. Past this
+ * the kernel still answers correctly but one head at a time, with no reuse, so
+ * splitk_gqa_use below routes those shapes to the per-head partial instead. */
+#define SG_SPLITK_GQA_MAX 8u
 
 /* The tiled-GEMM output tile shape (Task M5.3), mirroring kernels.metal's
  * SG_GEMM_TM / SG_GEMM_TN constants of the same value; keep both in sync.
@@ -116,6 +129,7 @@ enum {
     KI_ROPE_CHUNK, KI_ATTN_PREFILL,
     KI_CONV1D_CHUNK, KI_DELTA_GATES_CHUNK, KI_DELTA_CHUNK, KI_RMSNORM_GATED_CHUNK,
     KI_ATTN_SPLITK_PARTIAL, KI_ATTN_SPLITK_COMBINE,
+    KI_ATTN_SPLITK_PARTIAL_GQA,
     KI_COUNT
 };
 
@@ -189,6 +203,12 @@ static const sg_kernel_desc SG_KERNELS[] = {
      * though neither `kind` is read outside that init width check. */
     { "k_attn_decode_splitk_partial", SG_K_HEADS2D },
     { "k_attn_decode_splitk_combine", SG_K_ROWS    },
+    /* P2.4: the GQA-shared partial. Same eight bindings, same params array and
+     * same output layout as the per-head partial above, so it is a drop-in
+     * alternative for it; only the grid's y extent (KV heads, not query heads)
+     * and the traffic differ. Dispatched by hand from
+     * sg_gpu_run_attn_splitk_partial_gqa and enc_attn_splitk. */
+    { "k_attn_decode_splitk_partial_gqa", SG_K_HEADS2D },
 };
 #define SG_N_KERNELS ((int)(sizeof SG_KERNELS / sizeof SG_KERNELS[0]))
 _Static_assert(SG_N_KERNELS == KI_COUNT, "SG_KERNELS and the KI_ enum disagree");
@@ -317,6 +337,16 @@ struct sg_gpu {
      * being deleted. Always false on the f32 KV path: the split-K kernels read
      * half-typed separate K and V buffers, which only the fp16 cache has. */
     bool attn_splitk;
+    /* --- Task P2.4: GQA-shared split-K threadgroups ---
+     * Read from SURGE_ATTN_SPLITK_GQA at the last sg_gpu_state_new call, and
+     * only consulted when attn_splitk above is already true. true makes
+     * enc_attn_splitk dispatch k_attn_decode_splitk_partial_gqa (one
+     * threadgroup per GQA GROUP, each K/V element read once for all the query
+     * heads that share it) instead of the per-head
+     * k_attn_decode_splitk_partial; the two write the same bytes, so this
+     * changes memory traffic and grid shape, never the answer. DEFAULT FALSE
+     * until the deferred hardware gates run: see splitk_gqa_use. */
+    bool attn_splitk_gqa;
     /* The largest n_splits any decode step at this max_ctx can ask for, i.e.
      * splitk_n_splits(max_ctx). n_splits is nondecreasing in seq and seq is
      * capped at max_ctx, so the three buffers below and g->splitk_scratch can
@@ -807,18 +837,20 @@ static sg_err check_sizes(const char *kernel, const sg_gpu_buf *a, const sg_gpu_
              mul_ck((uint64_t)p[4], p[1], &t2) && mul_ck(t2, f, &need_b);
         need_o = need_a;
     } else if (strcmp(kernel, "k_attn_decode_splitk_partial") == 0 ||
-               strcmp(kernel, "k_attn_decode_splitk_combine") == 0) {
-        /* P2.2. A ROUTING rule rather than a size rule: the partial kernel
-         * binds six device buffers (q, k, v, m, s, acc) plus a score scratch
-         * and the combine four (m, s, acc, out), so the (a, b, o) triple this
+               strcmp(kernel, "k_attn_decode_splitk_combine") == 0 ||
+               strcmp(kernel, "k_attn_decode_splitk_partial_gqa") == 0) {
+        /* P2.2 (and P2.4's GQA partial, which binds exactly the same eight).
+         * A ROUTING rule rather than a size rule: the partial kernels bind six
+         * device buffers (q, k, v, m, s, acc) plus a score scratch and the
+         * combine four (m, s, acc, out), so the (a, b, o) triple this
          * function is handed cannot describe either and sg_gpu_run_op has no
          * way to dispatch them. Named here rather than left to the generic
          * fall-through below so the error points at the entry points that do
-         * work. Their real byte counts go through splitk_sizes(), which both
+         * work. Their real byte counts go through splitk_sizes(), which the
          * one-shots call and which guards every product with mul_ck exactly
          * as the rules above do. */
         return gpu_errf("gpu: %s binds more device buffers than sg_gpu_run_op's "
-                        "(a, b, out); use sg_gpu_run_attn_splitk_partial/_combine",
+                        "(a, b, out); use sg_gpu_run_attn_splitk_partial/_gqa/_combine",
                         kernel);
     } else {
         return gpu_errf("gpu: no size rule for kernel '%s'", kernel);
@@ -924,7 +956,8 @@ static sg_err check_params(const char *kernel, const uint32_t *p) {
             return (sg_err){"gpu: k_rope_chunk head_dim*heads*n_tok exceeds the 32-bit grid range"};
         }
     } else if (strcmp(kernel, "k_attn_decode_splitk_partial") == 0 ||
-               strcmp(kernel, "k_attn_decode_splitk_combine") == 0) {
+               strcmp(kernel, "k_attn_decode_splitk_combine") == 0 ||
+               strcmp(kernel, "k_attn_decode_splitk_partial_gqa") == 0) {
         /* P2.2. ONE params array serves both dispatches (surge.h documents it
          * that way, and the test fills it once), so both kernels get ONE rule:
          * a caller must not be able to get an array past the partial only to
@@ -955,6 +988,13 @@ static sg_err check_params(const char *kernel, const uint32_t *p) {
          * oracle's n_parts == 0 case, which has no partial triples to fold at
          * all. Rejected rather than improvised. */
         if (p[6] == 0) return gpu_errf("gpu: %s n_splits must be nonzero", kernel);
+        /* P2.4's GQA partial shares this rule and needs no extra one. The
+         * divisibility check above is exactly what makes its (n_splits, n_kv)
+         * grid tile the query heads: group hk covers hk*repeat .. +repeat-1
+         * with n_kv*repeat == n_heads, so no group runs off the end and none
+         * is skipped. A group WIDER than SG_SPLITK_GQA_MAX is still answered
+         * correctly (the kernel's default arm walks it one head at a time), so
+         * it is a policy question for splitk_gqa_use, not a validity one. */
     }
     return SG_OK;
 }
@@ -1094,6 +1134,46 @@ static uint32_t splitk_use(const sg_gpu *g, uint32_t seq) {
     uint32_t n = splitk_n_splits(seq);
     if (n > g->splitk_max_splits) return 0;   /* sized from max_ctx; cannot happen */
     return n;
+}
+
+/* =====================================================================
+ * P2.4: which of the two split-K partials a decode step dispatches
+ * =====================================================================
+ *
+ * true means k_attn_decode_splitk_partial_gqa (one threadgroup per GQA GROUP,
+ * so each K/V element is read once and used for all `repeat` query heads that
+ * share it); false means the per-head k_attn_decode_splitk_partial P2.2/P2.3
+ * ship. The two write the SAME bytes into the same m/s/acc layout, so this
+ * chooses memory traffic and grid shape, never the answer.
+ *
+ * OFF BY DEFAULT, and that is a statement about evidence, not about the
+ * kernel: at the time it was written the GPU was held by a 256K benchmark, so
+ * NOTHING about the GQA kernel had been run. P2.2 shipped its kernels the same
+ * way (written, compiled, dispatched by nothing) and P2.3 flipped the default
+ * only after the hardware gates passed. SURGE_ATTN_SPLITK_GQA=1 opts in, which
+ * is what makes the A/B runnable on ONE binary; see docs/17082026_splitk_gqa_
+ * threadgroups.md for the gates that have to pass before the default moves.
+ *
+ * THE GROUP MUST BE WORTH SHARING AND MUST FIT IN REGISTERS:
+ *   - repeat < 2 means no sharing exists (the GQA grid would be the per-head
+ *     grid, one query head per threadgroup, with extra index arithmetic);
+ *   - repeat > SG_SPLITK_GQA_MAX falls into the kernel's correct-but-no-reuse
+ *     arm, which is strictly worse than the per-head kernel because it also
+ *     shrinks the grid by `repeat`.
+ * Both real shapes sit inside the band (27B 24/4 = 6, 4B dense 32/8 = 4).
+ *
+ * WHAT IS NOT DECIDED HERE, on purpose: there is no threadgroup-count floor.
+ * The GQA grid is `repeat` times smaller than the per-head one (at seq 1024 on
+ * the 27B shape that is 4 kv * 4 splits = 16 threadgroups against 96, on a
+ * machine with 80 GPU cores), so a crossover like P2.3's seq-1024 one probably
+ * exists. Inventing a threshold without the measurement is exactly what P2.3's
+ * gate doc refused to do, so the switch stays off until bench_splitk --gqa has
+ * been run and the crossover is a table rather than an argument. */
+static bool splitk_gqa_use(const sg_gpu *g, uint32_t n_heads, uint32_t n_kv) {
+    if (!g->attn_splitk_gqa) return false;
+    if (n_kv == 0 || n_heads % n_kv != 0) return false;
+    uint32_t repeat = n_heads / n_kv;
+    return repeat >= 2 && repeat <= SG_SPLITK_GQA_MAX;
 }
 
 sg_err sg_gpu_run_op(sg_gpu *g, const char *kernel, void *a, void *b, void *out,
@@ -1428,13 +1508,14 @@ sg_err sg_gpu_run_attn_prefill(sg_gpu *g, void *q, void *k, void *v, void *out,
  * P2.2: split-K decode attention one-shots
  * =====================================================================
  *
- * The host side of k_attn_decode_splitk_partial / _combine. Full contract
- * (layout, the shared params array, the partition rule, the seq == 0
- * decision) is in surge.h next to the two declarations. Neither kernel is
+ * The host side of k_attn_decode_splitk_partial / _combine, and (P2.4) of
+ * k_attn_decode_splitk_partial_gqa, which shares every rule below. Full
+ * contract (layout, the shared params array, the partition rule, the seq == 0
+ * decision) is in surge.h next to the declarations. None of the three is
  * reachable through sg_gpu_run_op -- six and four device buffers against its
- * (a, b, out) triple -- so these are their only entry points, and the decode
- * path is untouched: enc_attn / enc_attn_f16 still dispatch
- * k_attn_decode_f16. */
+ * (a, b, out) triple -- so these are their only one-shot entry points. They
+ * commit and wait, so the decode path does not call them; it encodes the same
+ * kernels by hand in enc_attn_splitk. */
 
 /* One buffer-size check with the standard message. Factored out because the
  * partial dispatch below has six of them and the combine four, and six
@@ -1500,17 +1581,30 @@ static bool splitk_sizes(const uint32_t *p, uint64_t *need_q, uint64_t *need_kv,
     return true;
 }
 
-sg_err sg_gpu_run_attn_splitk_partial(sg_gpu *g, void *q, void *k, void *v,
-                                      void *m, void *s, void *acc,
-                                      const uint32_t params[8]) {
-    const char *kn = "k_attn_decode_splitk_partial";
-    if (!g || !q || !k || !v || !m || !s || !acc || !params) {
-        return (sg_err){"gpu: sg_gpu_run_attn_splitk_partial got a NULL argument"};
-    }
+/* The shared body of BOTH split-K partial one-shots (P2.4). The per-head
+ * k_attn_decode_splitk_partial and the GQA-shared
+ * k_attn_decode_splitk_partial_gqa take the same eight bindings, the same
+ * params array, the same buffer sizes and the same score scratch; they differ
+ * only in the pipeline and in the grid's y extent (query heads against KV
+ * heads). Factored rather than copied so the two cannot drift on a validation
+ * rule: every rejection surge.h documents is checked HERE, once.
+ *
+ * `kn` is the kernel name for the error messages, `ki` its pipeline index, and
+ * `gqa` picks the grid. The arguments are already NULL-checked by the two
+ * public entry points below, which do it under their own names. */
+static sg_err splitk_partial_run(sg_gpu *g, const char *kn, int ki, bool gqa,
+                                 void *q, void *k, void *v,
+                                 void *m, void *s, void *acc,
+                                 const uint32_t params[8]) {
     sg_err e = check_params(kn, params);
     if (sg_failed(e)) return e;
 
-    uint32_t n_heads = params[0], n_splits = params[6];
+    /* The grid's y extent: one threadgroup per QUERY head for the per-head
+     * partial, per KV head (i.e. per GQA group) for the GQA one. check_params
+     * has already rejected n_kv_heads == 0 and n_heads % n_kv_heads != 0, so
+     * the groups tile the query heads exactly. */
+    uint32_t n_splits = params[6];
+    uint32_t n_rows = gqa ? params[1] : params[0];
     uint64_t need_q = 0, need_kv = 0, need_ms = 0, need_acc = 0, need_scratch = 0;
     if (!splitk_sizes(params, &need_q, &need_kv, &need_ms, &need_acc, NULL, &need_scratch)) {
         return gpu_errf("gpu: %s params describe a region that overflows 64 bits", kn);
@@ -1573,7 +1667,7 @@ sg_err sg_gpu_run_attn_splitk_partial(sg_gpu *g, void *q, void *k, void *v,
         if (!cb || !enc) {
             rc = (sg_err){"gpu: could not open a compute encoder"};
         } else {
-            [enc setComputePipelineState:g->pipes[KI_ATTN_SPLITK_PARTIAL]];
+            [enc setComputePipelineState:g->pipes[ki]];
             for (int i = 0; i < 3; i++) {
                 [enc setBuffer:ins[i]->buf offset:(NSUInteger)ins[i]->offset atIndex:(NSUInteger)i];
                 [enc setBuffer:outs[i]->buf offset:(NSUInteger)outs[i]->offset
@@ -1582,15 +1676,16 @@ sg_err sg_gpu_run_attn_splitk_partial(sg_gpu *g, void *q, void *k, void *v,
             [enc setBytes:params length:8 * sizeof(uint32_t) atIndex:6];
             /* The DEDICATED split-K scratch, not g->scratch (see above). */
             [enc setBuffer:g->splitk_scratch offset:0 atIndex:7];
-            /* The SG_K_HEADS2D grid: x = split, y = query head, matching the
-             * kernel's tg.x / tg.y. Both grid attributes are declared uint2
-             * there, the same pairing the SG_K_TILES2D dispatch above uses and
-             * for the same stated reason (the two position attributes must
-             * agree on their vector width), so the kernel reads its lane index
-             * out of tid.x of an SG_TG x 1 threadgroup. Total threads per
-             * threadgroup is still exactly SG_TG, which is what the fixed
-             * tg_max/tg_sum fold trees are shaped for. */
-            [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)n_splits, (NSUInteger)n_heads, 1)
+            /* The SG_K_HEADS2D grid: x = split, y = query head (per-head
+             * partial) or KV head (GQA partial), matching the kernel's
+             * tg.x / tg.y. Both grid attributes are declared uint2 there, the
+             * same pairing the SG_K_TILES2D dispatch above uses and for the
+             * same stated reason (the two position attributes must agree on
+             * their vector width), so the kernel reads its lane index out of
+             * tid.x of an SG_TG x 1 threadgroup. Total threads per threadgroup
+             * is still exactly SG_TG, which is what the fixed tg_max/tg_sum
+             * fold trees are shaped for. */
+            [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)n_splits, (NSUInteger)n_rows, 1)
                 threadsPerThreadgroup:MTLSizeMake(SG_TG, 1, 1)];
             [enc endEncoding];
             [cb commit];
@@ -1602,6 +1697,32 @@ sg_err sg_gpu_run_attn_splitk_partial(sg_gpu *g, void *q, void *k, void *v,
         }
     }
     return rc;
+}
+
+sg_err sg_gpu_run_attn_splitk_partial(sg_gpu *g, void *q, void *k, void *v,
+                                      void *m, void *s, void *acc,
+                                      const uint32_t params[8]) {
+    if (!g || !q || !k || !v || !m || !s || !acc || !params) {
+        return (sg_err){"gpu: sg_gpu_run_attn_splitk_partial got a NULL argument"};
+    }
+    return splitk_partial_run(g, "k_attn_decode_splitk_partial",
+                              KI_ATTN_SPLITK_PARTIAL, false, q, k, v, m, s, acc, params);
+}
+
+/* P2.4. The GQA-shared twin: identical arguments, identical validation,
+ * identical output bytes, one threadgroup per GQA group instead of per query
+ * head. Separate entry point rather than a flag in the params array because
+ * the params array is contracted (surge.h) to serve the combine dispatch too,
+ * and because the per-op gate's whole job is to run the TWO of them on the
+ * same inputs and memcmp the results. */
+sg_err sg_gpu_run_attn_splitk_partial_gqa(sg_gpu *g, void *q, void *k, void *v,
+                                          void *m, void *s, void *acc,
+                                          const uint32_t params[8]) {
+    if (!g || !q || !k || !v || !m || !s || !acc || !params) {
+        return (sg_err){"gpu: sg_gpu_run_attn_splitk_partial_gqa got a NULL argument"};
+    }
+    return splitk_partial_run(g, "k_attn_decode_splitk_partial_gqa",
+                              KI_ATTN_SPLITK_PARTIAL_GQA, true, q, k, v, m, s, acc, params);
 }
 
 sg_err sg_gpu_run_attn_splitk_combine(sg_gpu *g, void *m, void *s, void *acc,
@@ -2282,8 +2403,18 @@ static void enc_attn_splitk(sg_enc *E, void *q, void *k, void *v, void *out,
     id<MTLComputeCommandEncoder> e = E->enc;
     NSUInteger n_heads = (NSUInteger)p[0], n_splits = (NSUInteger)p[6];
 
+    /* Task P2.4: which partial, and therefore how tall the grid is. The GQA
+     * kernel gives one threadgroup the whole GQA group, so it reads each K/V
+     * element ONCE instead of once per query head sharing it; it writes the
+     * same m/s/acc bytes into the same layout, so nothing else here (the
+     * combine, the buffers, the scratch) changes with the choice. Off unless
+     * SURGE_ATTN_SPLITK_GQA=1 selects it; see splitk_gqa_use. */
+    bool gqa = splitk_gqa_use(g, p[0], p[1]);
+    NSUInteger rows = gqa ? (NSUInteger)p[1] : n_heads;
+
     /* The partial: q=0, kc=1, vc=2, m=3, s=4, acc=5, params=6, scores=7. */
-    [e setComputePipelineState:g->pipes[KI_ATTN_SPLITK_PARTIAL]];
+    [e setComputePipelineState:g->pipes[gqa ? KI_ATTN_SPLITK_PARTIAL_GQA
+                                            : KI_ATTN_SPLITK_PARTIAL]];
     [e setBuffer:bufof(q) offset:(NSUInteger)offof(q) atIndex:0];
     [e setBuffer:bufof(k) offset:(NSUInteger)offof(k) atIndex:1];
     [e setBuffer:bufof(v) offset:(NSUInteger)offof(v) atIndex:2];
@@ -2292,13 +2423,14 @@ static void enc_attn_splitk(sg_enc *E, void *q, void *k, void *v, void *out,
     [e setBuffer:bufof(g->b_sk_acc) offset:(NSUInteger)offof(g->b_sk_acc) atIndex:5];
     [e setBytes:p length:8 * sizeof(uint32_t) atIndex:6];
     [e setBuffer:g->splitk_scratch offset:0 atIndex:7];
-    /* SG_K_HEADS2D: x = split, y = query head, matching the kernel's tg.x /
-     * tg.y. gpu_grid's (groups, elems) pair cannot carry two group dimensions
-     * (it says so at its default case), so this is computed here by hand, the
-     * same way enc_matmul does it for SG_K_TILES2D and the one-shot partial
-     * does it for this kernel. Threads per threadgroup stay exactly SG_TG,
-     * which is the width the fixed tg_max/tg_sum fold trees are shaped for. */
-    [e dispatchThreadgroups:MTLSizeMake(n_splits, n_heads, 1)
+    /* SG_K_HEADS2D: x = split, y = query head (per-head partial) or KV head
+     * (GQA partial), matching the kernel's tg.x / tg.y. gpu_grid's (groups,
+     * elems) pair cannot carry two group dimensions (it says so at its default
+     * case), so this is computed here by hand, the same way enc_matmul does it
+     * for SG_K_TILES2D and the one-shots do it for these kernels. Threads per
+     * threadgroup stay exactly SG_TG, which is the width the fixed
+     * tg_max/tg_sum fold trees are shaped for. */
+    [e dispatchThreadgroups:MTLSizeMake(n_splits, rows, 1)
       threadsPerThreadgroup:MTLSizeMake(SG_TG, 1, 1)];
 
     /* The combine: m=0, s=1, acc=2, out=3, params=4. One threadgroup per query
@@ -2779,6 +2911,7 @@ static void gpu_free_state(sg_gpu *g) {
     sg_gpu_buf_free(g->b_sk_acc); g->b_sk_acc = NULL;
     g->splitk_max_splits = 0;
     g->attn_splitk = false;
+    g->attn_splitk_gqa = false;    /* P2.4: re-read from the env on the next state */
 
     void *shared[] = { g->b_x, g->b_h, g->b_r, g->b_qg, g->b_ctx, g->b_ffg,
                        g->b_ffu, g->b_qkv, g->b_ab, g->b_gates, g->b_y,
@@ -3100,6 +3233,27 @@ sg_err sg_gpu_state_new(sg_gpu *g, const sg_model *m, uint32_t max_ctx) {
                         "using 1\n", sk_env);
     }
     g->attn_splitk = splitk_on && kv_dtype == SG_T_F16;
+
+    /* Task P2.4: SURGE_ATTN_SPLITK_GQA selects WHICH split-K partial the
+     * decode path dispatches, once split-K itself is on. DEFAULT 0, the
+     * per-head k_attn_decode_splitk_partial P2.3 measured and shipped; "1"
+     * selects the GQA-shared k_attn_decode_splitk_partial_gqa, which reads
+     * each K/V element once per GQA group instead of once per query head.
+     *
+     * OFF BY DEFAULT BECAUSE NOTHING ABOUT IT HAS BEEN RUN: the GPU was held
+     * by a 256K benchmark for the whole of P2.4, so the kernel is compiled and
+     * reachable but ungated. That is exactly how P2.2 shipped its kernels, and
+     * P2.3 flipped its default only after the hardware gates passed. Same
+     * unrecognized-value warning as the two env vars above. */
+    const char *gq_env = getenv("SURGE_ATTN_SPLITK_GQA");
+    bool gqa_on = false;
+    if (gq_env && strcmp(gq_env, "1") == 0) {
+        gqa_on = true;
+    } else if (gq_env && gq_env[0] != '\0' && strcmp(gq_env, "0") != 0) {
+        fprintf(stderr, "gpu: SURGE_ATTN_SPLITK_GQA='%s' not recognized (want 0 or 1); "
+                        "using 0\n", gq_env);
+    }
+    g->attn_splitk_gqa = gqa_on && g->attn_splitk;
     g->splitk_max_splits = 0;
 
     uint64_t half = 0;

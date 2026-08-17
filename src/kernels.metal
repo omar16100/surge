@@ -1632,3 +1632,322 @@ kernel void k_attn_decode_splitk_combine(device const float *m_in   [[buffer(0)]
         oh[d] = (S > 0.0f) ? (num / S) : 0.0f;
     }
 }
+
+/* =====================================================================
+ * GQA-shared split-K decode attention partial (Task P2.4)
+ * =====================================================================
+ *
+ * SAME OUTPUT BYTES AS k_attn_decode_splitk_partial, LESS MEMORY TRAFFIC.
+ * That kernel's grid is (n_splits, n_heads), and GQA maps repeat = n_heads /
+ * n_kv_heads query heads onto ONE kv head, so for a given split the `repeat`
+ * threadgroups h = hk*repeat .. hk*repeat+repeat-1 each stream the SAME K and
+ * V slices out of memory independently. On the real 4B decode shape (32 heads,
+ * 8 kv) that is 4x the unique bytes; on the 27B shape (24 heads, 4 kv), 6x.
+ * Decode at depth is bandwidth-bound, so it is close to a `repeat`x tax on the
+ * dominant cost. (P2.3a's harness reports achieved GB/s from ISSUED bytes,
+ * which is why its headline number is `repeat` times the unique-bytes figure.)
+ *
+ * This kernel makes ONE threadgroup serve an entire GQA group: the grid is
+ * (n_splits, n_kv_heads), each threadgroup reads a K (later V) element once
+ * and applies it to all `repeat` query vectors that share it, holding `repeat`
+ * independent running results.
+ *
+ * THE OUTPUT LAYOUT IS UNCHANGED, deliberately: m_out and s_out are still
+ * indexed part_idx = h * n_splits + part and acc_out at part_idx * hd, for
+ * EVERY h in the group, so k_attn_decode_splitk_combine, the score-scratch
+ * sizing in metal.m and the [n_heads, n_splits] buffer shapes are all
+ * untouched. Only which threadgroup writes a given triple changes.
+ *
+ * BYTE-IDENTICAL, NOT MERELY CLOSE. This is a data-reuse reorganization and
+ * nothing about the arithmetic moves:
+ *   - the dot product still accumulates qh[i] * (float)kt[i] over increasing
+ *     i, per head, from 0.0f;
+ *   - m and s are still folded by tg_max / tg_sum, one fixed-shape tree per
+ *     head over the same per-lane partials (thread lid still owns the split's
+ *     keys lid, lid+SG_TG, ...);
+ *   - acc[d] still accumulates sc[r] * (float)v[t0+r][d] over increasing r,
+ *     per head, from 0.0f.
+ * So every output bit must match k_attn_decode_splitk_partial's, and any
+ * difference is a bug here rather than a tolerance to widen. The one ordering
+ * change is WHEN m and s are stored (right after each head's folds rather than
+ * after the acc pass); those are plain stores of already-final values into
+ * buffers no other threadgroup touches, so no bit depends on it.
+ *
+ * THAT CONTRACT RESTS ON -fno-fast-math, which the Makefile passes and calls
+ * not optional. This kernel raises the stakes on it: an R-accumulator loop is
+ * exactly the shape a fast-math optimizer would reassociate or contract
+ * differently from the single-accumulator one, and the failure would be a
+ * silent one-ulp drift rather than an error. Anyone building the metallib
+ * outside the Makefile rule voids the guarantee.
+ *
+ * DETERMINISM (the rule at the top of this file) is unchanged: no atomics, no
+ * simd_sum / simd_max, no read-modify-write of a shared accumulator. Holding
+ * `repeat` SEPARATE per-thread accumulators is exactly what the rule allows;
+ * the trees are still fixed-shape and still folded one head at a time.
+ *
+ * THE GROUP SIZE IS A COMPILE-TIME CONSTANT, by necessity: `repeat` private
+ * accumulators indexed by a runtime value would be a stack array in device
+ * memory rather than registers, which would cost more than the traffic it
+ * saves. splitk_partial_group is therefore templated on it and the kernel
+ * switches over the runtime `repeat`, with one instantiation per value up to
+ * SG_SPLITK_GQA_MAX. A larger group still produces the right answer (the
+ * default arm below runs the group one head at a time, which is bit for bit
+ * what the per-head kernel does) but buys no reuse, so metal.m's policy keeps
+ * the per-head kernel there instead.
+ *
+ * Q IS LEFT IN DEVICE MEMORY rather than staged into threadgroup memory. The
+ * inner loop reads repeat*head_dim floats per key instead of head_dim, but
+ * that is the SAME number of q loads the `repeat` separate threadgroups issued
+ * before (it is only the K/V loads that collapse), a group's q slice is at
+ * most 8 KB and is re-read every key, so it sits in cache; staging it would
+ * add a fixed threadgroup allocation that cuts how many threadgroups a core
+ * can hold. */
+
+/* The largest GQA group this kernel keeps in registers. Mirrored in metal.m as
+ * SG_SPLITK_GQA_MAX, the way SG_TG and SG_GEMM_TM already are; keep both in
+ * sync. 8 covers every shape surge targets (27B: 24/4 = 6, 4B dense:
+ * 32/8 = 4) with room for the 8 that 64-head/8-kv models use. */
+constant uint SG_SPLITK_GQA_MAX = 8u;
+/* The switch in the kernel below must have one arm per group size up to that
+ * bound, and metal.m's policy uses the SAME bound to decide which shapes it
+ * sends here; a bump that forgets either half would silently fall into the
+ * no-reuse default arm. */
+static_assert(SG_SPLITK_GQA_MAX == 8u,
+              "SG_SPLITK_GQA_MAX changed: update the switch arms in "
+              "k_attn_decode_splitk_partial_gqa and SG_SPLITK_GQA_MAX in metal.m");
+
+/* Every loop that indexes one of the per-head accumulator arrays carries this.
+ * The arrays must end up in REGISTERS: indexed by a runtime j they would be a
+ * stack allocation in the thread address space, and the inner loop would then
+ * do a load and a store per head per element, which is more traffic than the
+ * K/V reads this kernel exists to remove. R is a compile-time constant, so the
+ * trip count is always known and the hint always applies.
+ *
+ * WHAT THIS IS AND IS NOT EVIDENCE OF. `xcrun metal -c` emits AIR, and the AIR
+ * carries the array as an `alloca [R x float]` with variable-index geps WITH OR
+ * WITHOUT this pragma (a minimal standalone probe reproduces that), because the
+ * unrolling and the register allocation happen in the driver's backend when the
+ * pipeline is created, not in the offline compiler. So this is a hint whose
+ * effect is only observable in a timing on hardware, and the compile-time check
+ * cannot confirm it. */
+#define SG_UNROLL_R _Pragma("clang loop unroll(full)")
+
+/* One (kv head group, split) threadgroup's whole job, for a group of exactly R
+ * query heads starting at h0. Written as a template so the `float dot[R]` and
+ * `float a[R]` accumulators are register-resident (see SG_UNROLL_R above), and
+ * called with R == 1 in a loop for group sizes past SG_SPLITK_GQA_MAX.
+ *
+ * Every argument is uniform across the threadgroup except lid, so both the
+ * empty-split early return and the barriers below are reached by all threads
+ * or none, whichever arm the caller took. */
+template <uint R>
+static void splitk_partial_group(device const float *q,
+                                 device const half *kc,
+                                 device const half *vc,
+                                 device float *m_out,
+                                 device float *s_out,
+                                 device float *acc_out,
+                                 device float *scores,
+                                 threadgroup float *red,
+                                 uint h0, uint hk, uint part, uint lid,
+                                 uint n_kv, uint hd, uint seq, uint q_stride,
+                                 float scale, uint n_splits)
+{
+    /* The partition rule, in 64-bit exactly like attn_decode_core's and
+     * k_attn_decode_splitk_partial's. */
+    uint t0 = (uint)(((ulong)part * (ulong)seq) / (ulong)n_splits);
+    uint t1 = (uint)((((ulong)part + 1ul) * (ulong)seq) / (ulong)n_splits);
+
+    /* The group's FIRST head's flat (head, split) index, plus the strides that
+     * step to the next head in the group. Head h0+j sits at
+     * part_idx + j*n_splits in m/s and (part_idx + j*n_splits)*hd in acc,
+     * which is the per-query-head layout the combine already consumes. */
+    size_t part_idx = (size_t)h0 * (size_t)n_splits + (size_t)part;
+    size_t ms_stride = (size_t)n_splits;
+    size_t acc_stride = (size_t)n_splits * (size_t)hd;
+    device float *acc = acc_out + part_idx * (size_t)hd;
+
+    /* Empty split: the documented m = -INFINITY / s = 0 / acc = 0 encoding for
+     * EVERY head of the group. Uniform branch (t0, t1 are uniform). */
+    if (t0 >= t1) {
+        if (lid == 0u) {
+            for (uint j = 0; j < R; j++) {
+                m_out[part_idx + (size_t)j * ms_stride] = -INFINITY;
+                s_out[part_idx + (size_t)j * ms_stride] = 0.0f;
+            }
+        }
+        for (uint i = lid; i < hd; i += SG_TG) {
+            for (uint j = 0; j < R; j++) acc[(size_t)j * acc_stride + i] = 0.0f;
+        }
+        return;
+    }
+
+    /* One private score row of `span` floats per (head, split), the same rows
+     * and the same ceil(seq/n_splits) formula k_attn_decode_splitk_partial and
+     * metal.m's splitk_sizes use, so the scratch buffer needs no resizing and
+     * neighbouring rows still never share a byte. */
+    uint span = (uint)((((ulong)seq + (ulong)n_splits) - 1ul) / (ulong)n_splits);
+    device float *sc = scores + part_idx * (size_t)span;
+    size_t sc_stride = (size_t)n_splits * (size_t)span;
+    device const float *qh = q + (size_t)h0 * q_stride;
+    uint len = t1 - t0;
+
+    /* 1. scores over [t0, t1). Thread `lid` owns the split's keys lid,
+     *    lid+256, ... exactly as before; the difference is that ONE read of
+     *    kt[i] now feeds all R heads instead of R threadgroups each reading
+     *    it. Per head the accumulation is still serial over increasing i from
+     *    0.0f, so every dot product is bit for bit the per-head kernel's. */
+    for (uint r = lid; r < len; r += SG_TG) {
+        device const half *kt = kc + ((size_t)(t0 + r) * n_kv + hk) * hd;
+        float dot[R];
+        SG_UNROLL_R for (uint j = 0; j < R; j++) dot[j] = 0.0f;
+        for (uint i = 0; i < hd; i++) {
+            float kf = (float)kt[i];
+            SG_UNROLL_R for (uint j = 0; j < R; j++) dot[j] += qh[(size_t)j * q_stride + i] * kf;
+        }
+        SG_UNROLL_R for (uint j = 0; j < R; j++) sc[(size_t)j * sc_stride + r] = dot[j] * scale;
+    }
+    threadgroup_barrier(mem_flags::mem_device | mem_flags::mem_threadgroup);
+
+    /* 2 + 3. Per head, in group order: m = max score over THIS split, then
+     *    s = sum exp(score - m) with the exponentials left in the score row
+     *    for step 4, and NO division by the sum (the split's weights must stay
+     *    unnormalized for the combine's rescaling to undo). One fixed-shape
+     *    tg_max and tg_sum per head over the same per-lane partials the
+     *    per-head kernel folds, so both values are bit-identical to it.
+     *
+     *    tg_max / tg_sum are callable in a loop: each opens with a barrier
+     *    that makes sure every thread has finished reading red[0] from the
+     *    previous fold before this one overwrites red[lid]. Only this
+     *    threadgroup writes these m/s slots, so storing them here rather than
+     *    after step 4 changes no bit. */
+    for (uint j = 0; j < R; j++) {
+        device float *scj = sc + (size_t)j * sc_stride;
+        float m = -INFINITY;
+        for (uint r = lid; r < len; r += SG_TG) { float v = scj[r]; m = (v > m) ? v : m; }
+        m = tg_max(red, lid, m);
+
+        float sacc = 0.0f;
+        for (uint r = lid; r < len; r += SG_TG) {
+            float e = precise::exp(scj[r] - m);
+            scj[r] = e;
+            sacc += e;
+        }
+        float s = tg_sum(red, lid, sacc);
+
+        /* tg_max/tg_sum hand the SAME value to every thread, so this is a
+         * store from a designated thread, not a reduction. */
+        if (lid == 0u) {
+            m_out[part_idx + (size_t)j * ms_stride] = m;
+            s_out[part_idx + (size_t)j * ms_stride] = s;
+        }
+    }
+    /* The exponentials just written are read across threads in step 4. */
+    threadgroup_barrier(mem_flags::mem_device | mem_flags::mem_threadgroup);
+
+    /* 4. acc[d] = sum_t exp(score_t - m) * v[t][d] over the split, thread
+     *    `lid` owning OUTPUT dims lid, lid+256, ... and walking t in
+     *    increasing order, so there is no cross-thread reduction and the
+     *    summation order per head is fixed, exactly as before. ONE read of the
+     *    V element now feeds all R heads. */
+    for (uint i = lid; i < hd; i += SG_TG) {
+        float a[R];
+        SG_UNROLL_R for (uint j = 0; j < R; j++) a[j] = 0.0f;
+        for (uint r = 0; r < len; r++) {
+            float vf = (float)vc[((size_t)(t0 + r) * n_kv + hk) * hd + i];
+            SG_UNROLL_R for (uint j = 0; j < R; j++) a[j] += sc[(size_t)j * sc_stride + r] * vf;
+        }
+        SG_UNROLL_R for (uint j = 0; j < R; j++) acc[(size_t)j * acc_stride + i] = a[j];
+    }
+}
+
+/* One threadgroup per (KV HEAD, split), a 2D grid dispatched as
+ * (x = split, y = kv head): metal.m's same SG_K_HEADS2D class as the per-head
+ * partial, with the y extent changed from params[0] to params[1]. Buffers,
+ * buffer indices and params are IDENTICAL to k_attn_decode_splitk_partial's,
+ * so the two are drop-in alternatives for one another on the host side:
+ *
+ * params: [0]=n_heads [1]=n_kv_heads [2]=head_dim [3]=seq [4]=q_stride
+ * [5]=softmax scale bits [6]=n_splits (params[7] unused).
+ *
+ * Like the per-head partial this binds metal.m's DEDICATED sg_gpu.splitk_
+ * scratch at buffer 7, never the process-wide sg_gpu.scratch (P2.2 review
+ * finding 1), and it writes the same rows of it. */
+kernel void k_attn_decode_splitk_partial_gqa(device const float *q [[buffer(0)]],
+                                             device const half *kc   [[buffer(1)]],
+                                             device const half *vc   [[buffer(2)]],
+                                             device float *m_out     [[buffer(3)]],
+                                             device float *s_out     [[buffer(4)]],
+                                             device float *acc_out   [[buffer(5)]],
+                                             constant uint *p        [[buffer(6)]],
+                                             device float *scores    [[buffer(7)]],
+                                             uint2 tg  [[threadgroup_position_in_grid]],
+                                             uint2 tid [[thread_position_in_threadgroup]])
+{
+    uint n_heads = p[0], n_kv = p[1], hd = p[2], seq = p[3];
+    uint q_stride = p[4];
+    float scale = as_type<float>(p[5]);
+    uint n_splits = p[6];
+
+    uint part = tg.x, hk = tg.y, lid = tid.x;
+    /* Every term is uniform across the threadgroup (tg.x/tg.y are, lid is not
+     * used), so these returns cannot strand a thread on a barrier below. */
+    if (n_kv == 0u || hd == 0u || hk >= n_kv || part >= n_splits) return;
+
+    uint repeat = n_heads / n_kv;
+    /* UNREACHABLE through metal.m's entry points, which reject n_kv_heads == 0
+     * and n_heads % n_kv_heads != 0 before encoding anything (check_params).
+     * Guarded anyway, and as a no-op rather than a best effort: with a group
+     * size that does not tile n_heads exactly, the group starting at hk*repeat
+     * would run off the end of the m/s/acc buffers, and a wild write is far
+     * worse than an unwritten one. NOTE WHAT "UNWRITTEN" MEANS, though: the
+     * m/s/acc buffers keep whatever they held, and the combine consumes those
+     * stale bytes without complaint. This is a last resort against memory
+     * corruption, NOT a diagnostic; check_params is where a bad shape is
+     * supposed to be caught, and it is. */
+    if (repeat == 0u || n_kv * repeat != n_heads) return;
+
+    threadgroup float red[SG_TG];
+    uint h0 = hk * repeat;
+
+    /* The switch is what makes R compile-time (see the header). Every thread
+     * of the threadgroup takes the same arm, since `repeat` is uniform. */
+    switch (repeat) {
+    case 1u: splitk_partial_group<1>(q, kc, vc, m_out, s_out, acc_out, scores, red,
+                                     h0, hk, part, lid, n_kv, hd, seq, q_stride,
+                                     scale, n_splits); break;
+    case 2u: splitk_partial_group<2>(q, kc, vc, m_out, s_out, acc_out, scores, red,
+                                     h0, hk, part, lid, n_kv, hd, seq, q_stride,
+                                     scale, n_splits); break;
+    case 3u: splitk_partial_group<3>(q, kc, vc, m_out, s_out, acc_out, scores, red,
+                                     h0, hk, part, lid, n_kv, hd, seq, q_stride,
+                                     scale, n_splits); break;
+    case 4u: splitk_partial_group<4>(q, kc, vc, m_out, s_out, acc_out, scores, red,
+                                     h0, hk, part, lid, n_kv, hd, seq, q_stride,
+                                     scale, n_splits); break;
+    case 5u: splitk_partial_group<5>(q, kc, vc, m_out, s_out, acc_out, scores, red,
+                                     h0, hk, part, lid, n_kv, hd, seq, q_stride,
+                                     scale, n_splits); break;
+    case 6u: splitk_partial_group<6>(q, kc, vc, m_out, s_out, acc_out, scores, red,
+                                     h0, hk, part, lid, n_kv, hd, seq, q_stride,
+                                     scale, n_splits); break;
+    case 7u: splitk_partial_group<7>(q, kc, vc, m_out, s_out, acc_out, scores, red,
+                                     h0, hk, part, lid, n_kv, hd, seq, q_stride,
+                                     scale, n_splits); break;
+    case 8u: splitk_partial_group<8>(q, kc, vc, m_out, s_out, acc_out, scores, red,
+                                     h0, hk, part, lid, n_kv, hd, seq, q_stride,
+                                     scale, n_splits); break;
+    default:
+        /* A group larger than SG_SPLITK_GQA_MAX: still CORRECT, one head at a
+         * time, which is bit for bit what k_attn_decode_splitk_partial does,
+         * but with none of the reuse. metal.m's policy sends these shapes to
+         * the per-head kernel instead, so this arm is the safety net for a
+         * caller that reached this kernel anyway. */
+        for (uint j = 0; j < repeat; j++) {
+            splitk_partial_group<1>(q, kc, vc, m_out, s_out, acc_out, scores, red,
+                                    h0 + j, hk, part, lid, n_kv, hd, seq, q_stride,
+                                    scale, n_splits);
+        }
+        break;
+    }
+}

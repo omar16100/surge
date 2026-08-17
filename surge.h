@@ -893,6 +893,41 @@ sg_err sg_gpu_run_attn_splitk_partial(sg_gpu *g, void *q, void *k, void *v,
 sg_err sg_gpu_run_attn_splitk_combine(sg_gpu *g, void *m, void *s, void *acc,
                                       void *out, const uint32_t params[8]);
 
+/* THE GQA-SHARED PARTIAL (Task P2.4), a drop-in alternative to
+ * sg_gpu_run_attn_splitk_partial above: same arguments, same params array,
+ * same buffer sizes, same score scratch, same [n_heads, n_splits] output
+ * layout, and the SAME OUTPUT BYTES. It dispatches
+ * k_attn_decode_splitk_partial_gqa, whose grid is (n_splits, n_kv_heads)
+ * rather than (n_splits, n_heads).
+ *
+ * WHY: GQA maps repeat = n_heads / n_kv_heads query heads onto one kv head, so
+ * in the per-head kernel the `repeat` threadgroups of a group each stream the
+ * SAME K and V slices out of memory. On the real 4B decode shape (32 heads, 8
+ * kv) that is 4x the unique bytes; on the 27B shape (24 heads, 4 kv), 6x. This
+ * kernel reads each K/V element once and applies it to all `repeat` query
+ * vectors, holding `repeat` independent running results per thread.
+ *
+ * BYTE-IDENTICAL BY CONSTRUCTION, not to a tolerance: the per-head dot
+ * products, the per-head fixed-shape tg_max/tg_sum folds and the per-head acc
+ * sums keep their operands and their order exactly. Anything else is a bug in
+ * the kernel. (The pair of kernels still agrees with sg_ref_attn_decode only
+ * to float rounding, as before; it is the two METAL partials that must match
+ * bit for bit.)
+ *
+ * SAME DOMAIN AND SAME REJECTIONS as sg_gpu_run_attn_splitk_partial, checked
+ * by the same code. n_heads % n_kv_heads == 0 (already required) is what makes
+ * the groups tile the query heads exactly. A group wider than the kernel's
+ * SG_SPLITK_GQA_MAX (8) is accepted and answered correctly, one head at a
+ * time, but buys no reuse, so the decode path routes those shapes to the
+ * per-head kernel instead.
+ *
+ * NOT THE DECODE DEFAULT YET. sg_gpu_forward dispatches this kernel only under
+ * SURGE_ATTN_SPLITK_GQA=1 (see sg_gpu_state_new below): it was written while
+ * the GPU was busy and no hardware gate has been run on it. */
+sg_err sg_gpu_run_attn_splitk_partial_gqa(sg_gpu *g, void *q, void *k, void *v,
+                                          void *m, void *s, void *acc,
+                                          const uint32_t params[8]);
+
 /* One-shot dispatches for the gated-DeltaNet chunked-scan prefill kernels (Task
  * M5.5), each the same synchronous commit-and-wait contract as the entries
  * above, extended to the extra device buffer the kernel needs beyond (a, b,
@@ -990,6 +1025,16 @@ sg_err sg_gpu_run_rmsnorm_gated_chunk(sg_gpu *g, void *y, void *z, void *out, vo
  * so they agree to float rounding, not bit for bit: expect the same generated
  * token ids, not the same logit bits. Each choice is independently
  * deterministic (rerunning either one reproduces its own logits exactly).
+ *
+ * WHICH SPLIT-K PARTIAL runs is a second, independent env var read at the same
+ * point (Task P2.4): SURGE_ATTN_SPLITK_GQA. Default 0, the per-head
+ * k_attn_decode_splitk_partial. 1 selects the GQA-shared
+ * k_attn_decode_splitk_partial_gqa, which reads each K/V element once per GQA
+ * GROUP instead of once per query head and is contracted to produce the SAME
+ * BYTES (unlike the split-K/incumbent choice above, which changes rounding).
+ * It is ignored unless split-K itself is on, and for GQA groups outside
+ * [2, 8], where it would buy nothing. Default 0 because no hardware gate has
+ * been run on that kernel yet, not because it is known to be slower.
  *
  * Order of use: sg_gpu_init -> sg_gpu_load_model -> sg_gpu_state_new ->
  * sg_gpu_forward per token with pos = 0, 1, 2, ... A second sequence needs

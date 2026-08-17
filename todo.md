@@ -12,6 +12,7 @@ held. It is superseded, on the same day, by the GPU gates actually running:
 | P2.2 Metal split-K kernels | **GATED ON HARDWARE**, worst rel 1.027e-06 vs BOTH oracles, 100x byte-identical |
 | P2.3a split-K timing harness (`make bench-splitk`) | **MEASURED**: 15.9x (27B shape) and 21.9x (4B shape) at seq 262144 |
 | P2.3 wiring into the decode path | **DONE AND GATED**, see Task P2.3 Results at the end of this file |
+| P2.4 GQA-shared threadgroups (`k_attn_decode_splitk_partial_gqa`) | **WRITTEN AND COMPILED ONLY, NO GPU GATE RUN.** Off by default (`SURGE_ATTN_SPLITK_GQA=1` opts in), so the shipped decode path is still exactly what P2.3 measured. See Task P2.4 Results at the end of this file. |
 
 What that means concretely: the CPU oracles (P2.0, P2.1) are proven; the Metal kernels
 (P2.2) have now been executed against both of them on real hardware and matched; the
@@ -2593,3 +2594,86 @@ fixture's `n_heads` (4), because a swapped axis is invisible when those are equa
 Docs: `docs/16082026_splitk_decode_gate.md` (new, registered in `docs/index.md`),
 `docs/c4model.md` decode data flow + status. Report:
 `.superpowers/sdd/2026-08-09-surge-m3-m5/task-P2.3-report.md`.
+
+## Task P2.4 Results (kernels.metal/metal.m: GQA-shared split-K threadgroups)
+
+**NO GPU GATE HAS BEEN RUN.** A 27B MLX NIAH benchmark (`mlx_raw_niah_client.py`, PID
+27940) held the GPU for this entire task, confirmed with
+`pgrep -f "bench_niah|mlx_raw_niah|llama-server|surge-bench"` before the first edit and
+after the last. Nothing below is a measured correctness or timing result; the numbers that
+do appear are grid arithmetic and model shapes.
+
+**What the task removes.** `k_attn_decode_splitk_partial`'s grid is `(n_splits, n_heads)`
+and GQA maps `repeat = n_heads / n_kv_heads` query heads onto one kv head, so for a given
+split those `repeat` threadgroups each stream the SAME K and V slices out of memory: 4x
+the unique bytes on the 4B dense shape (32 heads, 8 kv), 6x on the 27B decode shape (24
+heads, 4 kv). Decode at depth is bandwidth-bound, so that is a tax on the dominant cost.
+It is also why `bench_splitk`'s achieved-GB/s column (issued bytes) reads 4.0x the
+unique-bytes figure on the 4B shape.
+
+**New kernel** `k_attn_decode_splitk_partial_gqa`: grid `(n_splits, n_kv_heads)`, one
+threadgroup per GQA GROUP. It reads each K (and V) element once and applies it to all
+`repeat` query vectors, holding `repeat` separate per-thread accumulators. Same eight
+bindings, same params array, same score-scratch rows, same `[n_heads, n_splits]` m/s and
+`[n_heads, n_splits, head_dim]` acc layout, so `k_attn_decode_splitk_combine` and every
+host-side size rule are untouched, and P2.2's DEDICATED `splitk_scratch` separation is
+preserved (this kernel binds it at index 7 exactly as the per-head one does).
+
+**The bar is BYTE-IDENTICAL, not a tolerance.** Per query head nothing about the
+arithmetic moves: the dot product still accumulates `qh[i] * (float)kt[i]` over increasing
+`i` from 0.0f, m/s still come off the same fixed-shape `tg_max`/`tg_sum` trees over the
+same per-lane partials, and acc still sums over increasing t. The only ordering change is
+that m and s are stored right after each head's folds instead of after the acc pass, which
+is a store of an already-final value into a slot no other threadgroup touches.
+Determinism rule intact: no atomics, no `simd_sum`, no shared accumulator.
+
+**Group size is compile-time** (`SG_SPLITK_GQA_MAX == 8`, mirrored in `metal.m` with a
+`static_assert` on the kernel side): `repeat` accumulators indexed by a runtime value
+would be a device-memory stack array and would cost more than the traffic saved. The
+kernel templates the body on the group size and switches over the runtime `repeat`; past
+the bound it falls into a correct one-head-at-a-time arm with no reuse, and `metal.m`'s
+policy sends those shapes to the per-head kernel instead.
+
+**Switchable, OFF BY DEFAULT.** `SURGE_ATTN_SPLITK_GQA=1` selects it, read in
+`sg_gpu_state_new` like `SURGE_ATTN_SPLITK`, so ONE binary runs both sides of the A/B.
+Default off because nothing has been run, exactly how P2.2 shipped its kernels;
+`splitk_gqa_use` also declines groups outside [2, 8]. NO threadgroup-count floor was
+invented: the GQA grid is `repeat`x smaller (at seq 1024 on the 27B shape, 16 threadgroups
+against 96 on an 80-core GPU), so a short-sequence crossover probably exists and
+`tests/bench_splitk.bin --gqa` (new flag) is the instrument for it.
+
+**Also changed:** the two partial one-shots now share one body (`splitk_partial_run`), so
+they cannot drift on a validation rule; `sg_gpu_run_attn_splitk_partial_gqa` is public in
+`surge.h`; `check_params` / `check_sizes` route the new kernel name through the same rules.
+
+**COMPILE-ONLY GATES, RUN:**
+1. `xcrun -sdk macosx metal -fno-fast-math -Wall -c src/kernels.metal -o /tmp/p24_kernels.air`
+   clean, 0 warnings; `xcrun -sdk macosx metallib` links to /tmp and `metal-nm` shows
+   `k_attn_decode_splitk_partial_gqa`. `src/kernels.metallib` was NOT overwritten (the GPU
+   was busy); the next `make` rebuilds it.
+2. `clang -fsyntax-only -std=c11 -Wall -Wextra -Werror` clean on `src/metal.m`,
+   `tests/test_metal_ops.c` and `tests/bench_splitk.c`, in both their Metal and
+   `-DSURGE_NO_METAL` forms.
+3. `make debug` (SURGE_NO_METAL, ASan/UBSan) rc 0, **83523 checks, 0 failures, 0 sanitizer
+   diagnostics** -- the IDENTICAL count to a clean `git worktree` at the parent commit
+   6f9c524 measured in the same shell today (83523), not assumed. (P2.3's doc records
+   83953 for its own run; the difference is the env-gated fixture tests that skip when
+   `SURGE_GGUF`/`SURGE_ST` are unset, which is the case here for both measurements.)
+
+**DEFERRED GATES (need the GPU free), in the order to run them:**
+1. `pgrep -f "bench_niah|mlx_raw_niah|phase0|surge-bench|llama-server|llama-cli"` prints
+   nothing.
+2. `make check` (rebuilds `src/kernels.metallib` with the new kernel first). Expected: the
+   pre-existing count plus the new subtest's checks, 0 failures. This also covers whether
+   the new pipeline builds at all and keeps a 256-thread threadgroup width.
+3. `./tests/test_metal_ops.bin` -> `metal_attn_splitk_gqa_bit_identical`: m, s, acc and
+   out byte-identical to the per-head partial across repeat 4/6/1/3/16, both q_stride
+   conventions, n_splits {1,2,3,7,64,257}, plus 100x determinism.
+4. `SURGE_ATTN_SPLITK_GQA=0 ./surge <4B gguf> -p "$(cat PROMPT)" -n 64` then `=1`: gen_ids
+   AND logits byte-identical (a stronger claim than P2.3's A/B, which changed rounding).
+5. `./tests/bench_splitk.bin --seqs 8192,32768,131072,262144` then the same `--gqa`, and
+   `--seqs 1024,2048,4096,8192` both ways for the crossover.
+
+Docs: `docs/17082026_splitk_gqa_threadgroups.md` (new, registered in `docs/index.md`),
+`docs/c4model.md` (component row, decode data flow, status). Report:
+`.superpowers/sdd/2026-08-09-surge-m3-m5/task-P2.4-report.md`.

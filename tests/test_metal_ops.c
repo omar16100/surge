@@ -2820,6 +2820,276 @@ static void splitk_rejects_bad_arguments(void) {
     gb_free(&mb); gb_free(&sb); gb_free(&ab); gb_free(&ob);
 }
 
+/* --------------------------------------------------------------------
+ * P2.4: k_attn_decode_splitk_partial_gqa vs k_attn_decode_splitk_partial
+ * --------------------------------------------------------------------
+ *
+ * THIS SUBTEST WAS ALSO WRITTEN WITH THE GPU HELD BY A BENCHMARK and had never
+ * been executed when it was committed, exactly like the P2.2 block above.
+ *
+ * THE BAR IS BYTE-IDENTICAL, NOT close, and that is the point of the task
+ * rather than an aspiration. The GQA kernel is a pure data-reuse
+ * reorganization of the per-head one: one threadgroup serves a whole GQA
+ * group, so each K/V element is read once instead of once per query head that
+ * shares it, but every dot product still accumulates the same operands in
+ * increasing i, every m and s still comes off the same fixed-shape tg_max /
+ * tg_sum tree over the same per-lane partials, and every acc still sums over
+ * increasing t. Nothing in the arithmetic moves, so nothing in the output may.
+ * A 1e-7 difference here would mean the reorganization changed an accumulation
+ * order somewhere, which is a bug in the kernel, not a rounding budget.
+ *
+ * All four buffers are compared (m, s, acc AND the combined out), memcmp-wise,
+ * for the two reasons the P2.2 determinism check states: a partial that is
+ * wrong in a way the combine's num/S division cancels would pass an out-only
+ * check, and float != is wrong in both directions (a stable NaN compares
+ * unequal to itself, a +0.0/-0.0 flip compares equal). Both sides' outputs are
+ * poisoned before every dispatch so an UNWRITTEN buffer cannot pass by
+ * inheriting bytes; if the GQA kernel ever silently skipped a head, its m/s/acc
+ * would still hold 0xA5 and the comparison would fail rather than pass. */
+static void gqa_same_bytes(const char *label, const float *a, const float *b, size_t n) {
+    size_t first = n, ndiff = 0;
+    for (size_t i = 0; i < n; i++) {
+        if (memcmp(&a[i], &b[i], sizeof(float)) != 0) {
+            if (first == n) first = i;
+            ndiff++;
+        }
+    }
+    double fa = (first < n) ? (double)a[first] : 0.0;
+    double fb = (first < n) ? (double)b[first] : 0.0;
+    tt_assert(ndiff == 0,
+              "%s: %llu of %llu floats differ, first at index %llu "
+              "(per-head %.9g, gqa %.9g)", label,
+              (unsigned long long)ndiff, (unsigned long long)n,
+              (unsigned long long)first, fa, fb);
+}
+
+/* One (shape, q_stride) sweep: for every n_splits, run BOTH partials plus the
+ * shared combine on identical inputs and compare all four outputs bit for bit.
+ * The n_splits list is P2.2's, so it carries the same cases: 257 > seq 200
+ * forces genuinely empty splits (the -inf/0/0 encoding, which the GQA kernel
+ * has to write for every head of the group), and the low counts push a split
+ * past 256 keys so the score loop strides. */
+static void splitk_gqa_shape(const char *what, uint32_t n_heads, uint32_t n_kv, uint32_t hd,
+                             uint32_t seq, uint32_t q_stride, uint32_t seed) {
+    const uint32_t splits[] = {1, 2, 3, 7, 64, 257};
+    uint32_t out_n = n_heads * hd;
+    uint64_t kvn = (uint64_t)seq * n_kv * hd;
+    float scale = (float)(1.0 / sqrt((double)hd));
+
+    lcg_seed(seed);
+    float *q = xmalloc((size_t)n_heads * q_stride * sizeof *q);
+    for (uint32_t h = 0; h < n_heads; h++) {
+        float *qh = q + (size_t)h * q_stride;
+        for (uint32_t i = 0; i < hd; i++) qh[i] = lcg_next();
+        /* The gate half is not query data. NaN-poisoned exactly as in the P2.2
+         * sweep: the GQA kernel reaches head h0+j through a j*q_stride stride
+         * rather than its own base pointer, so an off-by-one there would read
+         * this and every comparison would come back NaN. */
+        for (uint32_t i = hd; i < q_stride; i++) qh[i] = (float)NAN;
+    }
+
+    uint16_t *k16 = xmalloc((size_t)kvn * sizeof *k16);
+    uint16_t *v16 = xmalloc((size_t)kvn * sizeof *v16);
+    for (uint64_t i = 0; i < kvn; i++) {
+        k16[i] = sg_f32_to_f16(lcg_next() * 2.0f);
+        v16[i] = sg_f32_to_f16(lcg_next() * 2.0f);
+    }
+
+    gbuf qb = gb_from(q, (uint64_t)n_heads * q_stride);
+    gbuf16 kb = gb16_new(kvn), vb = gb16_new(kvn);
+    memcpy(kb.h, k16, (size_t)kvn * sizeof(uint16_t));
+    memcpy(vb.h, v16, (size_t)kvn * sizeof(uint16_t));
+
+    for (size_t si = 0; si < sizeof splits / sizeof splits[0]; si++) {
+        uint32_t ns = splits[si];
+        uint32_t p[8] = {n_heads, n_kv, hd, seq, q_stride, f32_bits(scale), ns, 0};
+        uint64_t parts = (uint64_t)n_heads * ns;
+        gbuf m1 = gb_new(parts), s1 = gb_new(parts), a1 = gb_new(parts * hd);
+        gbuf m2 = gb_new(parts), s2 = gb_new(parts), a2 = gb_new(parts * hd);
+        gbuf o1 = gb_new(out_n), o2 = gb_new(out_n);
+        gb_poison(&m1); gb_poison(&s1); gb_poison(&a1); gb_poison(&o1);
+        gb_poison(&m2); gb_poison(&s2); gb_poison(&a2); gb_poison(&o2);
+
+        sg_err e = sg_gpu_run_attn_splitk_partial(g_gpu, qb.b, kb.b, vb.b,
+                                                  m1.b, s1.b, a1.b, p);
+        tt_assert(!sg_failed(e), "splitk per-head partial (%s, n_splits %u): %s",
+                  what, ns, e.msg ? e.msg : "ok");
+        if (!sg_failed(e)) {
+            e = sg_gpu_run_attn_splitk_combine(g_gpu, m1.b, s1.b, a1.b, o1.b, p);
+            tt_assert(!sg_failed(e), "splitk combine after per-head (%s, n_splits %u): %s",
+                      what, ns, e.msg ? e.msg : "ok");
+        }
+        if (!sg_failed(e)) {
+            e = sg_gpu_run_attn_splitk_partial_gqa(g_gpu, qb.b, kb.b, vb.b,
+                                                   m2.b, s2.b, a2.b, p);
+            tt_assert(!sg_failed(e), "splitk gqa partial (%s, n_splits %u): %s",
+                      what, ns, e.msg ? e.msg : "ok");
+        }
+        if (!sg_failed(e)) {
+            e = sg_gpu_run_attn_splitk_combine(g_gpu, m2.b, s2.b, a2.b, o2.b, p);
+            tt_assert(!sg_failed(e), "splitk combine after gqa (%s, n_splits %u): %s",
+                      what, ns, e.msg ? e.msg : "ok");
+        }
+        if (!sg_failed(e)) {
+            char lbl[128];
+            snprintf(lbl, sizeof lbl, "gqa %s K=%-3u m", what, ns);
+            gqa_same_bytes(lbl, m1.h, m2.h, (size_t)parts);
+            snprintf(lbl, sizeof lbl, "gqa %s K=%-3u s", what, ns);
+            gqa_same_bytes(lbl, s1.h, s2.h, (size_t)parts);
+            snprintf(lbl, sizeof lbl, "gqa %s K=%-3u acc", what, ns);
+            gqa_same_bytes(lbl, a1.h, a2.h, (size_t)(parts * hd));
+            snprintf(lbl, sizeof lbl, "gqa %s K=%-3u out", what, ns);
+            gqa_same_bytes(lbl, o1.h, o2.h, (size_t)out_n);
+        }
+
+        gb_free(&m1); gb_free(&s1); gb_free(&a1); gb_free(&o1);
+        gb_free(&m2); gb_free(&s2); gb_free(&a2); gb_free(&o2);
+    }
+
+    gb_free(&qb); gb16_free(&kb); gb16_free(&vb);
+    free(q); free(k16); free(v16);
+}
+
+/* 100 reruns of the GQA partial + combine on identical inputs must be
+ * byte-identical to each other, the same property (and the same method)
+ * splitk_determinism checks for the per-head kernel. Holding `repeat`
+ * accumulators per thread is exactly the kind of change that could reach for
+ * an atomic or a simd_sum; this is what would catch it. */
+static void splitk_gqa_determinism(void) {
+    const uint32_t n_heads = 32, n_kv = 8, hd = 128, seq = 1000, q_stride = 2 * hd;
+    const uint32_t ns = 7;
+    uint32_t out_n = n_heads * hd;
+    uint64_t kvn = (uint64_t)seq * n_kv * hd;
+    float scale = (float)(1.0 / sqrt((double)hd));
+
+    lcg_seed(0x6A1Fu);
+    float *q = xmalloc((size_t)n_heads * q_stride * sizeof *q);
+    for (uint32_t i = 0; i < n_heads * q_stride; i++) q[i] = lcg_next();
+    uint16_t *k16 = xmalloc((size_t)kvn * sizeof *k16);
+    uint16_t *v16 = xmalloc((size_t)kvn * sizeof *v16);
+    for (uint64_t i = 0; i < kvn; i++) {
+        k16[i] = sg_f32_to_f16(lcg_next() * 2.0f);
+        v16[i] = sg_f32_to_f16(lcg_next() * 2.0f);
+    }
+
+    gbuf qb = gb_from(q, (uint64_t)n_heads * q_stride);
+    gbuf16 kb = gb16_new(kvn), vb = gb16_new(kvn);
+    memcpy(kb.h, k16, (size_t)kvn * sizeof(uint16_t));
+    memcpy(vb.h, v16, (size_t)kvn * sizeof(uint16_t));
+    gbuf mb = gb_new((uint64_t)n_heads * ns);
+    gbuf sb = gb_new((uint64_t)n_heads * ns);
+    gbuf ab = gb_new((uint64_t)n_heads * ns * hd);
+    gbuf ob = gb_new(out_n);
+    uint32_t p[8] = {n_heads, n_kv, hd, seq, q_stride, f32_bits(scale), ns, 0};
+
+    size_t ms_bytes = (size_t)n_heads * ns * sizeof(float);
+    size_t acc_bytes = (size_t)n_heads * ns * hd * sizeof(float);
+    size_t out_bytes = (size_t)out_n * sizeof(float);
+    uint8_t *first_m = xmalloc(ms_bytes), *first_s = xmalloc(ms_bytes);
+    uint8_t *first_acc = xmalloc(acc_bytes), *first_out = xmalloc(out_bytes);
+    uint32_t mism_m = 0, mism_s = 0, mism_acc = 0, mism_out = 0;
+
+    for (int rep = 0; rep < 100; rep++) {
+        gb_poison(&mb); gb_poison(&sb); gb_poison(&ab); gb_poison(&ob);
+        sg_err e = sg_gpu_run_attn_splitk_partial_gqa(g_gpu, qb.b, kb.b, vb.b,
+                                                      mb.b, sb.b, ab.b, p);
+        if (!sg_failed(e)) e = sg_gpu_run_attn_splitk_combine(g_gpu, mb.b, sb.b, ab.b, ob.b, p);
+        tt_assert(!sg_failed(e), "splitk gqa determinism rep %d: %s", rep, e.msg ? e.msg : "ok");
+        if (sg_failed(e)) break;
+        if (rep == 0) {
+            memcpy(first_m, mb.h, ms_bytes);
+            memcpy(first_s, sb.h, ms_bytes);
+            memcpy(first_acc, ab.h, acc_bytes);
+            memcpy(first_out, ob.h, out_bytes);
+        } else {
+            if (memcmp(first_m, mb.h, ms_bytes) != 0) mism_m++;
+            if (memcmp(first_s, sb.h, ms_bytes) != 0) mism_s++;
+            if (memcmp(first_acc, ab.h, acc_bytes) != 0) mism_acc++;
+            if (memcmp(first_out, ob.h, out_bytes) != 0) mism_out++;
+        }
+    }
+    tt_assert(mism_m == 0 && mism_s == 0 && mism_acc == 0 && mism_out == 0,
+              "GQA split-K partial over 99 reruns: m differed on %u, s on %u, "
+              "acc on %u, out on %u", mism_m, mism_s, mism_acc, mism_out);
+    if (mism_m == 0 && mism_s == 0 && mism_acc == 0 && mism_out == 0) {
+        fprintf(stderr, "   GQA split-K partial: m/s/acc/out byte-identical "
+                        "over 100 reruns\n");
+    }
+
+    free(first_m); free(first_s); free(first_acc); free(first_out);
+    free(q); free(k16); free(v16);
+    gb_free(&qb); gb16_free(&kb); gb16_free(&vb);
+    gb_free(&mb); gb_free(&sb); gb_free(&ab); gb_free(&ob);
+}
+
+/* The GQA entry point must reject everything the per-head one does: the two
+ * share splitk_partial_run, so this is a check that they are still wired to
+ * the SAME validation rather than a second implementation of it. */
+static void splitk_gqa_rejects_bad_arguments(void) {
+    const uint32_t n_heads = 4, n_kv = 2, hd = 8, seq = 16, ns = 3;
+    uint32_t good[8] = {n_heads, n_kv, hd, seq, hd, f32_bits(0.35f), ns, 0};
+    gbuf qb = gb_new((uint64_t)n_heads * hd);
+    gbuf16 kb = gb16_new((uint64_t)seq * n_kv * hd), vb = gb16_new((uint64_t)seq * n_kv * hd);
+    gbuf mb = gb_new((uint64_t)n_heads * ns), sb = gb_new((uint64_t)n_heads * ns);
+    gbuf ab = gb_new((uint64_t)n_heads * ns * hd), ob = gb_new((uint64_t)n_heads * hd);
+    sg_err e;
+
+    e = sg_gpu_run_attn_splitk_partial_gqa(g_gpu, NULL, kb.b, vb.b, mb.b, sb.b, ab.b, good);
+    tt_assert(sg_failed(e), "splitk gqa partial should reject a NULL q");
+
+    uint32_t zero_k[8]; memcpy(zero_k, good, sizeof good); zero_k[6] = 0;
+    e = sg_gpu_run_attn_splitk_partial_gqa(g_gpu, qb.b, kb.b, vb.b, mb.b, sb.b, ab.b, zero_k);
+    tt_assert(sg_failed(e), "splitk gqa partial should reject n_splits == 0");
+
+    /* The rule the GQA grid actually depends on: without it the group starting
+     * at hk*repeat would not tile the query heads. */
+    uint32_t bad_gqa[8]; memcpy(bad_gqa, good, sizeof good); bad_gqa[1] = 3;
+    e = sg_gpu_run_attn_splitk_partial_gqa(g_gpu, qb.b, kb.b, vb.b, mb.b, sb.b, ab.b, bad_gqa);
+    tt_assert(sg_failed(e), "splitk gqa partial should reject n_heads not a multiple of n_kv");
+
+    uint32_t bad_stride[8]; memcpy(bad_stride, good, sizeof good); bad_stride[4] = hd - 1;
+    e = sg_gpu_run_attn_splitk_partial_gqa(g_gpu, qb.b, kb.b, vb.b, mb.b, sb.b, ab.b, bad_stride);
+    tt_assert(sg_failed(e), "splitk gqa partial should reject q_stride < head_dim");
+
+    uint32_t big_k[8]; memcpy(big_k, good, sizeof good); big_k[6] = ns + 1;
+    e = sg_gpu_run_attn_splitk_partial_gqa(g_gpu, qb.b, kb.b, vb.b, mb.b, sb.b, ab.b, big_k);
+    tt_assert(sg_failed(e), "splitk gqa partial should reject buffers sized for fewer splits");
+
+    e = sg_gpu_run_attn_splitk_partial_gqa(g_gpu, qb.b, kb.b, vb.b, mb.b, mb.b, ab.b, good);
+    tt_assert(sg_failed(e), "splitk gqa partial should reject m and s being the same buffer");
+
+    e = sg_gpu_run_op(g_gpu, "k_attn_decode_splitk_partial_gqa", qb.b, kb.b, ob.b, good);
+    tt_assert(sg_failed(e), "sg_gpu_run_op should refuse k_attn_decode_splitk_partial_gqa");
+
+    gb_free(&qb); gb16_free(&kb); gb16_free(&vb);
+    gb_free(&mb); gb_free(&sb); gb_free(&ab); gb_free(&ob);
+}
+
+static void metal_attn_splitk_gqa_bit_identical(void) {
+    /* The two real decode shapes first, at both q_stride conventions, then the
+     * three group sizes that are about the KERNEL rather than the model:
+     *   repeat 4  (4B dense: 32 heads over 8 kv, head_dim 128)
+     *   repeat 6  (27B: 24 heads over 4 kv, head_dim 256), a non-power-of-two
+     *             group, which is the case a hardcoded shift would get wrong
+     *   repeat 1  (no GQA at all: the group is one head, and the GQA grid is
+     *             then exactly the per-head grid)
+     *   repeat 3  (odd, small, non-power-of-two)
+     *   repeat 16 (past SG_SPLITK_GQA_MAX == 8, so the kernel's fallback arm
+     *             runs the group one head at a time; it must STILL be byte-
+     *             identical, which is what makes the arm safe to keep)
+     * seq 200 with n_splits 257 in the list gives every shape genuinely empty
+     * splits as well. */
+    splitk_gqa_shape("32x8x128 seq200 dense", 32, 8, 128, 200, 128, 0x6C0A1u);
+    splitk_gqa_shape("32x8x128 seq1000 gated", 32, 8, 128, 1000, 256, 0x6C0A2u);
+    splitk_gqa_shape("24x4x256 seq1000 dense", 24, 4, 256, 1000, 256, 0x6C0A3u);
+    splitk_gqa_shape("24x4x256 seq1000 gated", 24, 4, 256, 1000, 512, 0x6C0A4u);
+    splitk_gqa_shape("8x8x64 seq300 repeat1", 8, 8, 64, 300, 64, 0x6C0A5u);
+    splitk_gqa_shape("6x2x64 seq300 repeat3", 6, 2, 64, 300, 128, 0x6C0A6u);
+    splitk_gqa_shape("16x1x64 seq300 repeat16", 16, 1, 64, 300, 64, 0x6C0A7u);
+    splitk_gqa_determinism();
+    splitk_gqa_rejects_bad_arguments();
+}
+
 static void metal_attn_splitk_matches_ref(void) {
     /* The real decode shape this exists for: Qwen3-4B-Instruct-2507's
      * 32 query heads over 8 kv heads, head_dim 128 (repeat 4). Two sequence
@@ -2876,6 +3146,7 @@ int main(void) {
     tt_run("metal_rope_chunk_matches_rope_heads", metal_rope_chunk_matches_rope_heads);
     tt_run("metal_attn_prefill_matches_decode", metal_attn_prefill_matches_decode);
     tt_run("metal_attn_splitk_matches_ref", metal_attn_splitk_matches_ref);
+    tt_run("metal_attn_splitk_gqa_bit_identical", metal_attn_splitk_gqa_bit_identical);
     tt_run("metal_conv1d_chunk_matches_step", metal_conv1d_chunk_matches_step);
     tt_run("metal_delta_gates_chunk_matches", metal_delta_gates_chunk_matches);
     tt_run("metal_delta_chunk_matches_multi", metal_delta_chunk_matches_multi);

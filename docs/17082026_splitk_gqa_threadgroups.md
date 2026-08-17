@@ -207,7 +207,7 @@ This **refutes the review's single biggest risk**: that the `R >= 3` accumulator
 fail to register-allocate and leave GQA slower than the per-head kernel. It is faster
 everywhere tested.
 
-### The shipped split policy is wrong for this kernel (not yet fixed)
+### The shipped split policy WAS wrong for this kernel (FIXED by task P2.5)
 
 `n_splits = clamp(seq / SG_TG, 4, 1024)` was measured optimal for the per-head partial. **GQA's
 optimum is consistently lower**, so reusing that policy costs real throughput:
@@ -218,8 +218,11 @@ optimum is consistently lower**, so reusing that policy costs real throughput:
 | 4B dense | 262144 | 1024 | 29.754x | 512 | 32.444x | ~9% |
 
 The optimum was 2x lower in two cases and 4x lower in the third, and the curve is shallow near
-it (27B at 262144: 256 gives 4217 us, 512 gives 4316 us, 2.3% apart). So this needs its own
-sweep rather than a guessed closed form. **This is why the default stays OFF.**
+it (27B at 262144: 256 gives 4217 us, 512 gives 4316 us, 2.3% apart). So this needed its own
+sweep rather than a guessed closed form, which is exactly what task P2.5 did: see "P2.5: the
+GQA partial's own split policy (implemented)" at the end of this file. **This was why the
+default stayed off; it still does, but for a different and now-explicit reason (see that
+section).**
 
 ### Achieved bandwidth: do not quote the harness's GQA GB/s column
 
@@ -241,3 +244,141 @@ P2.3a established that attention was essentially the *entire* decode cost at thi
 (16 x 118.8 ms predicted 0.526 t/s against 0.537 measured). Once attention shrinks ~28x, the
 non-attention cost stops being negligible and becomes the limiter. This is not a claim until it
 is measured end to end on the real model.
+
+## P2.5: the GQA partial's own split policy (implemented)
+
+Companion task, same branch, task brief
+`.superpowers/sdd/2026-08-09-surge-m3-m5/task-P2.5-brief.md`, report
+`.superpowers/sdd/2026-08-09-surge-m3-m5/task-P2.5-report.md`. This closes the "not yet
+fixed" gap the section above documented: the GQA partial now gets its own split count
+instead of reusing `splitk_n_splits`.
+
+### The policy
+
+`splitk_gqa_n_splits(seq)` (`src/metal.m`, next to `splitk_gqa_use`):
+
+```
+n_splits_gqa = clamp(min(seq / SG_TG, SG_SPLITK_GQA_N_SPLITS_CAP), SG_SPLITK_MIN, SG_SPLITK_MAX)
+```
+
+with `SG_SPLITK_GQA_N_SPLITS_CAP == 256`, a named constant carrying a comment that points at
+the measured table below (not a bare literal). `SG_SPLITK_MIN` (4) and `SG_SPLITK_MAX` (1024)
+are the SAME occupancy-band floor and ceiling `splitk_n_splits` uses; only the 256 cap in the
+middle is new, and it can only ever LOWER the result relative to the per-head policy at the
+same seq, which is why no split-K buffer needed to grow.
+
+This was measured, not guessed, and not re-derived by this task: task P2.5's brief carried the
+sweep and a four-way regret comparison already run 2026-08-17
+(`./tests/bench_splitk.bin --seqs 8192,32768,131072,262144 --gqa`, fresh GEMM gate 21.63
+TFLOPS):
+
+| policy | mean regret | worst regret |
+|---|---|---|
+| `clamp(seq/SG_TG, 4, 1024)` (the old default, per-head policy reused) | 3.1% | 7.3% |
+| **`clamp(min(seq/SG_TG, 256), 4, 1024)` (the winner, implemented)** | **0.5%** | **2.6%** |
+| `clamp(min(seq/SG_TG, 512), 4, 1024)` | 1.5% | 4.2% |
+| `clamp(seq/(2*SG_TG), 4, 1024)` ("half the per-head optimum") | 3.8% | 13.4% |
+
+**The intuitive rule is the worst one.** "GQA's optimum is half the per-head optimum" fits
+the two longest sequences by construction (both optima there happen to be roughly half of
+`seq / SG_TG`) and is 13.4% worst-case wrong overall: the true optimum does not RESCALE with
+seq, it SATURATES near 256, so a value that keeps climbing and is merely halved eventually
+overshoots almost as badly as never capping at all. The winner is the per-head closed form
+with a measured cap, not a different closed form.
+
+### Wiring: enc_attn_splitk picks the policy that matches the kernel it already picked
+
+`enc_attn_splitk` already computes `gqa = splitk_gqa_use(g, p[0], p[1])` to choose which
+kernel to dispatch (P2.4). P2.5 adds: build a local copy of the params array, and on the GQA
+arm only, overwrite its `n_splits` slot with `splitk_gqa_n_splits(seq)` before EITHER the
+partial dispatch or the combine dispatch reads it, since those two must agree with each
+other on how many splits were written, not with whatever the per-head caller (`splitk_use`,
+unchanged) computed. The per-head arm is untouched byte for byte: `splitk_n_splits` and
+`splitk_use` are exactly what P2.3 shipped and are never called differently by this task, per
+the brief's explicit constraint.
+
+New public diagnostic `sg_gpu_splitk_gqa_n_splits(seq)` (`surge.h` / `src/metal.m`) exposes
+the policy function itself, calling it rather than restating it -- the same
+one-source-of-truth pattern `sg_gpu_splitk_gqa_selected` already established for the
+kernel-selection predicate.
+
+### A narrowed byte-identity claim, from seq 65792 on
+
+The cap first binds (first returns something below the per-head value) at seq 65792, i.e.
+`SG_TG * (SG_SPLITK_GQA_N_SPLITS_CAP + 1)`: that is the first seq where `seq / SG_TG` reaches
+257, one past the 256 cap. Every seq up to and including 65791 still floors to 256 or less,
+where `min(seq/SG_TG, 256)` is a no-op, so `splitk_gqa_n_splits(seq)` equals
+`splitk_n_splits(seq)` exactly through 65791 (verified directly: seq 65536, 65600 and 65791 all
+give 256 on both sides; 65792 gives 256 for GQA against 257 for the per-head policy, the first
+mismatch). Below 65792, `SURGE_ATTN_SPLITK_GQA=0` and `=1` still dispatch with the SAME
+n_splits and stay byte-identical end to end -- which is what
+`mini_f16_splitk_gqa_dispatches_and_matches` (seq up to `SPLITK_GATE_N` == 1600) measures and
+continues to measure unchanged. From 65792 on, the two modes partition the same keys
+differently BY DESIGN (fewer, longer splits is the entire point), so from that seq on they only
+agree to float rounding, the same way `SURGE_ATTN_SPLITK=0/1` already does. This is a property
+of picking fewer splits, not a bug: the two KERNELS are still byte-identical to each other at
+any FIXED n_splits, which `metal_attn_splitk_gqa_bit_identical` checks directly and bypasses
+this policy entirely. Documented at the point it matters in `enc_attn_splitk`'s header
+comment so a future real-model long-context A/B is not built on an expectation this task
+already narrowed.
+
+(An earlier draft of this section and of the matching `src/metal.m` comment said the
+divergence started "above seq 65536"; an adversarial review caught that it is off by one
+`SG_TG`, since `floor(seq/SG_TG) <= 256` holds through seq 65791, not just through 65535. Fixed
+before commit; recorded here since the whole point of writing this section down was to save a
+future reader from re-deriving the boundary, and a wrong boundary would have cost more than
+none.)
+
+### Gates run, all on hardware (GPU free for the whole task)
+
+1. `xcrun metal -fno-fast-math -Wall -c src/kernels.metal` + metallib link: clean
+   (kernels.metal untouched by this task).
+2. `clang -fsyntax-only -std=c11 -Wall -Wextra -Werror` on `src/metal.m`,
+   `tests/test_metal_ops.c`, `tests/test_gpu_fwd.c`, `tests/bench_splitk.c`: clean, both with
+   and without `-DSURGE_NO_METAL`.
+3. `make debug`: **83523 checks, 0 failures, 0 sanitizer diagnostics** -- identical to the
+   P2.4 baseline (metal.m is not compiled at all under `SURGE_NO_METAL`).
+4. `make check`: **86024 checks, 0 failures** (86012 before this task, +12: the new
+   `splitk_gqa_n_splits_policy` subtest's 8 table points + 4 explicit cap-bind assertions).
+   CLI-level gates inside it also green (`test_cli_prefill`, `test_cli_bench`).
+5. P2.4's own gates re-verified UNCHANGED: `metal_attn_splitk_gqa_bit_identical` (byte
+   identity + 100x determinism) still passes; `mini_f16_splitk_gqa_dispatches_and_matches`
+   (the positive control) still reports **577 GQA dispatches with the switch on, 0 per-head;
+   577 per-head with it off; logits byte-identical at 1600/1600 positions** -- the exact same
+   numbers the P2.4 hardware run recorded, proving P2.5 did not perturb it (the mini fixture's
+   seq never exceeds `SPLITK_GATE_N` == 1600, far below the 65536 point where the two split
+   policies would first diverge).
+6. `./tests/bench_splitk.bin --seqs 8192,32768,131072,262144 --gqa`, re-run fresh for this
+   task (not the brief's original sweep):
+
+   | shape | seq | policy n_splits | policy time | optimum n_splits | optimum time | regret |
+   |---|---|---|---|---|---|---|
+   | 27B 24h/4kv/256d | 8192 | 32 | 584.60 us | 32 | 584.60 us | 0.00% |
+   | 27B 24h/4kv/256d | 32768 | 128 | 1006.10 us | 128 | 1006.10 us | 0.00% |
+   | 27B 24h/4kv/256d | 131072 | 256 | 2372.10 us | 256 | 2372.10 us | 0.00% |
+   | 27B 24h/4kv/256d | 262144 | 256 | 4154.80 us | 256 | 4154.80 us | 0.00% |
+   | 4B 32h/8kv/128d | 8192 | 32 | 532.55 us | 32 | 532.55 us | 0.00% |
+   | 4B 32h/8kv/128d | 32768 | 128 | 882.95 us | 64 | 877.05 us | 0.67% |
+   | 4B 32h/8kv/128d | 131072 | 256 | 1976.90 us | 256 | 1976.90 us | 0.00% |
+   | 4B 32h/8kv/128d | 262144 | 256 | 3430.05 us | 512 | 3338.80 us | 2.73% |
+
+   **Mean regret 0.43%, worst regret 2.73%** (4B dense, seq 262144), measured against this
+   run's own per-point optimum rather than the brief's original table. All eight per-point
+   optima matched the brief's original table exactly (same n_splits wins at every point);
+   only the microsecond values differ slightly, which is why the regret differs slightly
+   (0.43%/2.73% here vs the brief's 0.5%/2.6%) -- normal run-to-run GPU timing noise, not a
+   different policy or a different winner. The 2.73% worst case is marginally above the
+   brief's "~2.6%" reference figure and is reported as measured rather than rounded to match.
+   Both runs agree this policy is far better than reusing the per-head policy (3.1%/7.3%) and
+   vastly better than "half the per-head optimum" (3.8%/13.4%).
+
+### Still open, and still not this task's decision
+
+`attn_splitk_gqa` defaults to `false` in `sg_gpu_state_new`; `SURGE_ATTN_SPLITK_GQA=1` stays
+the opt-in. P2.5 removes the ONE reason the P2.4 gate doc gave for staying off (the wrong split
+policy); it does not flip the default, which is a separate, deliberate, outward-facing
+decision for whoever owns that call. Also still open, and out of P2.5's scope: the real-model
+greedy A/B on an actual GGUF, and whether `splitk_gqa_use` needs a short-sequence
+threadgroup-count floor the way `splitk_use` has one for the per-head kernel (see "WHAT IS NOT
+DECIDED HERE" in `splitk_gqa_use`'s comment, `src/metal.m`) -- neither was touched by this
+task and neither was required for its gates to pass.

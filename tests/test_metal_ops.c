@@ -3123,6 +3123,44 @@ static void splitk_gqa_rejects_bad_arguments(void) {
     gb_free(&mb); gb_free(&sb); gb_free(&ab); gb_free(&ob);
 }
 
+/* Task P2.5: sg_gpu_splitk_gqa_n_splits against the measured table the task
+ * brief gives verbatim (also reproduced in metal.m's splitk_gqa_n_splits and
+ * in docs/17082026_splitk_gqa_threadgroups.md). The formula is a pure
+ * function of seq, so the eight (shape, seq) points collapse to four
+ * distinct seq values, but all eight are asserted anyway to keep this test
+ * traceable to the brief's table line for line rather than to a
+ * hand-simplified version of it. No GPU dispatch here: this is metal.m's
+ * internal policy function, exercised directly. */
+static void splitk_gqa_n_splits_policy(void) {
+    struct { const char *shape; uint32_t seq, want; } cases[] = {
+        {"27B 24h/4kv/256d", 8192,   32},
+        {"27B 24h/4kv/256d", 32768,  128},
+        {"27B 24h/4kv/256d", 131072, 256},
+        {"27B 24h/4kv/256d", 262144, 256},
+        {"4B 32h/8kv/128d",  8192,   32},
+        {"4B 32h/8kv/128d",  32768,  128},
+        {"4B 32h/8kv/128d",  131072, 256},
+        {"4B 32h/8kv/128d",  262144, 256},
+    };
+    for (size_t i = 0; i < sizeof cases / sizeof cases[0]; i++) {
+        uint32_t got = sg_gpu_splitk_gqa_n_splits(cases[i].seq);
+        tt_assert(got == cases[i].want,
+                  "splitk_gqa_n_splits(%s, seq %u): got %u, want %u",
+                  cases[i].shape, cases[i].seq, got, cases[i].want);
+    }
+    /* The 256 cap must NOT bind at 8192/32768 (seq/SG_TG, 32 and 128, is
+     * already below it and IS the answer) and MUST bind at 131072/262144
+     * (seq/SG_TG would be 512 and 1024 there, which is where the per-head
+     * policy keeps climbing and overshoots the GQA optimum). This is exactly
+     * the property the rejected "half the per-head optimum" policy gets
+     * backwards (see the brief / metal.m for why it is the worst of the
+     * four candidates scored). */
+    tt_assert(sg_gpu_splitk_gqa_n_splits(8192) < 256, "cap must not bind at seq 8192");
+    tt_assert(sg_gpu_splitk_gqa_n_splits(32768) < 256, "cap must not bind at seq 32768");
+    tt_assert(sg_gpu_splitk_gqa_n_splits(131072) == 256, "cap must bind at seq 131072");
+    tt_assert(sg_gpu_splitk_gqa_n_splits(262144) == 256, "cap must bind at seq 262144");
+}
+
 static void metal_attn_splitk_gqa_bit_identical(void) {
     /* EVERY ARM OF THE KERNEL'S switch(repeat) IS DISPATCHED HERE, which is the
      * point of the shape list (fix round 1, review finding I2). The kernel has
@@ -3161,6 +3199,7 @@ static void metal_attn_splitk_gqa_bit_identical(void) {
     splitk_gqa_shape("16x1x64 seq300 r16", 16, 1, 64, 300, 64, 0x6C0A7u);
     splitk_gqa_determinism();
     splitk_gqa_rejects_bad_arguments();
+    splitk_gqa_n_splits_policy();
 }
 
 static void metal_attn_splitk_matches_ref(void) {

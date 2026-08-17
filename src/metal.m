@@ -1212,6 +1212,71 @@ void sg_gpu_splitk_dispatch_counts(const sg_gpu *g, uint64_t *per_head, uint64_t
     if (gqa) *gqa = g ? g->splitk_gqa_dispatches : 0;
 }
 
+/* =====================================================================
+ * P2.5: the GQA partial's OWN split count
+ * =====================================================================
+ *
+ * n_splits_gqa = clamp(min(seq / SG_TG, SG_SPLITK_GQA_N_SPLITS_CAP),
+ * SG_SPLITK_MIN, SG_SPLITK_MAX). MEASURED (task P2.5,
+ * `./tests/bench_splitk.bin --seqs 8192,32768,131072,262144 --gqa` on this
+ * machine, 2026-08-17, fresh GEMM gate 21.63 TFLOPS), not a guess and not a
+ * rescaling of splitk_n_splits.
+ *
+ * Per-point optimum n_splits for the GQA kernel, against seq / SG_TG:
+ *   seq                    8192   32768   131072   262144
+ *   seq / SG_TG              32     128      512     1024
+ *   27B 24h/4kv/256d         32     128      256      256
+ *   4B  32h/8kv/128d         32      64      256      512
+ * The optimum tracks seq / SG_TG at the two short lengths, then SATURATES
+ * near 256 rather than climbing with it the way the per-head optimum does
+ * (splitk_n_splits above always equals seq / SG_TG in this same band).
+ *
+ * Four candidate policies were scored by regret against that per-point
+ * optimum (mean / worst over all eight points above, lower is better):
+ *   clamp(seq/SG_TG, 4, 1024)           current per-head policy   3.1% / 7.3%
+ *   clamp(min(seq/SG_TG,256), 4, 1024)  THE WINNER, used below    0.5% / 2.6%
+ *   clamp(min(seq/SG_TG,512), 4, 1024)                            1.5% / 4.2%
+ *   clamp(seq/(2*SG_TG), 4, 1024)       "half the per-head optimum" 3.8% / 13.4%
+ *
+ * THE INTUITIVE RULE IS THE WORST ONE. Halving the per-head closed form
+ * fits the two longest sequences by construction (both optima there happen
+ * to be roughly half of seq / SG_TG) and is 13.4% worst-case wrong overall:
+ * the true optimum does not RESCALE with seq, it SATURATES, so a value that
+ * keeps climbing and is merely divided by two eventually overshoots almost
+ * as badly as never capping at all. The winner is the per-head closed form
+ * with a measured cap, not a different closed form.
+ *
+ * SG_SPLITK_MIN / SG_SPLITK_MAX (defined above) are the SAME occupancy-band
+ * floor and ceiling splitk_n_splits uses; only the cap in the middle differs,
+ * and the cap can only ever LOWER the result relative to splitk_n_splits at
+ * the same seq (min() cannot raise it), which is what keeps this policy
+ * inside the m/s/acc buffers g->splitk_max_splits already sizes from
+ * splitk_n_splits(max_ctx) -- see sg_gpu_state_new. No buffer changed size
+ * for this task.
+ *
+ * See docs/17082026_splitk_gqa_threadgroups.md for the full sweep and the
+ * regret re-measured against this implementation. */
+#define SG_SPLITK_GQA_N_SPLITS_CAP 256u  /* measured saturation point, see above */
+
+static uint32_t splitk_gqa_n_splits(uint32_t seq) {
+    uint32_t n = seq / SG_TG;
+    if (n > SG_SPLITK_GQA_N_SPLITS_CAP) n = SG_SPLITK_GQA_N_SPLITS_CAP;
+    if (n < SG_SPLITK_MIN) n = SG_SPLITK_MIN;
+    if (n > SG_SPLITK_MAX) n = SG_SPLITK_MAX;
+    return n;
+}
+
+/* The diagnostic counterpart of sg_gpu_splitk_gqa_selected above: calls
+ * splitk_gqa_n_splits rather than restating it, so a test of the measured
+ * table above tests the value enc_attn_splitk actually dispatches with once
+ * it has picked the GQA kernel, not a copy that could drift from it. Pure
+ * function of seq; needs no sg_gpu state, unlike sg_gpu_splitk_gqa_selected
+ * (there is no on/off switch to gate here -- the caller only reaches this
+ * once the GQA kernel is already selected). */
+uint32_t sg_gpu_splitk_gqa_n_splits(uint32_t seq) {
+    return splitk_gqa_n_splits(seq);
+}
+
 sg_err sg_gpu_run_op(sg_gpu *g, const char *kernel, void *a, void *b, void *out,
                      const uint32_t params[8]) {
     if (!g || !kernel || !params) return (sg_err){"gpu: sg_gpu_run_op got a NULL argument"};
@@ -2430,14 +2495,33 @@ static void enc_attn_f16(sg_enc *E, void *q, void *k, void *v, void *out,
  * mid-encode. The three are shared by every full-attention layer in the
  * forward, which is safe for the same serial-dispatch reason as above.
  *
- * `p` must carry the same 8 params the one-shots take, with p[6] = n_splits;
- * the buffer indices below are k_attn_decode_splitk_partial's and _combine's
+ * P2.5 NARROWS THE BYTE-IDENTITY CLAIM ABOVE seq 65791 (the cap first binds,
+ * i.e. first returns something below the per-head value, at seq 65792 ==
+ * SG_TG * (SG_SPLITK_GQA_N_SPLITS_CAP + 1): that is where seq / SG_TG first
+ * reaches 257, one past the 256 cap; every seq up to and including 65791
+ * still floors to 256 or less, where the cap is a no-op). Below 65792,
+ * splitk_gqa_n_splits(seq) equals splitk_n_splits(seq) exactly, so
+ * SURGE_ATTN_SPLITK_GQA=0 and =1 dispatch with the SAME n_splits and still
+ * agree bit for bit end to end -- which is what the existing gate
+ * (test_gpu_fwd.c's mini_f16_splitk_gqa_dispatches_and_matches, seq up to
+ * SPLITK_GATE_N == 1600) measures. From 65792 on, the two modes partition
+ * the same keys differently, exactly the way SURGE_ATTN_SPLITK=0/1 already
+ * does (see sg_gpu_run_attn_splitk_partial's doc in surge.h), so they only
+ * agree to float rounding there. This is a property of picking FEWER
+ * SPLITS, not a bug: the two KERNELS are still byte-identical to each other
+ * at any FIXED n_splits, which is what metal_attn_splitk_gqa_bit_identical
+ * (test_metal_ops.c) checks directly, bypassing this policy entirely.
+ *
+ * `p` must carry the same 8 params the one-shots take (surge.h has the full
+ * layout; p[3] = seq and p[6] = n_splits are the two this function itself
+ * reads -- p[6] only for the per-head kernel as of P2.5, see below); the
+ * buffer indices below are k_attn_decode_splitk_partial's and _combine's
  * own signatures in kernels.metal. */
 static void enc_attn_splitk(sg_enc *E, void *q, void *k, void *v, void *out,
                             const uint32_t *p) {
     sg_gpu *g = E->g;
     id<MTLComputeCommandEncoder> e = E->enc;
-    NSUInteger n_heads = (NSUInteger)p[0], n_splits = (NSUInteger)p[6];
+    NSUInteger n_heads = (NSUInteger)p[0];
 
     /* Task P2.4: which partial, and therefore how tall the grid is. The GQA
      * kernel gives one threadgroup the whole GQA group, so it reads each K/V
@@ -2454,6 +2538,25 @@ static void enc_attn_splitk(sg_enc *E, void *q, void *k, void *v, void *out,
      * sg_gpu_splitk_dispatch_counts; no computed value depends on them. */
     if (gqa) g->splitk_gqa_dispatches++; else g->splitk_partial_dispatches++;
 
+    /* Task P2.5: p[6] as the caller built it is splitk_use's PER-HEAD
+     * n_splits (splitk_n_splits(seq)); the GQA kernel saturates at a lower
+     * split count (splitk_gqa_n_splits above), so once gqa is chosen this
+     * dispatch needs its OWN n_splits rather than the caller's. A local copy
+     * of the whole params array is required, not just a local n_splits
+     * variable, because the combine dispatch below reads p[6] out of the
+     * SAME array: the partial and the combine it is paired with must agree
+     * with EACH OTHER on how many splits were written, not with whatever the
+     * per-head caller computed. splitk_gqa_n_splits(seq) <= splitk_n_splits
+     * (seq) always (its cap only ever lowers the result), so this can only
+     * shrink the grid relative to p[6], never exceed the m/s/acc buffers
+     * g->splitk_max_splits sized from the per-head policy. The per-head arm
+     * is untouched: pd[6] stays exactly the caller's p[6] there, so
+     * splitk_n_splits' own behaviour does not change at all. */
+    uint32_t pd[8];
+    memcpy(pd, p, sizeof pd);
+    if (gqa) pd[6] = splitk_gqa_n_splits(p[3]);
+    NSUInteger n_splits = (NSUInteger)pd[6];
+
     /* The partial: q=0, kc=1, vc=2, m=3, s=4, acc=5, params=6, scores=7. */
     [e setComputePipelineState:g->pipes[gqa ? KI_ATTN_SPLITK_PARTIAL_GQA
                                             : KI_ATTN_SPLITK_PARTIAL]];
@@ -2463,7 +2566,7 @@ static void enc_attn_splitk(sg_enc *E, void *q, void *k, void *v, void *out,
     [e setBuffer:bufof(g->b_sk_m) offset:(NSUInteger)offof(g->b_sk_m) atIndex:3];
     [e setBuffer:bufof(g->b_sk_s) offset:(NSUInteger)offof(g->b_sk_s) atIndex:4];
     [e setBuffer:bufof(g->b_sk_acc) offset:(NSUInteger)offof(g->b_sk_acc) atIndex:5];
-    [e setBytes:p length:8 * sizeof(uint32_t) atIndex:6];
+    [e setBytes:pd length:8 * sizeof(uint32_t) atIndex:6];
     [e setBuffer:g->splitk_scratch offset:0 atIndex:7];
     /* SG_K_HEADS2D: x = split, y = query head (per-head partial) or KV head
      * (GQA partial), matching the kernel's tg.x / tg.y. gpu_grid's (groups,
@@ -2477,13 +2580,14 @@ static void enc_attn_splitk(sg_enc *E, void *q, void *k, void *v, void *out,
 
     /* The combine: m=0, s=1, acc=2, out=3, params=4. One threadgroup per query
      * head, a plain 1D grid, and the SAME params array (it reads only [0], [2]
-     * and [6]). */
+     * and [6]) -- pd, not p, so it folds over exactly as many splits as the
+     * partial above actually wrote. */
     [e setComputePipelineState:g->pipes[KI_ATTN_SPLITK_COMBINE]];
     [e setBuffer:bufof(g->b_sk_m) offset:(NSUInteger)offof(g->b_sk_m) atIndex:0];
     [e setBuffer:bufof(g->b_sk_s) offset:(NSUInteger)offof(g->b_sk_s) atIndex:1];
     [e setBuffer:bufof(g->b_sk_acc) offset:(NSUInteger)offof(g->b_sk_acc) atIndex:2];
     [e setBuffer:bufof(out) offset:(NSUInteger)offof(out) atIndex:3];
-    [e setBytes:p length:8 * sizeof(uint32_t) atIndex:4];
+    [e setBytes:pd length:8 * sizeof(uint32_t) atIndex:4];
     [e dispatchThreadgroups:MTLSizeMake(n_heads, 1, 1)
       threadsPerThreadgroup:MTLSizeMake(SG_TG, 1, 1)];
 }

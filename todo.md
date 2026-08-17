@@ -12,7 +12,8 @@ held. It is superseded, on the same day, by the GPU gates actually running:
 | P2.2 Metal split-K kernels | **GATED ON HARDWARE**, worst rel 1.027e-06 vs BOTH oracles, 100x byte-identical |
 | P2.3a split-K timing harness (`make bench-splitk`) | **MEASURED**: 15.9x (27B shape) and 21.9x (4B shape) at seq 262144 |
 | P2.3 wiring into the decode path | **DONE AND GATED**, see Task P2.3 Results at the end of this file |
-| P2.4 GQA-shared threadgroups (`k_attn_decode_splitk_partial_gqa`) | **WRITTEN AND COMPILED ONLY, NO GPU GATE RUN.** Off by default (`SURGE_ATTN_SPLITK_GQA=1` opts in), so the shipped decode path is still exactly what P2.3 measured. See Task P2.4 Results at the end of this file. |
+| P2.4 GQA-shared threadgroups (`k_attn_decode_splitk_partial_gqa`) | **GATED ON HARDWARE 2026-08-17**: 577/577 GQA dispatches with the switch on, byte-identical vs the per-head partial, 1.46x-1.74x faster. Still off by default (`SURGE_ATTN_SPLITK_GQA=1` opts in) because it reused the per-head split policy, measured wrong for it (~8-9% left on the table). See Task P2.4 Results at the end of this file. |
+| P2.5 GQA-specific split policy (`splitk_gqa_n_splits`) | **DONE AND GATED**, mean regret 0.43%, worst 2.73% (measured; brief's original sweep said 0.5%/2.6%). Fixes P2.4's stated blocker; default stays OFF (a separate, deliberate decision, not this task's to make). See Task P2.5 Results at the end of this file. |
 
 What that means concretely: the CPU oracles (P2.0, P2.1) are proven; the Metal kernels
 (P2.2) have now been executed against both of them on real hardware and matched; the
@@ -2735,3 +2736,122 @@ metallib linking to /tmp with the new symbol; `clang -fsyntax-only -std=c11 -Wal
 at 83523 checks / 0 failures / 0 sanitizer diagnostics, the same count as the pre-round
 run and as the parent-commit baseline (all the new checks are Metal-only, so the CPU-path
 count cannot move).
+
+## Task P2.5 Results (metal.m: the GQA partial's own split policy)
+
+GPU was FREE for this whole task (`pgrep -f "bench_niah|mlx_raw_niah|omlx|llama-server|
+surge-bench"` empty before the first edit and again immediately before `make check` and
+before the bench run), so every gate below actually ran on hardware; nothing here is
+deferred.
+
+**What changed.** P2.4 shipped `k_attn_decode_splitk_partial_gqa` correct and 1.46x-1.74x
+faster but left it off by default because `enc_attn_splitk` fed it the PER-HEAD n_splits
+(`splitk_use` -> `splitk_n_splits(seq)`), measured wrong for the GQA kernel. New
+`splitk_gqa_n_splits(seq)` (`src/metal.m`, next to `splitk_gqa_use`):
+`clamp(min(seq / SG_TG, SG_SPLITK_GQA_N_SPLITS_CAP), SG_SPLITK_MIN, SG_SPLITK_MAX)`, cap
+256 (`SG_SPLITK_GQA_N_SPLITS_CAP`, a named constant, not a bare literal, with a comment
+pointing at the measured table). This is the task brief's winning policy verbatim, not
+re-derived: the sweep and the four-way regret comparison were already done
+(`.superpowers/sdd/2026-08-09-surge-m3-m5/task-P2.5-brief.md`), and the brief explains why
+the plausible "GQA's optimum is half the per-head optimum" rule
+(`clamp(seq/(2*SG_TG), 4, 1024)`) is actually the WORST of the four candidates (13.4% worst
+regret): the true optimum does not rescale with seq, it saturates near 256, so halving a
+value that keeps climbing eventually overshoots almost as badly as never capping at all.
+
+`enc_attn_splitk` now builds a local `pd[8]` copy of its params and overrides `pd[6]` with
+`splitk_gqa_n_splits(p[3])` only on the GQA arm (`p[3]` is seq); both the partial dispatch
+and the combine dispatch that follows it read `pd`, not the caller's `p`, so the two stay
+consistent with EACH OTHER regardless of what the per-head caller computed. The per-head
+arm is untouched: `splitk_n_splits` and `splitk_use` are byte-for-byte what P2.3 shipped,
+never called differently, per the brief's explicit constraint. `splitk_gqa_n_splits(seq) <=
+splitk_n_splits(seq)` for every seq (the cap only ever lowers the raw value before the same
+clamp), so this can only shrink the GQA grid relative to what the buffers were already sized
+for; no split-K buffer changed size. New public diagnostic
+`sg_gpu_splitk_gqa_n_splits(seq)` (`surge.h`) calls the static policy function rather than
+restating it, the same one-source-of-truth pattern `sg_gpu_splitk_gqa_selected` already
+uses for the kernel-selection predicate.
+
+**A narrowed claim, recorded rather than hidden.** The two split-count policies are
+numerically identical through seq 65791 and first diverge at seq 65792 (`SG_TG *
+(SG_SPLITK_GQA_N_SPLITS_CAP + 1)`, the first seq where `seq / SG_TG` reaches 257, one past the
+256 cap), so `SURGE_ATTN_SPLITK_GQA=0` and `=1` still dispatch the same n_splits and stay
+byte-identical end to end below that, which is what the existing gate
+(`mini_f16_splitk_gqa_dispatches_and_matches`, seq up to `SPLITK_GATE_N` == 1600) measures
+and what re-ran unchanged below. From 65792 on, the two modes now partition the same keys
+differently by design (that is the entire point: fewer, longer splits), so they only agree
+to float rounding there, exactly the way `SURGE_ATTN_SPLITK=0/1` already does. Documented at
+the point it matters (`enc_attn_splitk`'s header comment in `src/metal.m`) so a future
+long-context byte-identity expectation is not built on a claim P2.5 already narrowed. (Caught
+by an adversarial review before commit: a first draft of this claim said "above seq 65536,"
+off by one `SG_TG` -- `floor(seq/SG_TG) <= 256` actually holds through seq 65791.)
+
+**Tests extended, not weakened.** New `splitk_gqa_n_splits_policy()` in
+`tests/test_metal_ops.c`, called from the existing `metal_attn_splitk_gqa_bit_identical`:
+asserts `sg_gpu_splitk_gqa_n_splits` against all eight (shape, seq) points from the brief's
+table (32/128/256/256 for the 27B shape, 32/128/256/256 for the 4B shape -- the formula is a
+pure function of seq, so the two shapes collapse to the same four values, but all eight are
+asserted anyway to stay traceable to the brief line for line), plus explicit assertions that
+the 256 cap does NOT bind at 8192/32768 and DOES bind at 131072/262144. No GPU dispatch
+needed for this subtest (pure function of seq); it runs inside the same Metal-gated binary
+as the rest of P2.4's GQA coverage. `metal_attn_splitk_gqa_bit_identical` and
+`mini_f16_splitk_gqa_dispatches_and_matches` (the byte-identity, 100x determinism and
+positive-control gates) were not modified at all.
+
+**KEPT OFF.** `attn_splitk_gqa` default is still `false` in `sg_gpu_state_new`;
+`SURGE_ATTN_SPLITK_GQA=1` is still the opt-in. This task makes the flip justifiable, not
+performed -- that is a separate, deliberate decision for the user.
+
+**Gates run, all on hardware (GPU confirmed free before each):**
+1. `xcrun -sdk macosx metal -fno-fast-math -Wall -c src/kernels.metal -o /tmp/p25_kernels.air
+   && xcrun -sdk macosx metallib /tmp/p25_kernels.air -o /tmp/p25_kernels.metallib`: PASSED,
+   clean (kernels.metal was not touched by this task; `k_attn_decode_splitk_partial` and
+   `_gqa` both present via `xcrun metal-nm`).
+2. `clang -fsyntax-only -std=c11 -Wall -Wextra -Werror -Isrc -I. src/metal.m
+   tests/test_metal_ops.c tests/test_gpu_fwd.c tests/bench_splitk.c`, both with and without
+   `-DSURGE_NO_METAL`: PASSED, clean both forms.
+3. `make debug` (SURGE_NO_METAL, ASan/UBSan): PASSED, **83523 checks, 0 failures, 0
+   sanitizer diagnostics** -- IDENTICAL to the P2.4 baseline (metal.m is not compiled at all
+   under SURGE_NO_METAL, and no CPU-path file was touched, so this count cannot move).
+4. `make check` (rebuilt `src/kernels.metallib` first): PASSED, **86024 checks, 0 failures**
+   (86012 before this task, so +12, exactly the new policy subtest's assertions: 8 table
+   points + 4 explicit cap-bind checks). CLI-level shell gates inside `make check` also
+   green: `test_cli_prefill: 11 cases, prefill gen_ids == --no-prefill (byte-identical)`;
+   `test_cli_bench: 14 cases passed`.
+5. P2.4 gates re-verified UNCHANGED by this task, values quoted from this run's own log
+   (`/tmp/p25_make_check.log`), not assumed:
+   - Byte-identity + 100x determinism (`metal_attn_splitk_gqa_bit_identical`): "GQA split-K
+     partial: m/s/acc/out byte-identical over 100 reruns", 0 failures in that binary.
+   - Positive control (`mini_f16_splitk_gqa_dispatches_and_matches`): "577 GQA dispatches
+     with the switch on (0 per-head), 577 per-head with it off, logits byte-identical at
+     1600/1600 positions" -- the EXACT same 577/1600 the P2.4 hardware run recorded, i.e.
+     this task provably did not perturb it.
+6. `./tests/bench_splitk.bin --seqs 8192,32768,131072,262144 --gqa`: PASSED (ran to
+   completion, log at `/tmp/p25_bench_splitk_gqa.log`). Measured regret of
+   `splitk_gqa_n_splits` against this run's own per-point optimum (not the brief's original
+   table, per the task's own instruction to report what is actually measured):
+
+   | shape | seq | policy n_splits | policy time | optimum n_splits | optimum time | regret |
+   |---|---|---|---|---|---|---|
+   | 27B 24h/4kv/256d | 8192 | 32 | 584.60 us | 32 | 584.60 us | 0.00% |
+   | 27B 24h/4kv/256d | 32768 | 128 | 1006.10 us | 128 | 1006.10 us | 0.00% |
+   | 27B 24h/4kv/256d | 131072 | 256 | 2372.10 us | 256 | 2372.10 us | 0.00% |
+   | 27B 24h/4kv/256d | 262144 | 256 | 4154.80 us | 256 | 4154.80 us | 0.00% |
+   | 4B 32h/8kv/128d | 8192 | 32 | 532.55 us | 32 | 532.55 us | 0.00% |
+   | 4B 32h/8kv/128d | 32768 | 128 | 882.95 us | 64 | 877.05 us | 0.67% |
+   | 4B 32h/8kv/128d | 131072 | 256 | 1976.90 us | 256 | 1976.90 us | 0.00% |
+   | 4B 32h/8kv/128d | 262144 | 256 | 3430.05 us | 512 | 3338.80 us | 2.73% |
+
+   **Mean regret 0.43%, worst regret 2.73%** (4B dense, seq 262144). The brief's original
+   sweep (2026-08-17, a separate run) reported 0.5% / 2.6% for this same policy; this
+   re-measurement lands within normal run-to-run GPU timing noise of that (all eight
+   per-point optima matched the brief's table exactly -- only the microsecond values that
+   set the regret's size differ slightly). Both runs agree the policy is far better than
+   reusing the per-head policy (3.1% mean / 7.3% worst) and vastly better than "half the
+   per-head optimum" (3.8% mean / 13.4% worst). The 2.73% worst case is marginally above the
+   brief's "~2.6%" reference figure; reported as measured rather than rounded down to match.
+
+**Not verified (out of this task's scope, unchanged from P2.4):** the real-model greedy A/B
+(`SURGE_ATTN_SPLITK_GQA=0/1` on an actual GGUF) and the short-sequence crossover between the
+GQA and per-head KERNEL SELECTION (whether `splitk_gqa_use` should also gain a
+threadgroup-count floor) are P2.4 items this task did not touch and did not need to for its
+own gates to pass; both remain open questions for whoever proposes flipping the default.

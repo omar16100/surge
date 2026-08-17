@@ -957,6 +957,32 @@ sg_err sg_gpu_run_attn_splitk_partial_gqa(sg_gpu *g, void *q, void *k, void *v,
 bool sg_gpu_splitk_gqa_selected(const sg_gpu *g, uint32_t n_heads, uint32_t n_kv_heads);
 void sg_gpu_splitk_dispatch_counts(const sg_gpu *g, uint64_t *per_head, uint64_t *gqa);
 
+/* Task P2.5: the GQA partial's OWN split count, the diagnostic counterpart of
+ * sg_gpu_splitk_gqa_selected above. sg_gpu_forward's decode encoder computes
+ * n_splits for whichever kernel it just selected (per-head: the measured
+ * default above, splitk_n_splits(seq), unchanged since P2.3; GQA: this
+ * function), so a test of the measured table in metal.m's
+ * splitk_gqa_n_splits is a test of the value the encoder actually dispatches
+ * with, not a copy of it.
+ *
+ * n_splits_gqa = clamp(min(seq / SG_TG, 256), 4, 1024), measured task P2.5
+ * (`./tests/bench_splitk.bin --seqs 8192,32768,131072,262144 --gqa`): mean
+ * regret 0.5%, worst 2.6% against the per-point measured optimum, the best
+ * of four candidates scored. The rejected "half the per-head optimum"
+ * (seq / (2*SG_TG)) scored worst at 3.8%/13.4%: the true optimum SATURATES
+ * near 256 rather than continuing to scale with seq, so a value that keeps
+ * climbing and is merely halved eventually overshoots almost as badly as
+ * never capping at all. Full table: metal.m (splitk_gqa_n_splits) and
+ * docs/17082026_splitk_gqa_threadgroups.md.
+ *
+ * Pure function of seq; does not read sg_gpu state (there is no on/off
+ * switch to gate here, unlike sg_gpu_splitk_gqa_selected -- the decode path
+ * only reaches this once the GQA kernel is already selected). Always
+ * <= splitk_n_splits(seq) for the same seq, which is why no split-K buffer
+ * changed size for this task: it can only shrink the grid the GQA kernel
+ * dispatches, never exceed what the per-head policy already sized. */
+uint32_t sg_gpu_splitk_gqa_n_splits(uint32_t seq);
+
 /* One-shot dispatches for the gated-DeltaNet chunked-scan prefill kernels (Task
  * M5.5), each the same synchronous commit-and-wait contract as the entries
  * above, extended to the extra device buffer the kernel needs beyond (a, b,

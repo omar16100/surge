@@ -928,6 +928,35 @@ sg_err sg_gpu_run_attn_splitk_partial_gqa(sg_gpu *g, void *q, void *k, void *v,
                                           void *m, void *s, void *acc,
                                           const uint32_t params[8]);
 
+/* TWO OBSERVATION POINTS FOR THE GQA GATE (P2.4 fix round 1). Both are
+ * read-only diagnostics: no kernel reads them, no buffer size or dispatch shape
+ * depends on them, so they cannot change any computed output.
+ *
+ * They exist because the end-to-end A/B is VACUOUS WITHOUT THEM. The two
+ * partials are contracted to write the same bytes, so "SURGE_ATTN_SPLITK_GQA=0
+ * and =1 produce byte-identical logits" is ALSO exactly what you see if the GQA
+ * kernel is never selected: a later narrowing of the group band, an
+ * unset flag, a lost dispatch. Without a way to observe WHICH kernel ran, that
+ * gate stays green while the traffic saving silently disappears. P2.3 solved the
+ * same hazard by asserting its threshold in both directions.
+ *
+ * sg_gpu_splitk_gqa_selected answers the POLICY question for a (n_heads,
+ * n_kv_heads) pair by calling the same internal predicate the decode encoder
+ * consults, so a test of the group band (2 to 8), of the repeat == 1 decline or
+ * of the not-a-multiple decline tests the real rule rather than a copy of it. It
+ * reflects the CURRENT state's SURGE_ATTN_SPLITK_GQA and KV dtype, so it answers
+ * false for every shape while the switch is off. A NULL g answers false.
+ *
+ * sg_gpu_splitk_dispatch_counts reports how many split-K partial dispatches
+ * sg_gpu_forward has ENCODED since the last sg_gpu_state_new, split by kernel:
+ * `per_head` counts k_attn_decode_splitk_partial, `gqa` counts
+ * k_attn_decode_splitk_partial_gqa. Steps below the split-K threshold dispatch
+ * k_attn_decode_f16 and increment neither. The one-shot entry points above are
+ * NOT counted; this is about what the decode path chose. Either pointer may be
+ * NULL. */
+bool sg_gpu_splitk_gqa_selected(const sg_gpu *g, uint32_t n_heads, uint32_t n_kv_heads);
+void sg_gpu_splitk_dispatch_counts(const sg_gpu *g, uint64_t *per_head, uint64_t *gqa);
+
 /* One-shot dispatches for the gated-DeltaNet chunked-scan prefill kernels (Task
  * M5.5), each the same synchronous commit-and-wait contract as the entries
  * above, extended to the extra device buffer the kernel needs beyond (a, b,

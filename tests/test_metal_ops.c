@@ -2863,15 +2863,51 @@ static void gqa_same_bytes(const char *label, const float *a, const float *b, si
               (unsigned long long)first, fa, fb);
 }
 
+/* A comparison of two poison buffers passes, so at least one slot of each
+ * compared buffer has to be shown to have been WRITTEN (fix round 1, review
+ * finding M1). Without this, a pair of dispatches that silently did nothing at
+ * all would leave both sides holding 0xA5A5A5A5 and every memcmp above would
+ * report a perfect match.
+ *
+ * `strict` asks that NO element still holds the poison word, which is the real
+ * statement ("every slot was written") and is safe for m and s: m is either
+ * finite or -INFINITY and s is either 0.0 or >= 1.0, so neither can coincide
+ * with the poison word's value (a tiny negative ~-2.9e-16). For acc and out,
+ * whose elements are unbounded sums, the weaker "at least one slot moved" avoids
+ * a one-in-4-billion false failure on an exact bit coincidence. */
+static void gqa_not_poison(const char *label, const float *p, size_t n, bool strict) {
+    const uint32_t poison = 0xA5A5A5A5u;
+    size_t still = 0;
+    for (size_t i = 0; i < n; i++) {
+        uint32_t bits;
+        memcpy(&bits, &p[i], sizeof bits);
+        if (bits == poison) still++;
+    }
+    if (strict) {
+        tt_assert(still == 0, "%s: %llu of %llu floats still hold the 0xA5 poison, "
+                              "so those slots were never written", label,
+                  (unsigned long long)still, (unsigned long long)n);
+    } else {
+        tt_assert(still < n, "%s: all %llu floats still hold the 0xA5 poison, so the "
+                             "dispatch wrote nothing and every byte comparison of it "
+                             "is vacuous", label, (unsigned long long)n);
+    }
+}
+
 /* One (shape, q_stride) sweep: for every n_splits, run BOTH partials plus the
  * shared combine on identical inputs and compare all four outputs bit for bit.
- * The n_splits list is P2.2's, so it carries the same cases: 257 > seq 200
- * forces genuinely empty splits (the -inf/0/0 encoding, which the GQA kernel
- * has to write for every head of the group), and the low counts push a split
- * past 256 keys so the score loop strides. */
+ *
+ * THE SPLIT LIST. The first six are P2.2's, and the low counts push a split past
+ * 256 keys so the score loop strides. The seventh is computed per shape and is
+ * the empty-split case (fix round 1, review finding I3): it is > seq BY
+ * CONSTRUCTION, so the high-index splits are genuinely empty and the
+ * -INFINITY/0/0 encoding is exercised AT EVERY SHAPE. The fixed 257 only
+ * exceeded seq for the one 200-token shape, which left the encoding untested at
+ * repeat 6 and in the kernel's one-head-at-a-time arm; an earlier version of
+ * this comment claimed otherwise and was wrong. */
 static void splitk_gqa_shape(const char *what, uint32_t n_heads, uint32_t n_kv, uint32_t hd,
                              uint32_t seq, uint32_t q_stride, uint32_t seed) {
-    const uint32_t splits[] = {1, 2, 3, 7, 64, 257};
+    const uint32_t splits[] = {1, 2, 3, 7, 64, 257, seq + seq / 4 + 1};
     uint32_t out_n = n_heads * hd;
     uint64_t kvn = (uint64_t)seq * n_kv * hd;
     float scale = (float)(1.0 / sqrt((double)hd));
@@ -2910,28 +2946,50 @@ static void splitk_gqa_shape(const char *what, uint32_t n_heads, uint32_t n_kv, 
         gb_poison(&m1); gb_poison(&s1); gb_poison(&a1); gb_poison(&o1);
         gb_poison(&m2); gb_poison(&s2); gb_poison(&a2); gb_poison(&o2);
 
-        sg_err e = sg_gpu_run_attn_splitk_partial(g_gpu, qb.b, kb.b, vb.b,
-                                                  m1.b, s1.b, a1.b, p);
-        tt_assert(!sg_failed(e), "splitk per-head partial (%s, n_splits %u): %s",
+        /* THE GQA PARTIAL RUNS FIRST (fix round 1, review finding M2). Both
+         * kernels share the one grown-not-partitioned splitk_scratch, so
+         * whichever runs second could in principle read exponentials the first
+         * one left in a score row instead of its own. Neither kernel does (each
+         * writes every element of [0, len) before the barrier that precedes any
+         * read of it), but the ordering makes the KERNEL UNDER TEST the one that
+         * cannot inherit the reference kernel's bytes: if the GQA kernel ever
+         * skipped a score write, it would read the previous ITERATION's leftovers
+         * for a different shape or split count, not a correct-looking value. */
+        sg_err e = sg_gpu_run_attn_splitk_partial_gqa(g_gpu, qb.b, kb.b, vb.b,
+                                                     m2.b, s2.b, a2.b, p);
+        tt_assert(!sg_failed(e), "splitk gqa partial (%s, n_splits %u): %s",
                   what, ns, e.msg ? e.msg : "ok");
-        if (!sg_failed(e)) {
-            e = sg_gpu_run_attn_splitk_combine(g_gpu, m1.b, s1.b, a1.b, o1.b, p);
-            tt_assert(!sg_failed(e), "splitk combine after per-head (%s, n_splits %u): %s",
-                      what, ns, e.msg ? e.msg : "ok");
-        }
-        if (!sg_failed(e)) {
-            e = sg_gpu_run_attn_splitk_partial_gqa(g_gpu, qb.b, kb.b, vb.b,
-                                                   m2.b, s2.b, a2.b, p);
-            tt_assert(!sg_failed(e), "splitk gqa partial (%s, n_splits %u): %s",
-                      what, ns, e.msg ? e.msg : "ok");
-        }
         if (!sg_failed(e)) {
             e = sg_gpu_run_attn_splitk_combine(g_gpu, m2.b, s2.b, a2.b, o2.b, p);
             tt_assert(!sg_failed(e), "splitk combine after gqa (%s, n_splits %u): %s",
                       what, ns, e.msg ? e.msg : "ok");
         }
         if (!sg_failed(e)) {
+            e = sg_gpu_run_attn_splitk_partial(g_gpu, qb.b, kb.b, vb.b,
+                                               m1.b, s1.b, a1.b, p);
+            tt_assert(!sg_failed(e), "splitk per-head partial (%s, n_splits %u): %s",
+                      what, ns, e.msg ? e.msg : "ok");
+        }
+        if (!sg_failed(e)) {
+            e = sg_gpu_run_attn_splitk_combine(g_gpu, m1.b, s1.b, a1.b, o1.b, p);
+            tt_assert(!sg_failed(e), "splitk combine after per-head (%s, n_splits %u): %s",
+                      what, ns, e.msg ? e.msg : "ok");
+        }
+        if (!sg_failed(e)) {
             char lbl[128];
+            /* Both sides must have actually written, or the four comparisons
+             * below are two poison buffers agreeing (finding M1). */
+            snprintf(lbl, sizeof lbl, "gqa %s K=%-3u m (gqa side)", what, ns);
+            gqa_not_poison(lbl, m2.h, (size_t)parts, true);
+            snprintf(lbl, sizeof lbl, "gqa %s K=%-3u m (per-head side)", what, ns);
+            gqa_not_poison(lbl, m1.h, (size_t)parts, true);
+            snprintf(lbl, sizeof lbl, "gqa %s K=%-3u s (gqa side)", what, ns);
+            gqa_not_poison(lbl, s2.h, (size_t)parts, true);
+            snprintf(lbl, sizeof lbl, "gqa %s K=%-3u acc (gqa side)", what, ns);
+            gqa_not_poison(lbl, a2.h, (size_t)(parts * hd), false);
+            snprintf(lbl, sizeof lbl, "gqa %s K=%-3u out (gqa side)", what, ns);
+            gqa_not_poison(lbl, o2.h, (size_t)out_n, false);
+
             snprintf(lbl, sizeof lbl, "gqa %s K=%-3u m", what, ns);
             gqa_same_bytes(lbl, m1.h, m2.h, (size_t)parts);
             snprintf(lbl, sizeof lbl, "gqa %s K=%-3u s", what, ns);
@@ -3066,26 +3124,41 @@ static void splitk_gqa_rejects_bad_arguments(void) {
 }
 
 static void metal_attn_splitk_gqa_bit_identical(void) {
-    /* The two real decode shapes first, at both q_stride conventions, then the
-     * three group sizes that are about the KERNEL rather than the model:
+    /* EVERY ARM OF THE KERNEL'S switch(repeat) IS DISPATCHED HERE, which is the
+     * point of the shape list (fix round 1, review finding I2). The kernel has
+     * nine near-duplicate arms; a copy-paste that made `case 8u:` call
+     * splitk_partial_group<7> would leave head h0+7's triple unwritten and the
+     * combine would fold stale bytes into the logits, and only a dispatch at
+     * exactly repeat 8 can catch it. The static_assert in kernels.metal guards
+     * the CONSTANT, not the arms. 7 (28/4) and 8 (64/8) are common real ratios,
+     * so neither is hypothetical.
+     *
+     * The two real decode shapes come first, at both q_stride conventions:
      *   repeat 4  (4B dense: 32 heads over 8 kv, head_dim 128)
      *   repeat 6  (27B: 24 heads over 4 kv, head_dim 256), a non-power-of-two
      *             group, which is the case a hardcoded shift would get wrong
+     * then one shape per remaining group size, tiny on purpose since what is
+     * under test is the arm, not the shape:
      *   repeat 1  (no GQA at all: the group is one head, and the GQA grid is
      *             then exactly the per-head grid)
-     *   repeat 3  (odd, small, non-power-of-two)
-     *   repeat 16 (past SG_SPLITK_GQA_MAX == 8, so the kernel's fallback arm
-     *             runs the group one head at a time; it must STILL be byte-
-     *             identical, which is what makes the arm safe to keep)
-     * seq 200 with n_splits 257 in the list gives every shape genuinely empty
-     * splits as well. */
-    splitk_gqa_shape("32x8x128 seq200 dense", 32, 8, 128, 200, 128, 0x6C0A1u);
-    splitk_gqa_shape("32x8x128 seq1000 gated", 32, 8, 128, 1000, 256, 0x6C0A2u);
-    splitk_gqa_shape("24x4x256 seq1000 dense", 24, 4, 256, 1000, 256, 0x6C0A3u);
-    splitk_gqa_shape("24x4x256 seq1000 gated", 24, 4, 256, 1000, 512, 0x6C0A4u);
-    splitk_gqa_shape("8x8x64 seq300 repeat1", 8, 8, 64, 300, 64, 0x6C0A5u);
-    splitk_gqa_shape("6x2x64 seq300 repeat3", 6, 2, 64, 300, 128, 0x6C0A6u);
-    splitk_gqa_shape("16x1x64 seq300 repeat16", 16, 1, 64, 300, 64, 0x6C0A7u);
+     *   repeat 2, 3, 5, 7 and 8 (8 is SG_SPLITK_GQA_MAX, the boundary)
+     *   repeat 16 (PAST the bound, so the kernel's one-head-at-a-time default
+     *             arm runs; it must STILL be byte-identical, which is what makes
+     *             that arm safe to keep as a fallback)
+     * Every row also gets its own > seq split count from splitk_gqa_shape, so the
+     * empty-split -INFINITY/0/0 encoding is exercised at every one of those group
+     * sizes rather than only at the one 200-token shape (finding I3). */
+    splitk_gqa_shape("32x8x128 seq200 dense r4", 32, 8, 128, 200, 128, 0x6C0A1u);
+    splitk_gqa_shape("32x8x128 seq1000 gated r4", 32, 8, 128, 1000, 256, 0x6C0A2u);
+    splitk_gqa_shape("24x4x256 seq1000 dense r6", 24, 4, 256, 1000, 256, 0x6C0A3u);
+    splitk_gqa_shape("24x4x256 seq1000 gated r6", 24, 4, 256, 1000, 512, 0x6C0A4u);
+    splitk_gqa_shape("8x8x64 seq300 r1", 8, 8, 64, 300, 64, 0x6C0A5u);
+    splitk_gqa_shape("4x2x32 seq300 r2", 4, 2, 32, 300, 32, 0x6C0A8u);
+    splitk_gqa_shape("6x2x64 seq300 r3", 6, 2, 64, 300, 128, 0x6C0A6u);
+    splitk_gqa_shape("10x2x32 seq300 gated r5", 10, 2, 32, 300, 64, 0x6C0A9u);
+    splitk_gqa_shape("14x2x32 seq300 r7", 14, 2, 32, 300, 32, 0x6C0AAu);
+    splitk_gqa_shape("16x2x32 seq300 r8", 16, 2, 32, 300, 32, 0x6C0ABu);
+    splitk_gqa_shape("16x1x64 seq300 r16", 16, 1, 64, 300, 64, 0x6C0A7u);
     splitk_gqa_determinism();
     splitk_gqa_rejects_bad_arguments();
 }

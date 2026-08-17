@@ -347,6 +347,24 @@ struct sg_gpu {
      * changes memory traffic and grid shape, never the answer. DEFAULT FALSE
      * until the deferred hardware gates run: see splitk_gqa_use. */
     bool attn_splitk_gqa;
+    /* WHICH PARTIAL enc_attn_splitk ACTUALLY ENCODED, counted per dispatch
+     * (P2.4 fix round 1, review finding I1). Pure diagnostics: nothing reads
+     * them inside a kernel, no buffer size or dispatch shape depends on them,
+     * so they cannot change computed output.
+     *
+     * THEY EXIST BECAUSE THE END-TO-END A/B IS VACUOUS WITHOUT THEM. The two
+     * partials are contracted to produce the SAME bytes, so
+     * "SURGE_ATTN_SPLITK_GQA=0 and =1 give byte-identical logits" is exactly
+     * what you also see when the GQA kernel is never selected at all (a
+     * narrowed band in splitk_gqa_use, an unset attn_splitk_gqa, a lost
+     * dispatch). A gate that cannot tell those two apart would stay green while
+     * the whole point of the task silently disappeared. sg_gpu_splitk_dispatch_
+     * counts exposes them so the gate can assert WHICH kernel ran, the way
+     * P2.3's wiring subtest asserted the threshold. Reset by sg_gpu_state_new
+     * and by gpu_free_state; they count ENCODER dispatches only, never the
+     * one-shot entry points. */
+    uint64_t splitk_partial_dispatches;
+    uint64_t splitk_gqa_dispatches;
     /* The largest n_splits any decode step at this max_ctx can ask for, i.e.
      * splitk_n_splits(max_ctx). n_splits is nondecreasing in seq and seq is
      * capped at max_ctx, so the three buffers below and g->splitk_scratch can
@@ -1174,6 +1192,24 @@ static bool splitk_gqa_use(const sg_gpu *g, uint32_t n_heads, uint32_t n_kv) {
     if (n_kv == 0 || n_heads % n_kv != 0) return false;
     uint32_t repeat = n_heads / n_kv;
     return repeat >= 2 && repeat <= SG_SPLITK_GQA_MAX;
+}
+
+/* The same predicate, for the gate (P2.4 fix round 1, review finding I1/M4).
+ * It CALLS splitk_gqa_use rather than restating it, so a test of the [2, 8]
+ * band, of the repeat == 1 decline or of the not-a-multiple decline is a test of
+ * the function the encoder actually consults, not of a copy that could drift
+ * from it. Read-only; a NULL g answers false rather than crashing, since this is
+ * reachable from a test harness. */
+bool sg_gpu_splitk_gqa_selected(const sg_gpu *g, uint32_t n_heads, uint32_t n_kv_heads) {
+    if (!g) return false;
+    return splitk_gqa_use(g, n_heads, n_kv_heads);
+}
+
+/* What enc_attn_splitk actually encoded since the last sg_gpu_state_new, split
+ * by kernel (P2.4 fix round 1, review finding I1). Either pointer may be NULL. */
+void sg_gpu_splitk_dispatch_counts(const sg_gpu *g, uint64_t *per_head, uint64_t *gqa) {
+    if (per_head) *per_head = g ? g->splitk_partial_dispatches : 0;
+    if (gqa) *gqa = g ? g->splitk_gqa_dispatches : 0;
 }
 
 sg_err sg_gpu_run_op(sg_gpu *g, const char *kernel, void *a, void *b, void *out,
@@ -2411,6 +2447,12 @@ static void enc_attn_splitk(sg_enc *E, void *q, void *k, void *v, void *out,
      * SURGE_ATTN_SPLITK_GQA=1 selects it; see splitk_gqa_use. */
     bool gqa = splitk_gqa_use(g, p[0], p[1]);
     NSUInteger rows = gqa ? (NSUInteger)p[1] : n_heads;
+    /* Record WHICH kernel this dispatch is, for the gate (finding I1): the two
+     * are contracted to produce the same bytes, so nothing downstream can tell
+     * them apart, and a gate that cannot either would pass while the GQA path
+     * quietly stopped being selected. Diagnostics only, read through
+     * sg_gpu_splitk_dispatch_counts; no computed value depends on them. */
+    if (gqa) g->splitk_gqa_dispatches++; else g->splitk_partial_dispatches++;
 
     /* The partial: q=0, kc=1, vc=2, m=3, s=4, acc=5, params=6, scores=7. */
     [e setComputePipelineState:g->pipes[gqa ? KI_ATTN_SPLITK_PARTIAL_GQA
@@ -2912,6 +2954,8 @@ static void gpu_free_state(sg_gpu *g) {
     g->splitk_max_splits = 0;
     g->attn_splitk = false;
     g->attn_splitk_gqa = false;    /* P2.4: re-read from the env on the next state */
+    g->splitk_partial_dispatches = 0;
+    g->splitk_gqa_dispatches = 0;
 
     void *shared[] = { g->b_x, g->b_h, g->b_r, g->b_qg, g->b_ctx, g->b_ffg,
                        g->b_ffu, g->b_qkv, g->b_ab, g->b_gates, g->b_y,
@@ -3254,6 +3298,11 @@ sg_err sg_gpu_state_new(sg_gpu *g, const sg_model *m, uint32_t max_ctx) {
                         "using 0\n", gq_env);
     }
     g->attn_splitk_gqa = gqa_on && g->attn_splitk;
+    /* Zeroed here as well as in gpu_free_state (which ran just above), so a
+     * gate can read them as "what this state did", not "what this process
+     * did". */
+    g->splitk_partial_dispatches = 0;
+    g->splitk_gqa_dispatches = 0;
     g->splitk_max_splits = 0;
 
     uint64_t half = 0;

@@ -494,6 +494,172 @@ static void mini_f16_splitk_decode_matches_incumbent(void) {
     free(seed);
 }
 
+/* Task P2.4 (written in fix round 1, review finding I1): the GQA-shared partial
+ * IN THE DECODE PATH, on the same mini hybrid fixture, past the same seq 1024
+ * threshold.
+ *
+ * WHY A BYTE-IDENTITY COMPARISON ALONE WOULD BE WORTHLESS HERE. Unlike P2.3's
+ * subtest, the two kernels this one switches between are contracted to produce
+ * the SAME BYTES, so "the logits match" is ALSO exactly what happens when the
+ * GQA kernel is never dispatched: someone narrows the group band in
+ * splitk_gqa_use, or attn_splitk_gqa stops being set, or the pipeline selection
+ * regresses, and every logit still matches because the per-head kernel ran both
+ * times. The gate would be green and the 4x traffic saving would be gone.
+ *
+ * So this asserts THREE things, and the first is the load-bearing one:
+ *   1. WHICH KERNEL RAN, from sg_gpu_splitk_dispatch_counts: with the switch on,
+ *      every split-K dispatch this state encoded must be a GQA dispatch and the
+ *      per-head count must be exactly 0; with it off, the reverse. A selection
+ *      that silently declined shows up as gqa == 0 and FAILS here.
+ *   2. The POLICY, from sg_gpu_splitk_gqa_selected, which calls the same
+ *      internal predicate the encoder consults: the documented group band (the
+ *      real 4B 32/8 and 27B 24/4 shapes are in), repeat == 1 is out, repeat == 9
+ *      is out, a non-multiple is out, n_kv_heads == 0 is out, and with the switch
+ *      off EVERYTHING is out. Those five rules previously existed only as a
+ *      comment.
+ *   3. Only then, byte-identity: with the counters proving the two runs really
+ *      did dispatch different kernels, every logit bit matching is the actual
+ *      end-to-end statement of the task's contract, and it is a STRONGER bar
+ *      than P2.3's A/B could use (that one changes the partition of the sum, so
+ *      it changes rounding; this one must not change anything).
+ *
+ * Both passes run the same ids through a fresh state, with SURGE_ATTN_SPLITK
+ * pinned on so the split-K path is live in both. */
+static void splitk_gqa_gate_run(sg_model *m, const int32_t *ids, uint32_t n,
+                                const char *gqa_mode, float *logits_out,
+                                uint64_t *per_head_out, uint64_t *gqa_out,
+                                bool *policy_ok) {
+    uint32_t vocab = m->cfg.vocab;
+    setenv("SURGE_ATTN_SPLITK", "1", 1);
+    setenv("SURGE_ATTN_SPLITK_GQA", gqa_mode, 1);
+    sg_err e = sg_gpu_state_new(g_gpu, m, n);
+    tt_assert(!sg_failed(e), "sg_gpu_state_new (gqa=%s): %s", gqa_mode,
+              e.msg ? e.msg : "ok");
+    if (sg_failed(e)) return;
+
+    /* The policy rules, read through the same predicate the encoder uses. `on`
+     * is what every in-band shape must answer while the switch is on. */
+    bool on = strcmp(gqa_mode, "1") == 0;
+    *policy_ok =
+        sg_gpu_splitk_gqa_selected(g_gpu, 32, 8) == on &&   /* 4B dense, repeat 4 */
+        sg_gpu_splitk_gqa_selected(g_gpu, 24, 4) == on &&   /* 27B, repeat 6 */
+        sg_gpu_splitk_gqa_selected(g_gpu, 4, 2) == on &&    /* this fixture, repeat 2 */
+        sg_gpu_splitk_gqa_selected(g_gpu, 16, 2) == on &&   /* repeat 8, the boundary */
+        !sg_gpu_splitk_gqa_selected(g_gpu, 8, 8) &&         /* repeat 1: nothing to share */
+        !sg_gpu_splitk_gqa_selected(g_gpu, 18, 2) &&        /* repeat 9: past the bound */
+        !sg_gpu_splitk_gqa_selected(g_gpu, 32, 5) &&        /* not a multiple */
+        !sg_gpu_splitk_gqa_selected(g_gpu, 32, 0);          /* no kv heads */
+
+    for (uint32_t t = 0; t < n; t++) {
+        const float *gl = NULL;
+        e = sg_gpu_forward(g_gpu, m, ids[t], t, &gl);
+        if (sg_failed(e)) {
+            tt_assert(false, "sg_gpu_forward %u (gqa=%s): %s", t, gqa_mode,
+                      e.msg ? e.msg : "ok");
+            return;
+        }
+        memcpy(logits_out + (size_t)t * vocab, gl, (size_t)vocab * sizeof *gl);
+    }
+    sg_gpu_splitk_dispatch_counts(g_gpu, per_head_out, gqa_out);
+}
+
+static void mini_f16_splitk_gqa_dispatches_and_matches(void) {
+    size_t n_seed = 0;
+    int32_t *seed = read_ids_file(MINI_DIR "/ids.txt", &n_seed);
+    tt_assert(seed && n_seed > 1, "read %s/ids.txt", MINI_DIR);
+    if (!seed || n_seed < 2) { free(seed); return; }
+
+    sg_gguf *gg = NULL;
+    sg_err e = sg_gguf_open(MINI_DIR "/model.gguf", &gg);
+    tt_assert(!sg_failed(e), "sg_gguf_open: %s", e.msg ? e.msg : "ok");
+    if (sg_failed(e)) { free(seed); return; }
+
+    sg_model m;
+    e = sg_model_from_gguf(gg, &m);
+    tt_assert(!sg_failed(e), "sg_model_from_gguf: %s", e.msg ? e.msg : "ok");
+    if (sg_failed(e)) { sg_gguf_close(gg); free(seed); return; }
+
+    e = sg_gpu_load_model(g_gpu, &m);
+    tt_assert(!sg_failed(e), "sg_gpu_load_model: %s", e.msg ? e.msg : "ok");
+    if (sg_failed(e)) { sg_model_free(&m); sg_gguf_close(gg); free(seed); return; }
+
+    /* This fixture is 4 query heads over 2 kv heads, i.e. repeat 2, which is
+     * INSIDE the documented [2, 8] band: the GQA kernel is genuinely selectable
+     * here, which is what makes assertion 1 below meaningful. */
+    tt_assert(m.cfg.n_heads == 4 && m.cfg.n_kv_heads == 2,
+              "the mini fixture must stay a GQA shape for this gate (got %u heads "
+              "over %u kv heads); repeat 1 would make it decline by policy and the "
+              "dispatch assertions below would be testing nothing",
+              m.cfg.n_heads, m.cfg.n_kv_heads);
+
+    const uint32_t n = SPLITK_GATE_N;
+    uint32_t vocab = m.cfg.vocab;
+    int32_t *ids = xmalloc((size_t)n * sizeof *ids);
+    for (uint32_t t = 0; t < n; t++) ids[t] = seed[t % n_seed];
+
+    size_t lbytes = (size_t)n * vocab * sizeof(float);
+    float *l_off = xmalloc(lbytes), *l_on = xmalloc(lbytes);
+    memset(l_off, 0, lbytes);
+    memset(l_on, 0, lbytes);
+    uint64_t ph_off = 0, gq_off = 0, ph_on = 0, gq_on = 0;
+    bool pol_off = false, pol_on = false;
+
+    splitk_gqa_gate_run(&m, ids, n, "0", l_off, &ph_off, &gq_off, &pol_off);
+    splitk_gqa_gate_run(&m, ids, n, "1", l_on, &ph_on, &gq_on, &pol_on);
+
+    /* 1. The positive control. Every step at or above the threshold encodes one
+     *    split-K partial per full-attention layer, so both runs must have
+     *    encoded the same NONZERO number of them, and each must have used
+     *    exactly one kernel. */
+    tt_assert(gq_on > 0,
+              "SURGE_ATTN_SPLITK_GQA=1 encoded 0 GQA partial dispatches over %u "
+              "positions, so the GQA kernel never ran and every comparison below "
+              "is vacuous", n);
+    tt_assert(ph_on == 0,
+              "SURGE_ATTN_SPLITK_GQA=1 still encoded %llu per-head partial "
+              "dispatches", (unsigned long long)ph_on);
+    tt_assert(ph_off > 0 && gq_off == 0,
+              "SURGE_ATTN_SPLITK_GQA=0 must encode only per-head partials "
+              "(per_head %llu, gqa %llu)",
+              (unsigned long long)ph_off, (unsigned long long)gq_off);
+    tt_assert(gq_on == ph_off,
+              "the two modes must dispatch the same NUMBER of split-K partials "
+              "(gqa %llu vs per-head %llu); a difference means the switch changed "
+              "more than which kernel runs",
+              (unsigned long long)gq_on, (unsigned long long)ph_off);
+
+    /* 2. The policy rules, including the band edges that were previously only a
+     *    comment. */
+    tt_assert(pol_on, "with SURGE_ATTN_SPLITK_GQA=1 the group-size policy is wrong: "
+                      "an in-band shape declined or an out-of-band one was accepted");
+    tt_assert(pol_off, "with SURGE_ATTN_SPLITK_GQA=0 some shape still selected the "
+                       "GQA kernel");
+
+    /* 3. Now that the counters prove different kernels ran, byte-identity is the
+     *    contract itself. memcmp, not float ==, for the P2.2 reason. */
+    uint32_t diff = 0;
+    for (uint32_t t = 0; t < n; t++) {
+        if (memcmp(l_off + (size_t)t * vocab, l_on + (size_t)t * vocab,
+                   (size_t)vocab * sizeof(float)) != 0) diff++;
+    }
+    tt_assert(diff == 0,
+              "the GQA partial must be BYTE-IDENTICAL end to end: %u of %u "
+              "positions have different logit bits", diff, n);
+
+    fprintf(stderr, "   split-K GQA decode: %llu GQA dispatches with the switch on "
+                    "(0 per-head), %llu per-head with it off, logits byte-identical "
+                    "at %u/%u positions\n",
+            (unsigned long long)gq_on, (unsigned long long)ph_off, n - diff, n);
+
+    unsetenv("SURGE_ATTN_SPLITK_GQA");
+    unsetenv("SURGE_ATTN_SPLITK");
+    free(l_on); free(l_off);
+    free(ids);
+    sg_model_free(&m);
+    sg_gguf_close(gg);
+    free(seed);
+}
+
 /* Q8_0 now loads on the Metal path (M3.2+M3.3). This env-guarded check wants
  * a real Q8_0 gguf, loads it, and greedily decodes a few tokens, asserting the
  * outputs are valid (in-vocab, finite logits) and NOT degenerate (not the same
@@ -590,6 +756,11 @@ int main(void) {
     /* P2.3: the split-K decode wiring, which only exists on the f16 path. */
     tt_run("mini_f16_splitk_decode_matches_incumbent",
            mini_f16_splitk_decode_matches_incumbent);
+    /* P2.4: WHICH split-K partial the decode path selected, plus the group-size
+     * policy and the end-to-end byte-identity that only means something once the
+     * first two hold. */
+    tt_run("mini_f16_splitk_gqa_dispatches_and_matches",
+           mini_f16_splitk_gqa_dispatches_and_matches);
     unsetenv("SURGE_KV_DTYPE");
 
     fprintf(stderr, "worst relative logit gap vs ref: %.3e\n", g_worst_rel);

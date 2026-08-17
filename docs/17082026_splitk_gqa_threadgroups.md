@@ -103,10 +103,32 @@ for every entry in `SG_KERNELS`.
 | 3 | Sanitizers, CPU path | `make debug` | PASSED, see the report for the check count |
 | 4 | BYTE-IDENTICAL vs the per-head partial | `make check` then `./tests/test_metal_ops.bin` (subtest `metal_attn_splitk_gqa_bit_identical`) | DEFERRED, needs the GPU |
 | 5 | 100x determinism of the GQA partial | included in the same subtest (`splitk_gqa_determinism`) | DEFERRED, needs the GPU |
-| 6 | Full suite green | `make check` | DEFERRED, needs the GPU |
-| 7 | Real-model greedy A/B | `SURGE_ATTN_SPLITK_GQA=0 ./surge <gguf> -p "$(cat PROMPT)" -n 64` then the same with `=1` | DEFERRED, needs the GPU |
-| 8 | Kernel-level speed A/B | `./tests/bench_splitk.bin --seqs 8192,32768,131072,262144` then the same with `--gqa` | DEFERRED, needs the GPU |
-| 9 | Short-sequence crossover | `./tests/bench_splitk.bin --seqs 1024,2048,4096,8192 --gqa` against the same without `--gqa` | DEFERRED, needs the GPU |
+| 6 | WHICH kernel the decode path selected, + the group-size policy, + end-to-end byte-identity | `./tests/gpu_fwd.bin` (subtest `mini_f16_splitk_gqa_dispatches_and_matches`, also inside `make check`) | DEFERRED, needs the GPU |
+| 7 | Full suite green | `make check` | DEFERRED, needs the GPU |
+| 8 | Real-model greedy A/B | `SURGE_ATTN_SPLITK_GQA=0 ./surge <gguf> -p "$(cat PROMPT)" -n 64` then the same with `=1` | DEFERRED, needs the GPU |
+| 9 | Kernel-level speed A/B | `./tests/bench_splitk.bin --seqs 8192,32768,131072,262144` then the same with `--gqa` | DEFERRED, needs the GPU |
+| 10 | Short-sequence crossover | `./tests/bench_splitk.bin --seqs 1024,2048,4096,8192 --gqa` against the same without `--gqa` | DEFERRED, needs the GPU |
+
+## Why gate 6 exists, and why gates 8 to 10 are worthless without it
+
+The two partials are contracted to produce the SAME BYTES. That makes the obvious
+end-to-end gate vacuous on its own: `SURGE_ATTN_SPLITK_GQA=0` versus `=1` giving
+byte-identical gen_ids and logits is ALSO exactly what you see when the GQA kernel is never
+selected at all, because then the per-head kernel ran both times. Narrow the group band,
+lose the flag, regress the pipeline selection, and the A/B stays green while the traffic
+saving silently disappears. P2.3 had the same hazard and answered it by asserting its
+threshold in BOTH directions.
+
+Gate 6 is the positive control. `sg_gpu_forward` now counts which partial
+`enc_attn_splitk` encoded, exposed read-only through `sg_gpu_splitk_dispatch_counts`, and
+the subtest asserts that with the switch on every split-K dispatch was a GQA dispatch and
+the per-head count is exactly 0 (and the reverse with it off, and the same TOTAL either
+way). It also checks the group-size policy through `sg_gpu_splitk_gqa_selected`, which
+calls the same internal predicate the encoder consults: the real 32/8 and 24/4 shapes and
+the repeat-8 boundary are in the band, repeat 1, repeat 9, a non-multiple and
+`n_kv_heads == 0` are out, and with the switch off everything is out. Those five rules
+previously existed only as a comment. Both functions are diagnostics: no kernel reads them
+and no dispatch shape depends on them.
 
 What gate 4 covers, and why those shapes: `repeat` 4 (the 4B shape), `repeat` 6 (the 27B
 shape, a non-power-of-two group, which is what a hardcoded shift would get wrong),

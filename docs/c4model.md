@@ -524,6 +524,25 @@ optionally Accelerate for the CPU reference path. No third-party libraries.
     `metal_attn_splitk_gqa_bit_identical` in `tests/test_metal_ops.c`, ready to run. Gate
     doc `docs/17082026_splitk_gqa_threadgroups.md`; full report
     `.superpowers/sdd/2026-08-09-surge-m3-m5/task-P2.4-report.md`.
+    FIX ROUND 1 (review findings, all in the GATE rather than the kernel; kernel arithmetic,
+    output layout, combine and scratch separation untouched): the end-to-end A/B was VACUOUS
+    because the two partials are contracted to produce the same bytes, so byte-identical
+    logits is also what a never-selected GQA kernel gives. `sg_gpu_forward` now COUNTS which
+    partial `enc_attn_splitk` encoded, exposed read-only as
+    `sg_gpu_splitk_dispatch_counts`, and the group-size policy is queryable through
+    `sg_gpu_splitk_gqa_selected` (which calls the same internal predicate the encoder
+    consults, so the [2, 8] band, the repeat-1 decline, the repeat-9 decline, the
+    non-multiple decline and the switch-off case are tested rather than commented). Both are
+    diagnostics: no kernel reads them and no dispatch shape depends on them. New decode-path
+    subtest `mini_f16_splitk_gqa_dispatches_and_matches` (`tests/test_gpu_fwd.c`) asserts
+    the selection, the policy and only then end-to-end byte-identity over 1600 positions on
+    the mini fixture (4 heads over 2 kv, i.e. repeat 2, in band). The per-op gate now
+    dispatches ALL NINE `switch(repeat)` arms (repeat 1..8 plus the past-the-bound default
+    arm at 16; 7 and 8 are common real ratios and were previously never run), gives EVERY
+    shape its own `> seq` split count so the empty-split -INFINITY/0/0 encoding is exercised
+    at every group size rather than only at one 200-token shape, asserts both compared
+    buffers actually left their 0xA5 poison, and runs the GQA partial FIRST so the kernel
+    under test cannot inherit the reference kernel's score-scratch bytes.
 - **Not built:** the rest of M4 (kernel excellence / beat mlx-lm; split-K decode attention
   is shipped and gated, and P2.4's GQA-shared threadgroup kernel exists but is ungated and
   off by default, while online softmax and the prefill kernels' own optimization are not

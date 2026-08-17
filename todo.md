@@ -2677,3 +2677,61 @@ they cannot drift on a validation rule; `sg_gpu_run_attn_splitk_partial_gqa` is 
 Docs: `docs/17082026_splitk_gqa_threadgroups.md` (new, registered in `docs/index.md`),
 `docs/c4model.md` (component row, decode data flow, status). Report:
 `.superpowers/sdd/2026-08-09-surge-m3-m5/task-P2.4-report.md`.
+
+### P2.4 fix round 1 (review findings I1/I2/I3 + M1/M2/M3)
+
+Review verdict: spec compliance PASSED and the reviewer re-verified the compile gates and
+proved at the AIR level that the DEFAULT path is instruction-for-instruction identical to
+P2.3. Code quality approved for an off-by-default kernel but NOT for flipping the default
+until the three Important findings closed. All three were in the GATE, not the kernel; the
+kernel arithmetic, the output layout, the combine kernel, `splitk_sizes` and the
+`splitk_scratch` separation are untouched by this round, and the default stays OFF.
+STILL NO GPU GATE HAS BEEN RUN: a 256K oMLX benchmark (`omlx-server` PID 35134 plus
+`omlx_niah_client.py` PID 35161) owns the GPU, so this round is compile-only too.
+
+- **I1, the A/B was vacuous.** The two partials are contracted to write the same bytes, so
+  "gen_ids and logits are byte-identical between `SURGE_ATTN_SPLITK_GQA=0` and `=1`" is
+  ALSO what you get when the GQA kernel is never selected (a narrowed band, an unset flag,
+  a lost dispatch), and nothing observed which kernel ran. Fixed with a positive control:
+  `enc_attn_splitk` now counts its dispatches per kernel, readable through the new
+  `sg_gpu_splitk_dispatch_counts`, and the new decode-path subtest
+  `mini_f16_splitk_gqa_dispatches_and_matches` (`tests/test_gpu_fwd.c`, 1600 positions on
+  the mini fixture, which is 4 heads over 2 kv = repeat 2 and therefore in band) asserts
+  gqa > 0 AND per-head == 0 with the switch on, the reverse with it off, the same TOTAL
+  either way, and only then the end-to-end byte-identity. Mutation it catches: force
+  `splitk_gqa_use` to return false (or narrow the band, or drop the flag) and the subtest
+  fails with "encoded 0 GQA partial dispatches ... so the GQA kernel never ran and every
+  comparison below is vacuous", where before it would have passed.
+- **I1/M4, the group-size policy existed only as a comment.** New
+  `sg_gpu_splitk_gqa_selected` answers the policy question by CALLING `splitk_gqa_use`, so
+  the subtest pins the real rule: 32/8 and 24/4 and 16/2 (repeat 8, the boundary) in band,
+  repeat 1 out, repeat 9 out, a non-multiple out, `n_kv_heads == 0` out, everything out
+  while the switch is off.
+- **I2, four switch arms were never dispatched.** The kernel has nine near-duplicate arms
+  and the gate only covered repeat 1, 3, 4, 6 and 16, so R = 2, 5, 7 and 8 (including the
+  `SG_SPLITK_GQA_MAX` boundary) were never run. Added four shapes: 4x2x32, 10x2x32 gated,
+  14x2x32, 16x2x32. Mutation they catch: `case 8u:` calling `splitk_partial_group<7>` after
+  a copy-paste leaves head h0+7's m/s/acc unwritten, which the 16x2x32 row now catches on
+  both the poison check and the byte comparison. 7 (28/4) and 8 (64/8) are common real
+  ratios, so this was not hypothetical.
+- **I3, the empty-split path ran at one group size, and the comment lied.** With splits
+  {1,2,3,7,64,257} only the seq-200 shape had a count above seq, so the -INFINITY/0/0
+  encoding (whose only new code is the `for j < R` loop) was exercised at repeat 4 only,
+  never at the 27B's repeat 6 nor in the default arm. Each shape now also gets
+  `seq + seq/4 + 1` splits, which is `> seq` BY CONSTRUCTION, so every group size exercises
+  it. The false comment is corrected and says what was wrong.
+- **M1, two poison buffers compare equal.** `gqa_not_poison` now asserts no m or s slot
+  still holds 0xA5A5A5A5 (strict: m is finite or -inf, s is 0.0 or >= 1.0, so neither can
+  collide with the poison value) and that acc and out are not entirely poison.
+- **M2, shared scratch between the two runs.** The GQA partial now runs FIRST, so the kernel
+  under test cannot inherit exponentials the reference kernel left in a score row; the worst
+  it can inherit is the previous iteration's different shape.
+- **M3, report line-count error.** Corrected, and re-measured after this round.
+
+Compile-only gates re-run after the round: `xcrun metal -fno-fast-math -Wall` clean and the
+metallib linking to /tmp with the new symbol; `clang -fsyntax-only -std=c11 -Wall -Wextra
+-Werror` clean on `src/metal.m`, `tests/test_metal_ops.c`, `tests/test_gpu_fwd.c` and
+`tests/bench_splitk.c` in both their Metal and `-DSURGE_NO_METAL` forms; `make debug` rc 0
+at 83523 checks / 0 failures / 0 sanitizer diagnostics, the same count as the pre-round
+run and as the parent-commit baseline (all the new checks are Metal-only, so the CPU-path
+count cannot move).

@@ -660,6 +660,387 @@ static void mini_f16_splitk_gqa_dispatches_and_matches(void) {
     free(seed);
 }
 
+/* Task P2.6: THE GREEDY-TOKEN GATE FOR THE REGIME P2.5 INTRODUCED.
+ *
+ * P2.5 gave the GQA arm its own split policy, clamp(min(seq/SG_TG, 256), 4,
+ * 1024). From seq 65792 == SG_TG * (256 + 1) on, that returns FEWER splits than
+ * the per-head splitk_n_splits, so the two arms partition the same keys
+ * differently and their logits agree only to float rounding. surge's
+ * correctness standard is byte-exact greedy TOKENS, and nothing tested them
+ * there: the P2.4 positive control above runs at seq <= 1600, where both
+ * policies still return 6, and test_metal_ops.c's byte-identity subtest pins
+ * n_splits identically on both sides, bypassing the policy entirely. The
+ * argument that the margin covers it (P2.4 measured a worst logit delta of
+ * 9.537e-07 against a smallest top1-top2 margin of 1.385e-03) was an argument,
+ * not a gate.
+ *
+ * WHY THIS RUNS IN SECONDS INSTEAD OF HOURS. The property under test is only
+ * "the two arms pick DIFFERENT n_splits, do greedy tokens still match". That
+ * needs divergence, not depth, and the divergence point is SG_TG * (cap + 1)
+ * for whatever cap the state resolved. SURGE_SPLITK_GQA_CAP=4 (P2.6) therefore
+ * reproduces the EXACT mechanism of the natural 257-vs-256 case at seq 1280:
+ * per-head 5 splits vs GQA 4 at 1280, 6 vs 4 at 1600. That is a HARSHER
+ * divergence than the natural one (a 1.5x split-count ratio at seq 1600 against
+ * 1.004x at 65792), so it stresses the rounding difference harder, not less.
+ *
+ * FIVE ASSERTIONS, AND THE FIRST THREE EXIST TO STOP THIS PASSING VACUOUSLY:
+ *   1. THE OVERRIDE WAS PARSED. sg_gpu_splitk_gqa_cap reports 4, read off the
+ *      live state. If SURGE_SPLITK_GQA_CAP were ignored, this fails here
+ *      instead of silently making 4 and 5 below.
+ *   2. THE POLICIES REALLY DIVERGE, by specific value, read through the same
+ *      functions the encoder dispatches with: per-head 5 vs GQA 4 at seq 1280,
+ *      6 vs 4 at 1600, and EQUAL (4 and 4) one position earlier at 1279. The
+ *      1279 case pins the boundary from below, so a cap that took effect at the
+ *      wrong seq fails rather than passing on a wider window. It also asserts
+ *      that AT THE DEFAULT cap the two would be equal at 1600, which is the
+ *      explicit statement that this subtest has content only because of the
+ *      override.
+ *   3. WHICH KERNEL RAN, from sg_gpu_splitk_dispatch_counts, exactly as the
+ *      P2.4 control does: a declined selection would otherwise show up as two
+ *      identical runs and a green gate.
+ *   4. THE BITS ACTUALLY CHANGED at and above seq 1280, and did NOT change
+ *      below it. Both halves are load-bearing. If the cap silently did nothing,
+ *      the two arms would use the same n_splits and be byte-identical
+ *      everywhere, failing the "differs above" half; if the cap bound too early
+ *      the "byte-identical below" half fails. This is P2.3's mutation-proof
+ *      shape applied to the policy instead of the threshold.
+ *   5. THE TOKENS. Identical argmax at every position, plus the M3.4 robustness
+ *      bound: the worst absolute logit delta anywhere must be under the
+ *      smallest top1-top2 margin anywhere, so the agreement is not luck.
+ *
+ * WHAT BREAKS IT (mutations, all of them checked by hand and reported in
+ * docs/17082026_splitk_gqa_threadgroups.md): making sg_gpu_state_new ignore
+ * SURGE_SPLITK_GQA_CAP fails assertion 1 and then 4; having enc_attn_splitk
+ * pass SG_SPLITK_GQA_N_SPLITS_CAP instead of the state's cap fails 4 with 0 of
+ * 321 positions differing; a real numeric bug in the GQA partial fails 5. */
+#define SPLITK_CAP_GATE_CAP 4u
+#define SPLITK_CAP_GATE_TG 256u   /* SG_TG, mirrored from metal.m like SPLITK_GATE_THRESHOLD */
+/* The first seq at which the capped GQA policy returns less than the per-head
+ * one: seq / SG_TG first reaches cap + 1 there. Same closed form as the natural
+ * 65792 at the shipped cap of 256. */
+#define SPLITK_CAP_GATE_DIVERGE (SPLITK_CAP_GATE_TG * (SPLITK_CAP_GATE_CAP + 1u))
+
+/* What one arm observed about the policy, read off the LIVE state so that a
+ * mis-parsed or ignored override shows up as a failed assertion rather than as
+ * two arms that quietly agree. */
+struct splitk_cap_obs {
+    uint32_t cap;              /* sg_gpu_splitk_gqa_cap: was the override parsed */
+    uint32_t ns_ph_at_n;       /* per-head n_splits at SPLITK_GATE_N */
+    uint32_t ns_gqa_at_n;      /* GQA n_splits at SPLITK_GATE_N, this state's cap */
+    uint32_t ns_ph_div, ns_gqa_div;      /* the same pair at the divergence point */
+    uint32_t ns_ph_pre, ns_gqa_pre;      /* and one seq BELOW it, where they must agree */
+    uint32_t ns_gqa_default_at_n;        /* the shipped cap's answer, for the vacuity note */
+    uint64_t per_head, gqa;    /* dispatch counters for this state */
+};
+
+static void splitk_cap_gate_run(sg_model *m, const int32_t *ids, uint32_t n,
+                                const char *gqa_mode, float *logits_out,
+                                uint32_t *arg_out, struct splitk_cap_obs *obs) {
+    uint32_t vocab = m->cfg.vocab;
+    char cap_str[16];
+    snprintf(cap_str, sizeof cap_str, "%u", SPLITK_CAP_GATE_CAP);
+    setenv("SURGE_ATTN_SPLITK", "1", 1);
+    setenv("SURGE_ATTN_SPLITK_GQA", gqa_mode, 1);
+    /* Set in BOTH arms on purpose: the cap must not perturb the per-head arm,
+     * and the byte-comparison below would hide it if only one arm carried it. */
+    setenv("SURGE_SPLITK_GQA_CAP", cap_str, 1);
+    sg_err e = sg_gpu_state_new(g_gpu, m, n);
+    tt_assert(!sg_failed(e), "sg_gpu_state_new (gqa=%s, cap=%s): %s", gqa_mode,
+              cap_str, e.msg ? e.msg : "ok");
+    if (sg_failed(e)) return;
+
+    obs->cap = sg_gpu_splitk_gqa_cap(g_gpu);
+    obs->ns_ph_at_n = sg_gpu_splitk_n_splits(n);
+    obs->ns_gqa_at_n = sg_gpu_splitk_gqa_n_splits_at(g_gpu, n);
+    obs->ns_ph_div = sg_gpu_splitk_n_splits(SPLITK_CAP_GATE_DIVERGE);
+    obs->ns_gqa_div = sg_gpu_splitk_gqa_n_splits_at(g_gpu, SPLITK_CAP_GATE_DIVERGE);
+    obs->ns_ph_pre = sg_gpu_splitk_n_splits(SPLITK_CAP_GATE_DIVERGE - 1u);
+    obs->ns_gqa_pre = sg_gpu_splitk_gqa_n_splits_at(g_gpu, SPLITK_CAP_GATE_DIVERGE - 1u);
+    obs->ns_gqa_default_at_n = sg_gpu_splitk_gqa_n_splits(n);
+
+    for (uint32_t t = 0; t < n; t++) {
+        const float *gl = NULL;
+        e = sg_gpu_forward(g_gpu, m, ids[t], t, &gl);
+        if (sg_failed(e)) {
+            tt_assert(false, "sg_gpu_forward %u (gqa=%s, cap=%s): %s", t, gqa_mode,
+                      cap_str, e.msg ? e.msg : "ok");
+            return;
+        }
+        memcpy(logits_out + (size_t)t * vocab, gl, (size_t)vocab * sizeof *gl);
+        arg_out[t] = argmax_f32(gl, vocab);
+    }
+    sg_gpu_splitk_dispatch_counts(g_gpu, &obs->per_head, &obs->gqa);
+}
+
+/* An unusable SURGE_SPLITK_GQA_CAP must FAIL sg_gpu_state_new, not warn and
+ * fall back the way the other three split-K env vars do. A silently ignored
+ * value is precisely how the gate above would go vacuous, so the rejection is
+ * part of the gate, not hygiene. */
+static void splitk_cap_rejects_bad_values(sg_model *m, uint32_t n) {
+    const char *bad[] = {
+        "0",      /* would clamp every seq to SG_SPLITK_MIN */
+        "3",      /* below SG_SPLITK_MIN: the floor clamp eats it */
+        "1025",   /* above SG_SPLITK_MAX: the ceiling clamp eats it */
+        "-4",     /* negative */
+        "4x",     /* trailing garbage: strtol alone would accept this as 4 */
+        "x",      /* no digits at all */
+        " ",      /* whitespace only */
+        " 4",     /* leading whitespace: strtol alone would accept this as 4 */
+        "+4",     /* leading sign: strtol alone would accept this as 4 */
+        "99999999999999999999",  /* strtol range error */
+    };
+    for (size_t i = 0; i < sizeof bad / sizeof bad[0]; i++) {
+        setenv("SURGE_SPLITK_GQA_CAP", bad[i], 1);
+        sg_err e = sg_gpu_state_new(g_gpu, m, n);
+        tt_assert(sg_failed(e),
+                  "SURGE_SPLITK_GQA_CAP='%s' must be rejected, not ignored "
+                  "(an ignored value makes the cap-override gate vacuous)", bad[i]);
+    }
+    /* And the in-band edges must be ACCEPTED, or the rejection above is just a
+     * blanket refusal and the override is unusable. */
+    const char *good[] = { "4", "256", "1024" };
+    for (size_t i = 0; i < sizeof good / sizeof good[0]; i++) {
+        setenv("SURGE_SPLITK_GQA_CAP", good[i], 1);
+        sg_err e = sg_gpu_state_new(g_gpu, m, n);
+        tt_assert(!sg_failed(e), "SURGE_SPLITK_GQA_CAP='%s' must be accepted: %s",
+                  good[i], e.msg ? e.msg : "ok");
+        if (!sg_failed(e)) {
+            uint32_t want = (uint32_t)strtoul(good[i], NULL, 10);
+            tt_assert(sg_gpu_splitk_gqa_cap(g_gpu) == want,
+                      "SURGE_SPLITK_GQA_CAP='%s' parsed as %u", good[i],
+                      sg_gpu_splitk_gqa_cap(g_gpu));
+        }
+    }
+    /* Unset must resolve to the shipped default, which is what every real run
+     * gets. Asserted through the same accessor, so "unset" and "256" are proven
+     * to be the same state rather than assumed to be. */
+    unsetenv("SURGE_SPLITK_GQA_CAP");
+    sg_err e = sg_gpu_state_new(g_gpu, m, n);
+    tt_assert(!sg_failed(e), "sg_gpu_state_new with no cap override: %s",
+              e.msg ? e.msg : "ok");
+    tt_assert(sg_gpu_splitk_gqa_cap(g_gpu) == 256u,
+              "with SURGE_SPLITK_GQA_CAP unset the resolved cap must be the "
+              "measured 256, got %u", sg_gpu_splitk_gqa_cap(g_gpu));
+}
+
+static void mini_f16_splitk_gqa_cap_override_greedy_matches(void) {
+    size_t n_seed = 0;
+    int32_t *seed = read_ids_file(MINI_DIR "/ids.txt", &n_seed);
+    tt_assert(seed && n_seed > 1, "read %s/ids.txt", MINI_DIR);
+    if (!seed || n_seed < 2) { free(seed); return; }
+
+    sg_gguf *gg = NULL;
+    sg_err e = sg_gguf_open(MINI_DIR "/model.gguf", &gg);
+    tt_assert(!sg_failed(e), "sg_gguf_open: %s", e.msg ? e.msg : "ok");
+    if (sg_failed(e)) { free(seed); return; }
+
+    sg_model m;
+    e = sg_model_from_gguf(gg, &m);
+    tt_assert(!sg_failed(e), "sg_model_from_gguf: %s", e.msg ? e.msg : "ok");
+    if (sg_failed(e)) { sg_gguf_close(gg); free(seed); return; }
+
+    e = sg_gpu_load_model(g_gpu, &m);
+    tt_assert(!sg_failed(e), "sg_gpu_load_model: %s", e.msg ? e.msg : "ok");
+    if (sg_failed(e)) { sg_model_free(&m); sg_gguf_close(gg); free(seed); return; }
+
+    /* The mirrored SG_TG must stay in step with the threshold this file already
+     * mirrors (SG_TG * SG_SPLITK_MIN == SG_TG * 4), or SPLITK_CAP_GATE_DIVERGE
+     * is computed from a stale constant and every seq boundary below is wrong. */
+    tt_assert(SPLITK_CAP_GATE_TG * 4u == SPLITK_GATE_THRESHOLD,
+              "mirrored SG_TG (%u) disagrees with the mirrored split-K threshold "
+              "(%u); one of the two is stale",
+              SPLITK_CAP_GATE_TG, SPLITK_GATE_THRESHOLD);
+    /* And the run must be long enough to reach past the divergence point, or
+     * assertion 4 has no positions to look at. */
+    tt_assert(SPLITK_GATE_N > SPLITK_CAP_GATE_DIVERGE,
+              "the gate run (%u positions) must reach past the divergence seq %u",
+              SPLITK_GATE_N, SPLITK_CAP_GATE_DIVERGE);
+    tt_assert(m.cfg.n_heads == 4 && m.cfg.n_kv_heads == 2,
+              "the mini fixture must stay a GQA shape (got %u heads over %u kv)",
+              m.cfg.n_heads, m.cfg.n_kv_heads);
+
+    const uint32_t n = SPLITK_GATE_N;
+    uint32_t vocab = m.cfg.vocab;
+    int32_t *ids = xmalloc((size_t)n * sizeof *ids);
+    for (uint32_t t = 0; t < n; t++) ids[t] = seed[t % n_seed];
+
+    size_t lbytes = (size_t)n * vocab * sizeof(float);
+    float *l_off = xmalloc(lbytes), *l_on = xmalloc(lbytes);
+    uint32_t *a_off = xmalloc((size_t)n * sizeof *a_off);
+    uint32_t *a_on = xmalloc((size_t)n * sizeof *a_on);
+    memset(l_off, 0, lbytes);
+    memset(l_on, 0, lbytes);
+    struct splitk_cap_obs off = {0}, on = {0};
+
+    splitk_cap_gate_run(&m, ids, n, "0", l_off, a_off, &off);
+    splitk_cap_gate_run(&m, ids, n, "1", l_on, a_on, &on);
+
+    /* 1. The override was PARSED, on both arms' states. */
+    tt_assert(off.cap == SPLITK_CAP_GATE_CAP && on.cap == SPLITK_CAP_GATE_CAP,
+              "SURGE_SPLITK_GQA_CAP=%u was not applied (resolved cap %u with the "
+              "GQA switch off, %u with it on); without it both arms pick the same "
+              "n_splits and everything below is vacuous",
+              SPLITK_CAP_GATE_CAP, off.cap, on.cap);
+
+    /* 2. The two policies diverge, BY SPECIFIC VALUE, at and only at the
+     *    documented seq, read through the functions the encoder dispatches
+     *    with. Cap 4: per-head 4 vs GQA 4 at seq 1279, 5 vs 4 at 1280, 6 vs 4
+     *    at 1600. */
+    tt_assert(on.ns_ph_pre == SPLITK_CAP_GATE_CAP && on.ns_gqa_pre == SPLITK_CAP_GATE_CAP,
+              "one seq below the divergence point (%u) the two policies must still "
+              "agree at %u splits, got per-head %u and GQA %u",
+              SPLITK_CAP_GATE_DIVERGE - 1u, SPLITK_CAP_GATE_CAP,
+              on.ns_ph_pre, on.ns_gqa_pre);
+    tt_assert(on.ns_ph_div == SPLITK_CAP_GATE_CAP + 1u
+                  && on.ns_gqa_div == SPLITK_CAP_GATE_CAP,
+              "at the divergence seq %u the policies must split %u vs %u, got "
+              "per-head %u and GQA %u",
+              SPLITK_CAP_GATE_DIVERGE, SPLITK_CAP_GATE_CAP + 1u, SPLITK_CAP_GATE_CAP,
+              on.ns_ph_div, on.ns_gqa_div);
+    tt_assert(on.ns_ph_at_n == 6u && on.ns_gqa_at_n == SPLITK_CAP_GATE_CAP,
+              "at the run's own seq %u the policies must split 6 vs %u, got "
+              "per-head %u and GQA %u",
+              n, SPLITK_CAP_GATE_CAP, on.ns_ph_at_n, on.ns_gqa_at_n);
+    tt_assert(on.ns_gqa_at_n < on.ns_ph_at_n,
+              "the GQA arm must ask for FEWER splits than the per-head arm here "
+              "(GQA %u, per-head %u); equal counts mean the same partition and no "
+              "rounding difference to test", on.ns_gqa_at_n, on.ns_ph_at_n);
+    /* The vacuity statement, asserted rather than commented: at the SHIPPED cap
+     * this run's seq is far below the divergence point, so the two policies
+     * agree and this whole subtest would be a duplicate of the P2.4 control. */
+    tt_assert(on.ns_gqa_default_at_n == on.ns_ph_at_n,
+              "at the shipped cap the two policies must still agree at seq %u "
+              "(got GQA %u vs per-head %u); if they already diverged there, this "
+              "subtest is not testing the override it claims to",
+              n, on.ns_gqa_default_at_n, on.ns_ph_at_n);
+    /* The cap must not touch the per-head policy at all. */
+    tt_assert(off.ns_ph_at_n == on.ns_ph_at_n,
+              "the cap changed the PER-HEAD split count (%u vs %u); it must only "
+              "affect the GQA arm", off.ns_ph_at_n, on.ns_ph_at_n);
+
+    /* 3. WHICH KERNEL RAN, the P2.4 positive control repeated under the
+     *    override: without this a declined GQA selection looks like a pass. */
+    tt_assert(on.gqa > 0 && on.per_head == 0,
+              "with the GQA switch on every split-K dispatch must be a GQA one "
+              "(gqa %llu, per-head %llu)",
+              (unsigned long long)on.gqa, (unsigned long long)on.per_head);
+    tt_assert(off.per_head > 0 && off.gqa == 0,
+              "with the GQA switch off every split-K dispatch must be a per-head "
+              "one (per-head %llu, gqa %llu)",
+              (unsigned long long)off.per_head, (unsigned long long)off.gqa);
+    tt_assert(on.gqa == off.per_head,
+              "the two arms must dispatch the same NUMBER of split-K partials "
+              "(%llu vs %llu)",
+              (unsigned long long)on.gqa, (unsigned long long)off.per_head);
+
+    /* 4. The bits must be IDENTICAL below the divergence seq and DIFFERENT at or
+     *    above it. Position t carries seq = t + 1. */
+    uint32_t below_diff = 0, above_diff = 0, above_total = 0;
+    bool boundary_differs = false;
+    for (uint32_t t = 0; t < n; t++) {
+        bool differs = memcmp(l_off + (size_t)t * vocab, l_on + (size_t)t * vocab,
+                              (size_t)vocab * sizeof(float)) != 0;
+        if (t + 1u < SPLITK_CAP_GATE_DIVERGE) {
+            if (differs) below_diff++;
+        } else {
+            above_total++;
+            if (differs) above_diff++;
+            if (t + 1u == SPLITK_CAP_GATE_DIVERGE) boundary_differs = differs;
+        }
+    }
+    tt_assert(below_diff == 0,
+              "below seq %u the two policies pick the SAME n_splits and the two "
+              "kernels are byte-identical, so every logit bit must match; %u "
+              "positions differ", SPLITK_CAP_GATE_DIVERGE, below_diff);
+    /* BOTH of the next two, and the second one is why. `above_diff > 0` alone is a
+     * ONE-SIDED existence test over a 321-position window, so a mutation that
+     * shifts the ACTUAL divergence LATER (dispatching with cap+1, say, while the
+     * accessors still report cap) would still find some differing position up here
+     * and pass. Requiring the position at EXACTLY the divergence seq to differ, and
+     * requiring EVERY position at or above it to differ, pins the boundary with the
+     * BITS instead of only through the accessor assertions above. Both are safe to
+     * state as equalities rather than inequalities because each mode is
+     * deterministic (P2.3's own subtest reruns split-K 100x byte-identically), so
+     * this is a fixed count for this fixture and cap, not a sampled one. */
+    tt_assert(boundary_differs,
+              "the position at exactly the divergence seq %u must differ: that is "
+              "the first seq where the two policies split %u vs %u, and if its bits "
+              "match, the cap the DISPATCH used is not the cap the accessors report",
+              SPLITK_CAP_GATE_DIVERGE, SPLITK_CAP_GATE_CAP + 1u, SPLITK_CAP_GATE_CAP);
+    tt_assert(above_diff == above_total && above_total > 0,
+              "at seq >= %u the capped GQA policy must change the bits at EVERY "
+              "position (%u of %u differ); 0 means the override never reached the "
+              "dispatch, and anything in between means the divergence starts "
+              "somewhere other than where the policy says it does",
+              SPLITK_CAP_GATE_DIVERGE, above_diff, above_total);
+
+    /* 5. THE TOKENS, which is what this task exists for, plus the M3.4
+     *    robustness bound. Same metric choice as the P2.3 subtest above: no bare
+     *    per-element relative ratio, because two summation orders over the same
+     *    keys is exactly the case that explodes it near a cancelled logit. */
+    uint32_t arg_mismatch = 0;
+    double worst_abs = 0.0, worst_scaled = 0.0, min_margin = INFINITY;
+    for (uint32_t t = 0; t < n; t++) {
+        if (a_off[t] != a_on[t]) arg_mismatch++;
+        const float *a = l_off + (size_t)t * vocab, *b = l_on + (size_t)t * vocab;
+        double scale = 0.0, top1 = -INFINITY, top2 = -INFINITY;
+        for (uint32_t i = 0; i < vocab; i++) {
+            double av = fabs((double)a[i]);
+            if (av > scale) scale = av;
+            if ((double)a[i] > top1) { top2 = top1; top1 = (double)a[i]; }
+            else if ((double)a[i] > top2) { top2 = (double)a[i]; }
+        }
+        if (scale < 1.0) scale = 1.0;
+        if (top1 - top2 < min_margin) min_margin = top1 - top2;
+        for (uint32_t i = 0; i < vocab; i++) {
+            double d = fabs((double)a[i] - (double)b[i]);
+            if (d > worst_abs) worst_abs = d;
+            if (d / scale > worst_scaled) worst_scaled = d / scale;
+        }
+    }
+    tt_assert(arg_mismatch == 0,
+              "GREEDY TOKENS MUST MATCH with the two policies splitting %u vs %u: "
+              "argmax differs at %u of %u positions",
+              on.ns_ph_at_n, on.ns_gqa_at_n, arg_mismatch, n);
+    tt_assert(worst_abs < min_margin,
+              "worst |logit delta| %.3e must stay under the smallest top1-top2 "
+              "margin %.3e, or an argmax could flip", worst_abs, min_margin);
+    tt_assert(worst_scaled < 1e-4,
+              "worst logit delta relative to the position's logit scale is %.3e",
+              worst_scaled);
+
+    fprintf(stderr, "   split-K GQA cap override: cap %u so the policies split %u "
+                    "(per-head) vs %u (GQA) at seq %u and diverge from seq %u; "
+                    "%llu GQA dispatches with the switch on (0 per-head), %llu "
+                    "per-head with it off; %u/%u positions differ above the "
+                    "divergence seq, 0 of %u below; worst |delta| %.3e (scaled "
+                    "%.3e) vs min top1-top2 margin %.3e; greedy argmax %u/%u agree\n",
+            on.cap, on.ns_ph_at_n, on.ns_gqa_at_n, n, SPLITK_CAP_GATE_DIVERGE,
+            (unsigned long long)on.gqa, (unsigned long long)off.per_head,
+            above_diff, above_total, n - above_total, worst_abs, worst_scaled,
+            min_margin, n - arg_mismatch, n);
+    fprintf(stderr, "   (mutation that breaks it: dropping the SURGE_SPLITK_GQA_CAP "
+                    "parse fails the resolved-cap assertion and then the "
+                    "\"%u of %u positions differ\" one; dispatching with the "
+                    "compiled cap instead of the state's fails the same one with 0 "
+                    "of %u)\n", above_diff, above_total, above_total);
+
+    /* The rejection half of the override's contract, on a state that is about to
+     * be replaced anyway. Runs last so a failure here cannot leave the arms
+     * above sharing a broken state. */
+    splitk_cap_rejects_bad_values(&m, n);
+
+    unsetenv("SURGE_SPLITK_GQA_CAP");
+    unsetenv("SURGE_ATTN_SPLITK_GQA");
+    unsetenv("SURGE_ATTN_SPLITK");
+    free(a_on); free(a_off);
+    free(l_on); free(l_off);
+    free(ids);
+    sg_model_free(&m);
+    sg_gguf_close(gg);
+    free(seed);
+}
+
 /* Q8_0 now loads on the Metal path (M3.2+M3.3). This env-guarded check wants
  * a real Q8_0 gguf, loads it, and greedily decodes a few tokens, asserting the
  * outputs are valid (in-vocab, finite logits) and NOT degenerate (not the same
@@ -761,6 +1142,17 @@ int main(void) {
      * first two hold. */
     tt_run("mini_f16_splitk_gqa_dispatches_and_matches",
            mini_f16_splitk_gqa_dispatches_and_matches);
+    /* P2.6: the same decode path with the GQA split cap overridden, so the two
+     * arms genuinely pick DIFFERENT n_splits and the greedy tokens are gated in
+     * the regime P2.5 introduced. Placed after the P2.4 control rather than
+     * before it as belt-and-braces, NOT because the order is required: each
+     * subtest sets its own env and clears SURGE_SPLITK_GQA_CAP when it finishes,
+     * and tt_assert counts rather than aborts, so the cleanup runs even on
+     * failure. The order only matters if this subtest dies between its setenv and
+     * its unsetenv, which would leak the override into the P2.4 control's
+     * byte-identity assertion. */
+    tt_run("mini_f16_splitk_gqa_cap_override_greedy_matches",
+           mini_f16_splitk_gqa_cap_override_greedy_matches);
     unsetenv("SURGE_KV_DTYPE");
 
     fprintf(stderr, "worst relative logit gap vs ref: %.3e\n", g_worst_rel);

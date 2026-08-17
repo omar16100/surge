@@ -63,7 +63,8 @@ optionally Accelerate for the CPU reference path. No third-party libraries.
   reaches 1024 keys, `k_attn_decode_f16` below that and under `SURGE_ATTN_SPLITK=0`, and
   `k_attn_decode` on the f32-KV path; Task P2.4 adds the GQA-shared
   `k_attn_decode_splitk_partial_gqa` as a same-bytes alternative to the partial, reached
-  only under `SURGE_ATTN_SPLITK_GQA=1` and ungated so far) or
+  only under `SURGE_ATTN_SPLITK_GQA=1`, gated on hardware 2026-08-17 and still off by
+  default) or
   conv-step + delta-step (DeltaNet layers), output gate, residuals; final norm + lm_head
   -> logits -> host argmax -> next token. Byte-exact GREEDY TOKENS to the CPU reference at
   temp 0 (M2 gate, oracle is the f32-KV path); fp16 KV adds ~1e-6 logit noise on the
@@ -543,10 +544,29 @@ optionally Accelerate for the CPU reference path. No third-party libraries.
     at every group size rather than only at one 200-token shape, asserts both compared
     buffers actually left their 0xA5 poison, and runs the GQA partial FIRST so the kernel
     under test cannot inherit the reference kernel's score-scratch bytes.
+  - **P2.5 + P2.6 (`src/metal.m`, `surge.h`, `tests/test_gpu_fwd.c`): the GQA arm's own
+    split policy, and the gate for the regime it creates.** P2.5 gave the GQA partial
+    `splitk_gqa_n_splits(seq) = clamp(min(seq/SG_TG, 256), 4, 1024)`, measured (mean regret
+    0.43%, worst 2.73% against the per-point optimum); `enc_attn_splitk` overrides `p[6]` in
+    a local `pd[8]` copy so the partial and the combine it is paired with agree on how many
+    splits were written. The cap can only LOWER the count relative to `splitk_n_splits`, so
+    no buffer sizing changed. CONSEQUENCE: from seq 65792 == `SG_TG * (cap + 1)` on, the two
+    decode arms partition the same keys differently and agree only to float rounding, which
+    narrows P2.4's byte-identity claim to below that seq. P2.6 GATES that instead of arguing
+    it. The cap became a per-state value (`SURGE_SPLITK_GQA_CAP`, read in `sg_gpu_state_new`,
+    REJECTED rather than ignored outside `[4, 1024]` because a silently dropped value makes
+    the gate vacuous), so `=4` reproduces the identical mechanism at seq 1280.
+    `splitk_gqa_n_splits` is now a pure function of `(seq, cap)` with one resolver,
+    `splitk_gqa_cap_of`, shared by the encoder and by the new read-only diagnostics
+    `sg_gpu_splitk_gqa_n_splits_at`, `sg_gpu_splitk_gqa_cap` and `sg_gpu_splitk_n_splits`.
+    New decode-path subtest `mini_f16_splitk_gqa_cap_override_greedy_matches` requires
+    byte-identity BELOW the divergence seq and a bit difference AT OR ABOVE it while every
+    greedy argmax agrees; proved non-vacuous by three mutations that were applied, built and
+    run. Defaults unchanged: cap 256, `attn_splitk_gqa` off.
 - **Not built:** the rest of M4 (kernel excellence / beat mlx-lm; split-K decode attention
-  is shipped and gated, and P2.4's GQA-shared threadgroup kernel exists but is ungated and
-  off by default, while online softmax and the prefill kernels' own optimization are not
-  started), the dense-qwen3
+  is shipped and gated, including P2.4's GQA-shared threadgroup kernel and P2.6's
+  greedy-token gate for it, though that kernel is still off by default; online softmax and
+  the prefill kernels' own optimization are not started), the dense-qwen3
   GPU forward's own numeric gate (P1 is loader-only; deferred until the GPU is free),
   server mode, non-Metal platforms, MoE, continuous batching, sampling beyond
   greedy/temp/top-p/top-k.

@@ -347,6 +347,25 @@ struct sg_gpu {
      * changes memory traffic and grid shape, never the answer. DEFAULT FALSE
      * until the deferred hardware gates run: see splitk_gqa_use. */
     bool attn_splitk_gqa;
+    /* --- Task P2.6: the GQA split policy's saturation cap, overridable ---
+     * Read from SURGE_SPLITK_GQA_CAP at the last sg_gpu_state_new call. 0 means
+     * "never set on this state", which splitk_gqa_cap_of resolves to the
+     * measured default SG_SPLITK_GQA_N_SPLITS_CAP == 256; it is deliberately
+     * NOT a cap of 0, because a literal 0 reaching splitk_gqa_n_splits would
+     * silently clamp every step down to SG_SPLITK_MIN.
+     *
+     * IT EXISTS FOR THE P2.6 GATE, not for users. The cap is what makes
+     * splitk_gqa_n_splits diverge from splitk_n_splits, and at the shipped 256
+     * that divergence only starts at seq 65792 (SG_TG * 257), a depth no test
+     * can reach in a `make check`. Lowering the cap moves the SAME divergence
+     * mechanism down to SG_TG * (cap + 1), so the greedy-token gate can run in
+     * seconds instead of hours. Its second use is retuning the cap without a
+     * recompile if a future GPU moves the saturation point.
+     *
+     * Validated at parse time and REJECTED (sg_gpu_state_new returns an error)
+     * outside [SG_SPLITK_MIN, SG_SPLITK_MAX], because a silently ignored value
+     * here would make the gate that depends on it pass vacuously. */
+    uint32_t splitk_gqa_cap;
     /* WHICH PARTIAL enc_attn_splitk ACTUALLY ENCODED, counted per dispatch
      * (P2.4 fix round 1, review finding I1). Pure diagnostics: nothing reads
      * them inside a kernel, no buffer size or dispatch shape depends on them,
@@ -1258,12 +1277,35 @@ void sg_gpu_splitk_dispatch_counts(const sg_gpu *g, uint64_t *per_head, uint64_t
  * regret re-measured against this implementation. */
 #define SG_SPLITK_GQA_N_SPLITS_CAP 256u  /* measured saturation point, see above */
 
-static uint32_t splitk_gqa_n_splits(uint32_t seq) {
+/* Task P2.6 made the cap a PARAMETER rather than reading the macro directly,
+ * so the whole policy stays a pure function of its inputs (which is what keeps
+ * the P2.5 policy assertions meaningful) while the cap the DECODE PATH uses can
+ * be overridden at state-creation time. Every caller resolves the cap through
+ * splitk_gqa_cap_of below or passes SG_SPLITK_GQA_N_SPLITS_CAP explicitly; no
+ * caller passes 0.
+ *
+ * The <= splitk_n_splits(seq) invariant holds for EVERY cap, not just 256:
+ * min(x, cap) <= x for any cap, and both sides then run the identical
+ * SG_SPLITK_MIN/SG_SPLITK_MAX clamp, which is monotone. So no override can
+ * make the GQA arm ask for more splits than the m/s/acc buffers
+ * g->splitk_max_splits sized from splitk_n_splits(max_ctx). */
+static uint32_t splitk_gqa_n_splits(uint32_t seq, uint32_t cap) {
     uint32_t n = seq / SG_TG;
-    if (n > SG_SPLITK_GQA_N_SPLITS_CAP) n = SG_SPLITK_GQA_N_SPLITS_CAP;
+    if (n > cap) n = cap;
     if (n < SG_SPLITK_MIN) n = SG_SPLITK_MIN;
     if (n > SG_SPLITK_MAX) n = SG_SPLITK_MAX;
     return n;
+}
+
+/* The cap THIS state will dispatch with: the SURGE_SPLITK_GQA_CAP override if
+ * sg_gpu_state_new accepted one, otherwise the measured default. The 0 ->
+ * default mapping is the reason splitk_gqa_cap is allowed to be 0 in a freshly
+ * calloc'd or freshly freed sg_gpu: an unset field must mean "the shipped
+ * policy", never "cap of 0" (which the clamp above would turn into
+ * SG_SPLITK_MIN for every seq, silently). */
+static uint32_t splitk_gqa_cap_of(const sg_gpu *g) {
+    uint32_t cap = g ? g->splitk_gqa_cap : 0;
+    return cap ? cap : SG_SPLITK_GQA_N_SPLITS_CAP;
 }
 
 /* The diagnostic counterpart of sg_gpu_splitk_gqa_selected above: calls
@@ -1272,9 +1314,35 @@ static uint32_t splitk_gqa_n_splits(uint32_t seq) {
  * it has picked the GQA kernel, not a copy that could drift from it. Pure
  * function of seq; needs no sg_gpu state, unlike sg_gpu_splitk_gqa_selected
  * (there is no on/off switch to gate here -- the caller only reaches this
- * once the GQA kernel is already selected). */
+ * once the GQA kernel is already selected).
+ *
+ * P2.6: this entry point reports the SHIPPED table, i.e. the compiled cap,
+ * which is what the P2.5 assertions are about. For what a particular state
+ * will dispatch, including a SURGE_SPLITK_GQA_CAP override, use
+ * sg_gpu_splitk_gqa_n_splits_at below. */
 uint32_t sg_gpu_splitk_gqa_n_splits(uint32_t seq) {
-    return splitk_gqa_n_splits(seq);
+    return splitk_gqa_n_splits(seq, SG_SPLITK_GQA_N_SPLITS_CAP);
+}
+
+/* Task P2.6. sg_gpu_splitk_gqa_n_splits_at is the ONLY honest answer to "how
+ * many splits will the GQA arm of enc_attn_splitk dispatch at this seq", since
+ * that depends on the state's cap; it calls the same splitk_gqa_n_splits with
+ * the same resolved cap the encoder uses, so a gate cannot drift from the
+ * dispatch. sg_gpu_splitk_gqa_cap exposes the resolved cap itself, which is how
+ * a gate proves an override was actually parsed rather than ignored.
+ * sg_gpu_splitk_n_splits is the PER-HEAD arm's split count, the value
+ * splitk_use hands enc_attn_splitk in p[6]; a gate needs both sides to assert
+ * that the two arms really do partition the keys differently. */
+uint32_t sg_gpu_splitk_gqa_cap(const sg_gpu *g) {
+    return splitk_gqa_cap_of(g);
+}
+
+uint32_t sg_gpu_splitk_gqa_n_splits_at(const sg_gpu *g, uint32_t seq) {
+    return splitk_gqa_n_splits(seq, splitk_gqa_cap_of(g));
+}
+
+uint32_t sg_gpu_splitk_n_splits(uint32_t seq) {
+    return splitk_n_splits(seq);
 }
 
 sg_err sg_gpu_run_op(sg_gpu *g, const char *kernel, void *a, void *b, void *out,
@@ -2512,6 +2580,16 @@ static void enc_attn_f16(sg_enc *E, void *q, void *k, void *v, void *out,
  * at any FIXED n_splits, which is what metal_attn_splitk_gqa_bit_identical
  * (test_metal_ops.c) checks directly, bypassing this policy entirely.
  *
+ * P2.6 GATES THAT NARROWED CLAIM instead of arguing it. The divergence point
+ * is SG_TG * (cap + 1) for whatever cap the state resolved, so
+ * SURGE_SPLITK_GQA_CAP=4 moves the identical mechanism from seq 65792 down to
+ * seq 1280, where a `make check` subtest can run both arms end to end
+ * (test_gpu_fwd.c's mini_f16_splitk_gqa_cap_override_greedy_matches): below
+ * 1280 it still requires BYTE-identity, at and above it requires the logits to
+ * DIFFER (or the override did nothing and the test is vacuous) while every
+ * greedy argmax still agrees. That is surge's actual correctness standard,
+ * byte-exact greedy tokens, asserted in the regime where the cap binds.
+ *
  * `p` must carry the same 8 params the one-shots take (surge.h has the full
  * layout; p[3] = seq and p[6] = n_splits are the two this function itself
  * reads -- p[6] only for the per-head kernel as of P2.5, see below); the
@@ -2546,15 +2624,20 @@ static void enc_attn_splitk(sg_enc *E, void *q, void *k, void *v, void *out,
      * variable, because the combine dispatch below reads p[6] out of the
      * SAME array: the partial and the combine it is paired with must agree
      * with EACH OTHER on how many splits were written, not with whatever the
-     * per-head caller computed. splitk_gqa_n_splits(seq) <= splitk_n_splits
-     * (seq) always (its cap only ever lowers the result), so this can only
-     * shrink the grid relative to p[6], never exceed the m/s/acc buffers
-     * g->splitk_max_splits sized from the per-head policy. The per-head arm
-     * is untouched: pd[6] stays exactly the caller's p[6] there, so
-     * splitk_n_splits' own behaviour does not change at all. */
+     * per-head caller computed. splitk_gqa_n_splits(seq, cap) <=
+     * splitk_n_splits(seq) always (its cap only ever lowers the result, at ANY
+     * cap), so this can only shrink the grid relative to p[6], never exceed the
+     * m/s/acc buffers g->splitk_max_splits sized from the per-head policy. The
+     * per-head arm is untouched: pd[6] stays exactly the caller's p[6] there,
+     * so splitk_n_splits' own behaviour does not change at all.
+     *
+     * P2.6: the cap comes from splitk_gqa_cap_of(g), i.e. the state's
+     * SURGE_SPLITK_GQA_CAP if one was accepted and the measured 256 otherwise.
+     * This line is the single place the dispatched GQA n_splits is decided, and
+     * sg_gpu_splitk_gqa_n_splits_at reports exactly it. */
     uint32_t pd[8];
     memcpy(pd, p, sizeof pd);
-    if (gqa) pd[6] = splitk_gqa_n_splits(p[3]);
+    if (gqa) pd[6] = splitk_gqa_n_splits(p[3], splitk_gqa_cap_of(g));
     NSUInteger n_splits = (NSUInteger)pd[6];
 
     /* The partial: q=0, kc=1, vc=2, m=3, s=4, acc=5, params=6, scores=7. */
@@ -3058,6 +3141,8 @@ static void gpu_free_state(sg_gpu *g) {
     g->splitk_max_splits = 0;
     g->attn_splitk = false;
     g->attn_splitk_gqa = false;    /* P2.4: re-read from the env on the next state */
+    g->splitk_gqa_cap = 0;         /* P2.6: 0 == "the measured default", see
+                                    * splitk_gqa_cap_of; re-read on the next state */
     g->splitk_partial_dispatches = 0;
     g->splitk_gqa_dispatches = 0;
 
@@ -3402,6 +3487,53 @@ sg_err sg_gpu_state_new(sg_gpu *g, const sg_model *m, uint32_t max_ctx) {
                         "using 0\n", gq_env);
     }
     g->attn_splitk_gqa = gqa_on && g->attn_splitk;
+
+    /* Task P2.6: SURGE_SPLITK_GQA_CAP overrides the GQA split policy's measured
+     * saturation cap (SG_SPLITK_GQA_N_SPLITS_CAP == 256). Unset keeps the
+     * measured value, which is the shipped policy and the only one anyone
+     * running surge should use.
+     *
+     * IT EXISTS FOR THE P2.6 GATE AND FOR RETUNING, NOT FOR USERS. The GQA and
+     * per-head policies only diverge from seq SG_TG * (cap + 1) on, so at the
+     * shipped 256 the divergence starts at 65792 keys, which no `make check`
+     * can reach. A lower cap reproduces the SAME mechanism at a reachable
+     * length so the greedy-token gate can run in seconds.
+     *
+     * REJECTED, NOT IGNORED, on anything that is not a plain integer in
+     * [SG_SPLITK_MIN, SG_SPLITK_MAX]. Every other env var in this function
+     * warns and falls back, because falling back to the shipped default is the
+     * safe answer there. Here it is not: a gate that sets this var and has it
+     * silently ignored passes VACUOUSLY, with both arms picking the same
+     * n_splits and nothing under test. Outside the band the value is also
+     * meaningless (below SG_SPLITK_MIN the floor clamp eats it, above
+     * SG_SPLITK_MAX the ceiling does), so there is no useful value being
+     * refused. strtol with a leading-digit check AND a full-string end check, so
+     * "4x" and "" are errors rather than 4 and 0, and so " 4" / "+4" are errors
+     * too: strtol would silently accept both (it skips leading whitespace and a
+     * sign), which would make this parser's behaviour wider than the "plain
+     * integer" it documents. */
+    const char *cap_env = getenv("SURGE_SPLITK_GQA_CAP");
+    if (cap_env && cap_env[0] != '\0') {
+        char *cap_end = NULL;
+        errno = 0;
+        long cap_v = strtol(cap_env, &cap_end, 10);
+        if (errno != 0 || cap_env[0] < '0' || cap_env[0] > '9'
+            || !cap_end || *cap_end != '\0'
+            || cap_v < (long)SG_SPLITK_MIN || cap_v > (long)SG_SPLITK_MAX) {
+            gpu_free_state(g);
+            return gpu_errf("gpu: SURGE_SPLITK_GQA_CAP='%s' is not an integer in "
+                            "[%u, %u] (default %u; this override exists for the "
+                            "P2.6 greedy-token gate, not for tuning a run)",
+                            cap_env, SG_SPLITK_MIN, SG_SPLITK_MAX,
+                            SG_SPLITK_GQA_N_SPLITS_CAP);
+        }
+        g->splitk_gqa_cap = (uint32_t)cap_v;
+        fprintf(stderr, "gpu: SURGE_SPLITK_GQA_CAP = %u (default %u); the GQA and "
+                        "per-head split policies now diverge from seq %u\n",
+                g->splitk_gqa_cap, SG_SPLITK_GQA_N_SPLITS_CAP,
+                SG_TG * (g->splitk_gqa_cap + 1));
+    }
+
     /* Zeroed here as well as in gpu_free_state (which ran just above), so a
      * gate can read them as "what this state did", not "what this process
      * did". */

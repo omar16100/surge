@@ -980,8 +980,38 @@ void sg_gpu_splitk_dispatch_counts(const sg_gpu *g, uint64_t *per_head, uint64_t
  * only reaches this once the GQA kernel is already selected). Always
  * <= splitk_n_splits(seq) for the same seq, which is why no split-K buffer
  * changed size for this task: it can only shrink the grid the GQA kernel
- * dispatches, never exceed what the per-head policy already sized. */
+ * dispatches, never exceed what the per-head policy already sized.
+ *
+ * Task P2.6 made the cap overridable per state (SURGE_SPLITK_GQA_CAP, see
+ * sg_gpu_state_new). This entry point keeps reporting the SHIPPED table, i.e.
+ * the compiled 256, because that is the measured policy the table above is
+ * about. Use sg_gpu_splitk_gqa_n_splits_at for what a given state dispatches. */
 uint32_t sg_gpu_splitk_gqa_n_splits(uint32_t seq);
+
+/* Task P2.6: the same policy AS A PARTICULAR STATE WILL DISPATCH IT, plus the
+ * two values a gate needs to prove the two decode arms really do partition the
+ * keys differently.
+ *
+ * sg_gpu_splitk_gqa_n_splits_at(g, seq) is the only honest answer to "how many
+ * splits will the GQA arm use at this seq", since that depends on g's resolved
+ * cap. It calls the same internal policy with the same resolved cap the decode
+ * encoder uses, so a test of it is a test of the dispatch, not of a copy.
+ *
+ * sg_gpu_splitk_gqa_cap(g) is that resolved cap: the accepted
+ * SURGE_SPLITK_GQA_CAP override, or the compiled 256 when none was given (also
+ * for a NULL g, or a gpu with no live state). This is how a gate asserts an
+ * override was PARSED rather than quietly dropped.
+ *
+ * sg_gpu_splitk_n_splits(seq) is the PER-HEAD arm's split count, the value the
+ * decode path hands the per-head partial in p[6]. Unchanged since P2.3 and
+ * never affected by the cap; exposed so a gate can assert the DIVERGENCE
+ * (per-head != GQA) instead of only one side of it. Pure function of seq.
+ *
+ * The invariant across all three: sg_gpu_splitk_gqa_n_splits_at(g, seq) <=
+ * sg_gpu_splitk_n_splits(seq) for every state and every seq, at any cap. */
+uint32_t sg_gpu_splitk_gqa_n_splits_at(const sg_gpu *g, uint32_t seq);
+uint32_t sg_gpu_splitk_gqa_cap(const sg_gpu *g);
+uint32_t sg_gpu_splitk_n_splits(uint32_t seq);
 
 /* One-shot dispatches for the gated-DeltaNet chunked-scan prefill kernels (Task
  * M5.5), each the same synchronous commit-and-wait contract as the entries
@@ -1090,6 +1120,23 @@ sg_err sg_gpu_run_rmsnorm_gated_chunk(sg_gpu *g, void *y, void *z, void *out, vo
  * It is ignored unless split-K itself is on, and for GQA groups outside
  * [2, 8], where it would buy nothing. Default 0 because no hardware gate has
  * been run on that kernel yet, not because it is known to be slower.
+ *
+ * SURGE_SPLITK_GQA_CAP (Task P2.6) overrides the GQA split policy's measured
+ * saturation cap, 256 (see sg_gpu_splitk_gqa_n_splits above). IT IS A GATE AND
+ * RETUNING KNOB, NOT A RUN OPTION: the GQA and per-head policies diverge only
+ * from seq SG_TG * (cap + 1) on, so at the shipped 256 the divergence begins at
+ * 65792 keys and no test suite can reach it, while SURGE_SPLITK_GQA_CAP=4 puts
+ * the identical mechanism at seq 1280. Unlike the three env vars above, an
+ * unusable value is REJECTED (sg_gpu_state_new returns an error) rather than
+ * warned about and ignored: the gate that depends on it would otherwise pass
+ * vacuously with both arms picking the same n_splits. Accepted values are plain
+ * integers in [4, 1024], the same occupancy band the policy clamps to (a leading
+ * sign or space is an error, not a value: strtol would accept " 4" and "+4" and
+ * this parser deliberately does not). Leaving it unset is the shipped, measured
+ * behaviour. Note that ACCEPTED does not imply OBSERVABLE at the top of the
+ * band: at cap 1024 the divergence point is 262400, past SG_KV_CAP_MAX, so that
+ * override can never change a dispatch; only caps below 1024 do anything, and
+ * only above seq SG_TG * (cap + 1).
  *
  * Order of use: sg_gpu_init -> sg_gpu_load_model -> sg_gpu_state_new ->
  * sg_gpu_forward per token with pos = 0, 1, 2, ... A second sequence needs

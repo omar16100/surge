@@ -14,6 +14,7 @@ held. It is superseded, on the same day, by the GPU gates actually running:
 | P2.3 wiring into the decode path | **DONE AND GATED**, see Task P2.3 Results at the end of this file |
 | P2.4 GQA-shared threadgroups (`k_attn_decode_splitk_partial_gqa`) | **GATED ON HARDWARE 2026-08-17**: 577/577 GQA dispatches with the switch on, byte-identical vs the per-head partial, 1.46x-1.74x faster. Still off by default (`SURGE_ATTN_SPLITK_GQA=1` opts in) because it reused the per-head split policy, measured wrong for it (~8-9% left on the table). See Task P2.4 Results at the end of this file. |
 | P2.5 GQA-specific split policy (`splitk_gqa_n_splits`) | **DONE AND GATED**, mean regret 0.43%, worst 2.73% (measured; brief's original sweep said 0.5%/2.6%). Fixes P2.4's stated blocker; default stays OFF (a separate, deliberate decision, not this task's to make). See Task P2.5 Results at the end of this file. |
+| P2.6 greedy-token gate for the diverging split policies (`SURGE_SPLITK_GQA_CAP`) | **DONE AND GATED**: the cap is runtime-settable so the two arms really do pick different n_splits at a reachable seq. New `make check` subtest (321/321 positions differ above the divergence seq, 0 of 1279 below, argmax 1600/1600 agree), three applied-and-run mutations, and a real-model 4B A/B where `gen_ids` are byte-identical while 63 of 64 margins differ. Default cap stays 256 and `SURGE_ATTN_SPLITK_GQA` stays OFF. See Task P2.6 Results at the end of this file. |
 
 What that means concretely: the CPU oracles (P2.0, P2.1) are proven; the Metal kernels
 (P2.2) have now been executed against both of them on real hardware and matched; the
@@ -2855,3 +2856,154 @@ performed -- that is a separate, deliberate decision for the user.
 GQA and per-head KERNEL SELECTION (whether `splitk_gqa_use` should also gain a
 threadgroup-count floor) are P2.4 items this task did not touch and did not need to for its
 own gates to pass; both remain open questions for whoever proposes flipping the default.
+
+## Task P2.6 Results (metal.m/surge.h/test_gpu_fwd.c: close P2.5's greedy-token gap)
+
+**Done.** P2.5 left exactly one thing ungated, and this task turns it into a real gate.
+
+**The gap.** From seq 65792 == `SG_TG * (SG_SPLITK_GQA_N_SPLITS_CAP + 1)` on, the GQA split
+policy deliberately returns FEWER splits than the per-head `splitk_n_splits`, so the two
+decode arms partition the same keys differently and agree only to float rounding. surge's
+correctness standard is byte-exact greedy TOKENS, and nothing tested them there: the P2.4
+positive control runs at seq <= 1600 (both policies return 6), and
+`metal_attn_splitk_gqa_bit_identical` pins n_splits identically on both sides. The margin
+argument (P2.4: worst logit delta 9.537e-07 against a smallest top1-top2 margin 1.385e-03)
+was an argument, not a gate.
+
+**The mechanism: divergence, not depth.** The property under test is only "the two arms pick
+DIFFERENT n_splits, do greedy tokens still match", and the divergence point is
+`SG_TG * (cap + 1)` for whatever cap the state resolved. So the cap became runtime-settable:
+new env var `SURGE_SPLITK_GQA_CAP`, read once in `sg_gpu_state_new` beside
+`SURGE_ATTN_SPLITK` / `SURGE_ATTN_SPLITK_GQA` / `SURGE_KV_DTYPE`. `SURGE_SPLITK_GQA_CAP=4`
+moves the identical 257-vs-256 mechanism down to seq 1280, reachable in seconds. Default is
+unchanged at the measured 256, and `attn_splitk_gqa` is still OFF by default (not this
+task's decision to flip).
+
+**REJECTED, NOT IGNORED.** Unlike the other three split-K env vars, which warn and fall back,
+an unusable `SURGE_SPLITK_GQA_CAP` makes `sg_gpu_state_new` RETURN AN ERROR. A silently
+ignored value is exactly how the gate that depends on it would pass vacuously with both arms
+picking the same n_splits. Accepted values are plain integers in `[SG_SPLITK_MIN,
+SG_SPLITK_MAX]` == `[4, 1024]`, parsed with `strtol` plus a full-string end check so "4x" and
+"" are errors rather than 4 and 0; outside that band the value is meaningless anyway (the
+policy's own floor or ceiling clamp eats it).
+
+**One source of truth kept.** `splitk_gqa_n_splits` became a pure function of `(seq, cap)`
+rather than reading the macro, so the P2.5 policy assertions stay meaningful, and
+`splitk_gqa_cap_of(g)` is the single cap resolver both `enc_attn_splitk` and the new
+diagnostics call. An unset field resolves to the compiled default, never to "cap 0" (which the
+clamp would silently turn into `SG_SPLITK_MIN` for every seq). The
+`splitk_gqa_n_splits(seq, cap) <= splitk_n_splits(seq)` invariant holds at ANY cap
+(`min(x, cap) <= x`, then the identical monotone clamp), so no override can make the GQA arm
+exceed the m/s/acc buffers sized from `splitk_n_splits(max_ctx)`; no buffer changed size.
+
+**New public diagnostics** (`surge.h`), each calling the internal function rather than
+restating it: `sg_gpu_splitk_gqa_n_splits_at(g, seq)` (what THIS state's GQA arm will
+dispatch), `sg_gpu_splitk_gqa_cap(g)` (the resolved cap, i.e. was an override parsed), and
+`sg_gpu_splitk_n_splits(seq)` (the per-head arm's count, so a gate can assert the DIVERGENCE
+rather than one side of it). `sg_gpu_splitk_gqa_n_splits(seq)` keeps its P2.5 signature and
+meaning (the shipped table at the compiled cap), so P2.5's assertions are untouched.
+
+**Gates run, all on hardware (`pgrep -f "bench_niah|mlx_raw_niah|omlx|llama-server|surge-bench"`
+empty before each):**
+
+1. `make check`: PASSED, **86067 checks, 0 failures** (86024 at the parent commit, +43, all in
+   the new subtest). `test_cli_prefill` 11 cases and `test_cli_bench` 14 cases green.
+2. `make debug` (SURGE_NO_METAL, ASan/UBSan): rc 0, **83523 checks, 0 failures, 0 sanitizer
+   diagnostics** -- identical to the P2.4/P2.5 baseline, as it must be (metal.m is not
+   compiled under SURGE_NO_METAL and no CPU-path file was touched).
+3. New `make check` subtest `mini_f16_splitk_gqa_cap_override_greedy_matches`
+   (`tests/test_gpu_fwd.c`), observed output: **cap 4 so the policies split 6 (per-head) vs 4
+   (GQA) at seq 1600 and diverge from seq 1280; 577 GQA dispatches with the switch on (0
+   per-head), 577 per-head with it off; 321/321 positions differ above the divergence seq, 0
+   of 1279 below; worst |delta| 7.153e-07 (scaled 2.902e-07) vs min top1-top2 margin
+   1.385e-03; greedy argmax 1600/1600 agree.**
+4. **Mutation-proved, three mutations actually applied, built and run** (not argued):
+   - `sg_gpu_state_new` parses `SURGE_SPLITK_GQA_CAP` but drops the value: **7 failures**,
+     first "SURGE_SPLITK_GQA_CAP=4 was not applied (resolved cap 256 ...)", then the policy
+     divergence assertions ("got per-head 6 and GQA 6"), then "0 of 321 positions differ".
+   - `enc_attn_splitk` dispatches with the compiled `SG_SPLITK_GQA_N_SPLITS_CAP` instead of
+     the state's cap: **1 failure**, "at seq >= 1280 the capped GQA policy must actually
+     change the bits (0 of 321 positions differ ...)", worst |delta| 0.000e+00.
+   - the range/format validation accepts everything (i.e. warn-and-ignore like the other env
+     vars): **10 failures**, one per rejected value ("must be rejected, not ignored").
+   - `enc_attn_splitk` dispatches with `splitk_gqa_cap_of(g) + 1`, so the ACCESSORS still
+     report cap 4 while the DISPATCH uses 5: **2 failures**, "the position at exactly the
+     divergence seq 1280 must differ" and "must change the bits at EVERY position (65 of 321
+     differ)". This one came from an EXTERNAL ADVERSARIAL REVIEW of the commit and it found a
+     real hole: the first version of the subtest asserted only `above_diff > 0`, a one-sided
+     existence test over a 321-position window, which this mutation passes because the
+     divergence merely moves to seq 1536 and positions 1536-1600 still differ. Worse, the
+     greedy argmax was still 1600/1600 under it, so the token comparison alone would not have
+     caught it either. The gate now requires the position at EXACTLY the divergence seq to
+     differ AND every position at or above it to differ; both are equalities rather than
+     inequalities because each mode is deterministic, so 321/321 is a fixed count for this
+     fixture and cap. Two further review NOTEs were also applied: the parser now rejects `" 4"`
+     and `"+4"` (plain `strtol` accepts both, which made the parser wider than the "plain
+     integer" it documents), and the `main()` ordering comment no longer overstates the
+     dependency between this subtest and the P2.4 control.
+   All four reverted; the tree at commit is the unmutated version and was re-run green.
+5. **Real-model greedy A/B**, `Qwen3-4B-Instruct-2507-Q8_0.gguf` (32 heads / 8 kv, repeat 4,
+   36 full-attention layers), 5483-token prompt (surge's own three gate docs concatenated,
+   sha256 8844a188...), `-n 64 --margins`, three arms, only the two env vars changed:
+
+   | arm | `SURGE_ATTN_SPLITK_GQA` | cap | GQA n_splits | per-head n_splits | decode |
+   |---|---|---|---|---|---|
+   | A0 | 0 | 4 | n/a | 21 | 39.25 tok/s |
+   | A1 | 1 | 4 | 4 | n/a | 23.79 tok/s |
+   | A2 | 1 | 256 (default) | 21 | n/a | 38.51 tok/s |
+
+   - **A0 vs A1 (divergent, 21 splits vs 4): `gen_ids` BYTE-IDENTICAL**, sha256
+     7972849e3c0f0d18d6b638cf3e7ab24c8b6c3662a3c9d0e9fc58a148b680bb2d on both. **63 of 64
+     top1-top2 margins DIFFER**, so the two arms genuinely computed different bits and the
+     token match is not the vacuous case. (`margin[0]` is identical by construction: it comes
+     from the prefill's last-position logits, and prefill does not use the decode split-K
+     kernel.) Smallest decision margin observed 4.760456e-02, perturbed by 2.661e-04 on that
+     same position, **179x headroom**; largest absolute margin perturbation anywhere
+     3.860e-03, on a margin of 1.038e+01.
+   - **A0 vs A2 (same n_splits 21 on both sides): margins AND `gen_ids` byte-identical**,
+     which is P2.4's byte-identity contract holding on a real model at a real depth, and the
+     control proving the divergence in A1 comes from the cap and nothing else.
+   - A1's decode being SLOWER (23.79 vs 39.25 tok/s) is expected and is further evidence the
+     cap took effect: 4 splits x 8 kv rows is 32 threadgroups, deliberately pessimal
+     occupancy. Nothing about cap 4 is a performance configuration.
+6. P2.4 and P2.5 gates re-verified UNCHANGED in the same `make check`:
+   `mini_f16_splitk_gqa_dispatches_and_matches` still reports **577 GQA dispatches with the
+   switch on (0 per-head), 577 per-head with it off, logits byte-identical at 1600/1600
+   positions**; `metal_attn_splitk_gqa_bit_identical` (byte identity + 100x determinism +
+   `splitk_gqa_n_splits_policy`'s 12 assertions) still 0 failures.
+
+**A pre-existing flake, identified and NOT caused by this task.** `test_cli_bench`'s B6
+`check2` (reported decode-tps slope vs avg within 3%) failed once during a back-to-back
+`make check`, at rel_diff 0.0336. Reproduced AT THE PARENT COMMIT with this task's changes
+stashed: 3rd consecutive `make check` failed the same check at rel_diff 0.0376, with decode
+throughput down to 1214/1170 tok/s (the M3 firmware clock clamp). It is a machine-timing
+tolerance on a live 1024-token decode, touches no split-K policy, and passes on a cooled
+machine (6/6 at baseline, 3/3 plus the final full run on this branch).
+
+7. **Off-by-one confirmation on the real model**, the closest affordable approximation of the
+   natural regime. `SURGE_SPLITK_GQA_CAP=63` on a 16449-token prompt makes the two arms split
+   **64 (per-head) against 63 (GQA)** at seq 16450, the same shape of perturbation as the
+   natural 257-against-256 (1.016x split-count ratio vs 1.004x) at real depth and large split
+   counts. Result: **`gen_ids` BYTE-IDENTICAL**, sha256
+   7f1de3c66f355f1b91d783ca504e84f9d3def54c34ef76765e9abd809342346a on both arms; **61 of 64
+   margins differ** (the 3 that match are margin[0], prefill-derived and identical by
+   construction, plus two gaps of 1.504e+01 and 1.198e+01 where the perturbation is below what
+   `%.6e` resolves); tightest decision anywhere gap 1.152420e-02 perturbed by 2.022e-04 on that
+   same position, **57x headroom**; largest absolute perturbation anywhere 1.660e-03 on a gap of
+   1.544e+01. Prefill 554.751 s and 573.699 s for the two arms.
+
+**NOT RUN: the natural regime above seq 65791, abandoned on measured cost, not skipped.** A
+66219-token 4B run (9.10 GiB KV) was started and killed after reaching 9216 tokens: 1024 tokens
+in 14.8 s (69 tok/s), 9216 tokens in 267.6 s (34 tok/s). Fitting `t = c n^2 + d n` to those two
+IN-RUN points gives c = 1.78e-6 s/token^2 and d = 1.26e-2 s/token, i.e. **about 144 min of
+prefill per arm and 4.8 h for the two-arm A/B**. (Two shorter runs on the same binary, 5483 tok
+in 72.9 s and 10966 tok in 171.7 s, fit c = 4.32e-7 and predict only 44 min per arm; the in-run
+curve is ~2x worse, consistent with the B8 duty-cycle rests plus the documented M3 firmware
+clock clamp under sustained load, and the in-run number is the one to believe.) Judged not
+affordable for a confirmation whose perturbation is STRICTLY SMALLER than gate 5 above already
+measured: 1.004x split-count ratio at 65792 against the 5.25x (21 vs 4) that produced
+byte-identical gen_ids there, and against gate 7's off-by-one 1.016x. Budget ~5 h of exclusive
+GPU and 9.1 GiB of KV per arm, and use `--margins` so the result is falsifiable.
+
+**KEPT OFF.** `attn_splitk_gqa` default is still `false`. This task makes the flip safe to
+CONSIDER by closing the last correctness gate; performing it is the user's decision.

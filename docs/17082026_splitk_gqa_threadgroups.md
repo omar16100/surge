@@ -174,3 +174,70 @@ byte-for-byte the one P2.3 measured.
    than argues it.
 3. **Occupancy at short sequences**, as described above: fewer, longer-lived threadgroups.
    Gate 9 is the instrument.
+
+## MEASURED on hardware, 2026-08-17 (all gates above now run)
+
+The GPU freed when the 256K oMLX cell finished. Fresh GEMM gate 21.52 TFLOPS, nothing else
+resident. Every result below was observed, not projected.
+
+### Correctness
+
+| gate | result |
+|---|---|
+| `make check` | exit 0, **86012 checks, 0 failures** (85319 at P2.3, so +693) |
+| Positive control (gate 6) | **577 GQA dispatches with the switch on, 0 per-head; 577 per-head with it off; logits byte-identical at 1600/1600 positions** |
+| Byte-identity (gate 2) | `GQA split-K partial: m/s/acc/out byte-identical over 100 reruns` |
+
+The positive control is the one that matters. The review found the originally planned
+real-model A/B could not distinguish "the GQA kernel ran and matched" from "the switch did
+nothing", since both produce byte-identical output. Observing **577** dispatches rather than 0
+closes that by evidence. Byte-identity, not a tolerance, was the bar the task set, and it held.
+
+### Speed: GQA beats per-head split-K at every shape and depth tested
+
+Same binary, same yardstick, both arms; `n_splits` swept across the occupancy band.
+
+| shape | seq | per-head best | GQA best | GQA gain | total vs incumbent |
+|---|---|---|---|---|---|
+| 27B `24h/4kv/256d` | 262144 | 7353.75 us @1024 | **4217.15 us @256** | **1.744x** | 28.330x |
+| 27B `24h/4kv/256d` | 131072 | 3880.45 us @512 | **2385.05 us @256** | **1.627x** | 25.095x |
+| 4B dense `32h/8kv/128d` | 262144 | 4897.65 us @1024 | **3365.45 us @512** | **1.455x** | 32.444x |
+
+This **refutes the review's single biggest risk**: that the `R >= 3` accumulator arrays would
+fail to register-allocate and leave GQA slower than the per-head kernel. It is faster
+everywhere tested.
+
+### The shipped split policy is wrong for this kernel (not yet fixed)
+
+`n_splits = clamp(seq / SG_TG, 4, 1024)` was measured optimal for the per-head partial. **GQA's
+optimum is consistently lower**, so reusing that policy costs real throughput:
+
+| shape | seq | policy picks | policy time | GQA optimum | best time | left on the table |
+|---|---|---|---|---|---|---|
+| 27B | 262144 | 1024 | 4583.40 us | 256 | 4217.15 us | ~8% |
+| 4B dense | 262144 | 1024 | 29.754x | 512 | 32.444x | ~9% |
+
+The optimum was 2x lower in two cases and 4x lower in the third, and the curve is shallow near
+it (27B at 262144: 256 gives 4217 us, 512 gives 4316 us, 2.3% apart). So this needs its own
+sweep rather than a guessed closed form. **This is why the default stays OFF.**
+
+### Achieved bandwidth: do not quote the harness's GQA GB/s column
+
+`bytes_kv` (`tests/bench_splitk.c:280-283`) counts `n_heads` worth of issued bytes for BOTH
+arms deliberately, so the speedup ratio shares one denominator and is valid. But the GQA kernel
+reads only `n_kv_heads` worth, so its true traffic is `1/repeat` of the printed figure:
+
+- 4B GQA at 262144 prints **1276.2 GB/s**. Actual DRAM traffic is **319.0 GB/s**, which is
+  **51% of this machine's 630 GB/s measured roofline**.
+- The per-head arm prints **876.9 GB/s**, which *exceeds* the roofline. That is the tell:
+  cache was already absorbing much of the 4x redundant traffic. It is also the reason removing
+  the redundancy bought 1.46x to 1.74x rather than the naive 4x.
+
+### Projection, explicitly an upper bound
+
+16 full-attention layers x 4.217 ms = 67.5 ms/token = **~14.8 t/s** for the 27B at 262144,
+against **0.537 t/s** measured in B7 and ~8.5 t/s for per-head split-K. Handle with care:
+P2.3a established that attention was essentially the *entire* decode cost at this depth
+(16 x 118.8 ms predicted 0.526 t/s against 0.537 measured). Once attention shrinks ~28x, the
+non-attention cost stops being negligible and becomes the limiter. This is not a claim until it
+is measured end to end on the real model.

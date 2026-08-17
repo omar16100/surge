@@ -347,11 +347,31 @@ static timing_t time_incumbent(sg_gpu *g, gbuf *q, gbuf *k, gbuf *v, gbuf *out,
  * a bigger bandwidth number. */
 static bool g_gqa = false;
 
+/* --online (task P2.8): time k_attn_decode_splitk_partial_gqa_online, the
+ * streaming form of the GQA partial. It has the same grid as --gqa (so the same
+ * GB/s caveat above applies word for word) and does the same K/V reads, but it
+ * writes NO score row: the four-pass kernel's two writes and three reads of
+ * n_heads * len floats per split are replaced by a running (m, s, acc). The A/B
+ * that matters for P2.8 is therefore --gqa against --gqa --online at the SAME
+ * n_splits, which is what this harness makes possible on one binary.
+ *
+ * It implies the GQA grid rather than composing with the per-head one: there is
+ * no per-head online kernel, so --online alone selects the online GQA kernel and
+ * --gqa --online is the same request. UNLIKE the --gqa A/B, this one is NOT
+ * byte-identical to the arm it is compared against (streaming reorders the
+ * exponential sums), so a correctness claim here belongs to
+ * tests/test_metal_ops.c's oracle comparison, not to this file. */
+static bool g_online = false;
+
 /* Times the chosen split-K partial THEN k_attn_decode_splitk_combine as one
  * unit (see the file header: that pair together is what reaches the same
  * "final attention output" the incumbent produces in a single dispatch). */
 static sg_err run_partial(sg_gpu *g, gbuf *q, gbuf *k, gbuf *v,
                           gbuf *m, gbuf *s, gbuf *acc, const uint32_t params[8]) {
+    if (g_online) {
+        return sg_gpu_run_attn_splitk_partial_gqa_online(g, q->b, k->b, v->b,
+                                                         m->b, s->b, acc->b, params);
+    }
     if (g_gqa) {
         return sg_gpu_run_attn_splitk_partial_gqa(g, q->b, k->b, v->b,
                                                   m->b, s->b, acc->b, params);
@@ -597,7 +617,12 @@ static void usage(const char *prog) {
         "  --gqa        time k_attn_decode_splitk_partial_gqa (task P2.4, one\n"
         "               threadgroup per GQA GROUP) instead of the per-head\n"
         "               k_attn_decode_splitk_partial. Same output bytes, so the\n"
-        "               A/B is this binary run twice, with and without the flag.\n",
+        "               A/B is this binary run twice, with and without the flag.\n"
+        "  --online     time k_attn_decode_splitk_partial_gqa_online (task P2.8,\n"
+        "               the streaming form of the GQA partial: no score row in\n"
+        "               device memory). Implies the GQA grid. NOT byte-identical\n"
+        "               to --gqa, so compare TIMES here and correctness in\n"
+        "               tests/test_metal_ops.c.\n",
         prog, DEFAULT_REPS, (int)SEQS[0], (int)SEQS[N_SEQS - 1], MAX_SEQS);
 }
 
@@ -646,6 +671,11 @@ int main(int argc, char **argv) {
             n_seqs = n;
         } else if (strcmp(argv[i], "--gqa") == 0) {
             g_gqa = true;
+        } else if (strcmp(argv[i], "--online") == 0) {
+            /* Implies --gqa: the online kernel IS a GQA-shared kernel, and the
+             * GB/s caveat and grid note both belong to it too. */
+            g_online = true;
+            g_gqa = true;
         } else if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
             usage(argv[0]);
             return 0;
@@ -667,11 +697,19 @@ int main(int argc, char **argv) {
     printf("reps=%d (+1 discarded warm-up); incumbent=k_attn_decode_f16, "
            "split-K=%s+combine dispatched together (the pair needed for "
            "one decode step's answer)\n", reps,
-           g_gqa ? "k_attn_decode_splitk_partial_gqa" : "k_attn_decode_splitk_partial");
+           g_online ? "k_attn_decode_splitk_partial_gqa_online"
+                    : (g_gqa ? "k_attn_decode_splitk_partial_gqa"
+                             : "k_attn_decode_splitk_partial"));
     if (g_gqa) {
         printf("P2.4 --gqa: the GQA partial issues 1/repeat of the KV reads the "
                "per-head one does, so its splitk_GBps column is on the per-head "
                "yardstick (see the file header), not achieved DRAM bandwidth\n");
+    }
+    if (g_online) {
+        printf("P2.8 --online: streaming softmax, no score row in device memory "
+               "(splitk_scratch is neither grown nor bound). Same K/V reads as "
+               "--gqa, so compare against a --gqa run at the same --reps and "
+               "--seqs; the numbers are NOT bit-comparable, only time-comparable\n");
     }
     printf("speedup = incumbent_mean_time / splitk_mean_time (> 1.0 means split-K is faster)\n");
     printf("GB/s is decimal (1e9 bytes/s) achieved KV-read bandwidth, the same "

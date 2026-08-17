@@ -49,7 +49,7 @@ optionally Accelerate for the CPU reference path. No third-party libraries.
 | `src/bench.c` | (B-series) pure-C benchmark math: decode-by-slope, leaderboard-row/JSON formatters, prompt file read, ingestion/truncation guard, NIAH recall scorer, process `phys_footprint` probe + the `sg_mem_tracker` peak-max tracker (B2). |
 | `src/greedy.c` | the ONE greedy-decode argmax (`sg_argmax_f32`, lowest index wins an exact tie). Pure C in LIB_SRC; `surge` and `surge-bench` both call it so their gen_ids cannot drift (B5). |
 | `src/metal.m` | Metal device init, weight-buffer wrapping (mmap, no-copy; bf16/f32/Q8_0 sizing), per-weight matvec kernel dispatch (`matmul_kernel_for`), one command buffer per decode token; one command buffer per prefill chunk (`sg_gpu_prefill`, M5.6) unless `sg_gpu_set_prefill_max_burst` splits the layer sweep across several (2026-08-15), kernel registration (KI_ enum + SG_KERNELS table + size/param checks), `sg_gpu_current_alloc_bytes` (B2, `MTLDevice.currentAllocatedSize`). Registers itself as `sg_kv`'s allocation backend at init. Decode state: the DEFAULT full-attention KV cache is fp16, allocated through `sg_kv` as SEPARATE per-layer K/V buffers (M5.2, `SURGE_KV_DTYPE` env toggle); `SURGE_KV_DTYPE=f32` selects the original combined-buffer f32 path unchanged, kept so the M2 gate's oracle never moves. DeltaNet conv/S state stays on its pre-M5.1 ad hoc allocation for decode; prefill (M5.6) threads DeltaNet state through `sg_kv`'s conv/S carriers (so `g->kv` is now allocated for any DeltaNet model on the f16 path) and bridges the final state back into the ad hoc buffers when it finishes. `sg_gpu_prefill`'s chunk loop also carries the B8 prefill duty-cycle: `sg_gpu_set_prefill_rest` arms an optional idle sleep (`pf_sleep_ms`, `nanosleep`+EINTR-retry) between chunks once the accumulated GPU-busy time PLUS an estimate of the next chunk's would cross a work budget, so the GPU is yielded before the budget is blown rather than after. Its purpose is keeping the compositor alive, not dodging a firmware clock clamp (rationale corrected 2026-08-15, see the B8 block below). Alongside it, `sg_gpu_set_prefill_max_burst` bounds how long a SINGLE command buffer holds the GPU by splitting the layer sweep. Both are disabled by default and both are pure timing or pure submission-boundary changes (touching no buffer/state/accumulator), so neither changes computed output. |
-| `src/kernels.metal` | deterministic Metal kernels: decode-step ones fold a fixed reduction tree (no atomics/simd_sum) -- bf16/f32/Q8_0 matvec, attention decode (f32-KV `k_attn_decode` and fp16-KV `k_attn_decode_f16`, M5.2), a decode-step fp16 store (`k_kv_store_f16`, M5.2), gated-DeltaNet decode, RoPE, RMSNorm, SwiGLU. Prefill's tiled GEMM (M5.3, `k_matmul_bf16`/`k_matmul_f32`/`k_matmul_q8`, `Y[N,M]=X[N,K]@W[M,K]^T`) uses a different determinism mechanism: one thread per output element of a 16x16 output tile, a private serial K-loop, no cross-thread reduction at all (nothing to fold). Full-attention prefill (M5.4) adds `k_rope_chunk` (partial RoPE over a whole chunk) and `k_attn_prefill` (causal chunk attention over the fp16 KV cache, one threadgroup per (query token, query head), same fixed-tree softmax as `k_attn_decode_f16`). DeltaNet prefill (M5.5) adds `k_conv1d_chunk` / `k_delta_gates_chunk` / `k_delta_chunk` / `k_rmsnorm_gated_chunk`: a whole chunk of N tokens through one DeltaNet layer via a SEQUENTIAL within-chunk scan (per-token loop inside the kernel, threading the conv tail + S matrix), bit-identical to the matching decode kernel looped over the chunk. Split-K decode attention (P2.2/P2.3) adds `k_attn_decode_splitk_partial` + `k_attn_decode_splitk_combine`, and P2.4 adds `k_attn_decode_splitk_partial_gqa`, the same partial with one threadgroup per GQA GROUP instead of per query head (each K/V element read once for all `repeat` heads that share it, `repeat` separate per-thread accumulators, same output bytes and same output layout). |
+| `src/kernels.metal` | deterministic Metal kernels: decode-step ones fold a fixed reduction tree (no atomics/simd_sum) -- bf16/f32/Q8_0 matvec, attention decode (f32-KV `k_attn_decode` and fp16-KV `k_attn_decode_f16`, M5.2), a decode-step fp16 store (`k_kv_store_f16`, M5.2), gated-DeltaNet decode, RoPE, RMSNorm, SwiGLU. Prefill's tiled GEMM (M5.3, `k_matmul_bf16`/`k_matmul_f32`/`k_matmul_q8`, `Y[N,M]=X[N,K]@W[M,K]^T`) uses a different determinism mechanism: one thread per output element of a 16x16 output tile, a private serial K-loop, no cross-thread reduction at all (nothing to fold). Full-attention prefill (M5.4) adds `k_rope_chunk` (partial RoPE over a whole chunk) and `k_attn_prefill` (causal chunk attention over the fp16 KV cache, one threadgroup per (query token, query head), same fixed-tree softmax as `k_attn_decode_f16`). DeltaNet prefill (M5.5) adds `k_conv1d_chunk` / `k_delta_gates_chunk` / `k_delta_chunk` / `k_rmsnorm_gated_chunk`: a whole chunk of N tokens through one DeltaNet layer via a SEQUENTIAL within-chunk scan (per-token loop inside the kernel, threading the conv tail + S matrix), bit-identical to the matching decode kernel looped over the chunk. Split-K decode attention (P2.2/P2.3) adds `k_attn_decode_splitk_partial` + `k_attn_decode_splitk_combine`, and P2.4 adds `k_attn_decode_splitk_partial_gqa`, the same partial with one threadgroup per GQA GROUP instead of per query head (each K/V element read once for all `repeat` heads that share it, `repeat` separate per-thread accumulators, same output bytes and same output layout). P2.8 adds `k_attn_decode_splitk_partial_gqa_online`, the ONLINE-SOFTMAX form of that partial: one streaming pass holding a running `(m, s, acc)` per head, rescaled by `exp(m_old - m_new)` when the maximum moves, so it has no device-memory score row and SEVEN bindings instead of eight. `m` and `s` are uniform (off the new R-wide fixed trees `tg_max_group`/`tg_sum_group`) and `acc[d]` is owned by exactly one thread, which is what keeps the streaming state at `4R` registers instead of `R*head_dim`, and which is why the kernel wants `head_dim <= SG_TG` (past that its `dbase` loop re-streams the split per band, still correct, so the decline is policy not validity). Not byte-identical to the four-pass partials: streaming reorders the exponential sums, so the bar is the CPU oracle plus determinism plus byte-exact greedy tokens. |
 | `src/cli_*.c` | the four CLI mains (`cli_info`, `cli_ref`, `cli_metal` = `surge`, `cli_bench` = `surge-bench`). `cli_bench` (B5): raw tokenize (no chat template), `--bos`/`--no-bos` (default `tokenizer.ggml.add_bos_token`), M5 tiled prefill (`--chunk`, default 1024) + shared greedy decode, GEMM gate (`--gemm-gate-tflops F`, need F>20.5) + ingestion guard, whole-run peak-mem sampling, NIAH recall (text input only), decode-by-slope (`--warmup`, `--emit-timeseries`), md row to stdout + `--json`. Exit 0 DONE / 3 VOID / other hard error. `--prefill-work-ms`/`--prefill-rest-ms` (B8) arm the metal.m duty-cycle before prefill; JSON gains `prefill_rest_s` (slept subset of `prefill_wall_s`) and `prefill_compute_tps` (rest excluded, the fair full-clock number). |
 
 ## Level 4: Data flows
@@ -64,7 +64,10 @@ optionally Accelerate for the CPU reference path. No third-party libraries.
   `k_attn_decode` on the f32-KV path; Task P2.4 adds the GQA-shared
   `k_attn_decode_splitk_partial_gqa` as a same-bytes alternative to the partial, reached
   only under `SURGE_ATTN_SPLITK_GQA=1`, gated on hardware 2026-08-17 and still off by
-  default) or
+  default; Task P2.8 adds `k_attn_decode_splitk_partial_gqa_online`, the streaming form of
+  that partial, reached only under `SURGE_ATTN_SPLITK_ONLINE=1`, also gated on hardware
+  2026-08-17 and also off by default because it is measurably faster on the 27B shape and
+  measurably slower on the 4B one) or
   conv-step + delta-step (DeltaNet layers), output gate, residuals; final norm + lm_head
   -> logits -> host argmax -> next token. Byte-exact GREEDY TOKENS to the CPU reference at
   temp 0 (M2 gate, oracle is the f32-KV path); fp16 KV adds ~1e-6 logit noise on the
@@ -563,10 +566,38 @@ optionally Accelerate for the CPU reference path. No third-party libraries.
     byte-identity BELOW the divergence seq and a bit difference AT OR ABOVE it while every
     greedy argmax agrees; proved non-vacuous by three mutations that were applied, built and
     run. Defaults unchanged: cap 256, `attn_splitk_gqa` off.
+  - **P2.7 (`src/metal.m`, `tests/test_gpu_fwd.c`): a MEASURED occupancy floor on the GQA
+    arm.** Collapsing `repeat` per-head threadgroups into one divides the grid by `repeat`, so
+    at short context the GQA kernel trades redundant traffic for an idle GPU and measurably
+    loses (0.822x on the 27B at seq 2048). `splitk_gqa_use` now also requires
+    `splitk_gqa_n_splits(seq, cap) * n_kv_heads >= SG_SPLITK_GQA_MIN_TG == 128`, a floor on the
+    THREADGROUP COUNT rather than on seq, because the two real shapes' crossovers are 1.7x
+    apart in seq and in the opposite order. Both existing GQA gates had to move above the floor
+    (seq 16896) or they would have run the per-head kernel in both arms.
+  - **P2.8 (`src/kernels.metal`, `src/metal.m`, `surge.h`, `tests/test_metal_ops.c`,
+    `tests/test_gpu_fwd.c`, `tests/bench_splitk.c`): ONLINE-SOFTMAX GQA partial,
+    `k_attn_decode_splitk_partial_gqa_online`, `SURGE_ATTN_SPLITK_ONLINE=1`, default OFF.**
+    One streaming pass instead of four over a device-memory score row: no `scores` binding
+    (seven, not eight), and `splitk_scratch` is neither grown nor bound on that path (about
+    25 MB at the 27B's 24 heads and 262144 context if it ever became the only partial; the
+    buffer and `splitk_sizes` are untouched here because the four-pass kernels still need it).
+    The design turns on WHERE the running accumulator lives: `m`/`s` are uniform and every
+    thread keeps a copy, while `acc[d]` has exactly one owner thread, so the state is `4R`
+    registers rather than `R*head_dim`, at the cost of transposing the `R x SG_TG` score block
+    through 8 KB of threadgroup memory that doubles as the fold scratch for the new R-wide
+    trees. Policy: the shared `splitk_gqa_shape_ok` (group band + P2.7 floor) plus
+    `head_dim <= SG_TG`; when both kernel switches are on the online arm takes the dispatch and
+    `splitk_gqa_use` yields, so the counters cannot double-count. NOT byte-identical (streaming
+    reorders the sums), so the bar is the CPU oracle (worst rel 2.109e-06), 100x determinism,
+    and byte-exact greedy tokens on the 4B (`gen_ids` identical, 62 of 64 margins differ).
+    MEASURED TWO-SIDED and that is why it ships off: 1.013x-1.114x on the 27B at every
+    decode-policy point, 0.690x-0.984x on the 4B at depth. `SURGE_ATTN_SPLITK_ONLINE` is
+    REJECTED rather than ignored on a bad value, P2.6's rule.
 - **Not built:** the rest of M4 (kernel excellence / beat mlx-lm; split-K decode attention
-  is shipped and gated, including P2.4's GQA-shared threadgroup kernel and P2.6's
-  greedy-token gate for it, though that kernel is still off by default; online softmax and
-  the prefill kernels' own optimization are not started), the dense-qwen3
+  is shipped and gated, including P2.4's GQA-shared threadgroup kernel, P2.6's
+  greedy-token gate for it and P2.8's online-softmax variant of it, though both kernels are
+  still off by default; the phase-4 thread waste for `head_dim < SG_TG` and the prefill
+  kernels' own optimization are not started), the dense-qwen3
   GPU forward's own numeric gate (P1 is loader-only; deferred until the GPU is free),
   server mode, non-Metal platforms, MoE, continuous batching, sampling beyond
   greedy/temp/top-p/top-k.

@@ -130,6 +130,7 @@ enum {
     KI_CONV1D_CHUNK, KI_DELTA_GATES_CHUNK, KI_DELTA_CHUNK, KI_RMSNORM_GATED_CHUNK,
     KI_ATTN_SPLITK_PARTIAL, KI_ATTN_SPLITK_COMBINE,
     KI_ATTN_SPLITK_PARTIAL_GQA,
+    KI_ATTN_SPLITK_PARTIAL_GQA_ONLINE,
     KI_COUNT
 };
 
@@ -209,6 +210,13 @@ static const sg_kernel_desc SG_KERNELS[] = {
      * and the traffic differ. Dispatched by hand from
      * sg_gpu_run_attn_splitk_partial_gqa and enc_attn_splitk. */
     { "k_attn_decode_splitk_partial_gqa", SG_K_HEADS2D },
+    /* P2.8: the ONLINE-SOFTMAX GQA partial. Same grid class, same params array
+     * and same output layout as the two above, but SEVEN bindings instead of
+     * eight: it keeps a running (m, s, acc) per head in registers and
+     * threadgroup memory instead of writing a score row, so it has no `scores`
+     * argument and never touches g->splitk_scratch. Dispatched by hand from
+     * sg_gpu_run_attn_splitk_partial_gqa_online and enc_attn_splitk. */
+    { "k_attn_decode_splitk_partial_gqa_online", SG_K_HEADS2D },
 };
 #define SG_N_KERNELS ((int)(sizeof SG_KERNELS / sizeof SG_KERNELS[0]))
 _Static_assert(SG_N_KERNELS == KI_COUNT, "SG_KERNELS and the KI_ enum disagree");
@@ -347,6 +355,32 @@ struct sg_gpu {
      * changes memory traffic and grid shape, never the answer. DEFAULT FALSE
      * until the deferred hardware gates run: see splitk_gqa_use. */
     bool attn_splitk_gqa;
+    /* --- Task P2.8: online (streaming) softmax in the GQA partial ---
+     * Read from SURGE_ATTN_SPLITK_ONLINE at the last sg_gpu_state_new call, and
+     * only consulted when attn_splitk above is already true. true makes
+     * enc_attn_splitk dispatch k_attn_decode_splitk_partial_gqa_online, which
+     * keeps a running (m, s, acc) per head instead of writing a score row into
+     * splitk_scratch and walking it three more times.
+     *
+     * IT IS A SEPARATE SWITCH FROM attn_splitk_gqa, not a modifier of it: the
+     * online kernel IS a GQA-shared kernel (same grid, same group-size band,
+     * same threadgroup floor, same split policy), so requiring both switches
+     * would only mean two ways to spell one choice. When both are set the online
+     * kernel wins, because it is the more specific request; see
+     * splitk_online_use.
+     *
+     * UNLIKE THE OTHER TWO KERNEL SWITCHES, THIS ONE CHANGES THE ANSWER'S LAST
+     * BITS. Streaming reorders the exponential sums, so the online arm is NOT
+     * byte-identical to the four-pass arm at a fixed n_splits (only `m` is
+     * exact, and the whole triple happens to be exact when a split fits one
+     * SG_TG-wide tile). The bar is accuracy against sg_ref_attn_decode_splitk
+     * plus determinism plus byte-exact greedy tokens, the P2.2 standard, not the
+     * memcmp P2.4 could claim.
+     *
+     * DEFAULT FALSE, and for the same evidence reason P2.4's switch is: written
+     * and compiled with the GPU held by a 256K benchmark, so no timing and no
+     * accuracy number for it had been observed when it landed. */
+    bool attn_splitk_online;
     /* --- Task P2.6: the GQA split policy's saturation cap, overridable ---
      * Read from SURGE_SPLITK_GQA_CAP at the last sg_gpu_state_new call. 0 means
      * "never set on this state", which splitk_gqa_cap_of resolves to the
@@ -390,6 +424,14 @@ struct sg_gpu {
      * two-sided gate on the floor itself and not only on the selection. */
     uint64_t splitk_partial_dispatches;
     uint64_t splitk_gqa_dispatches;
+    /* P2.8's third arm, counted separately rather than folded into
+     * splitk_gqa_dispatches. Two reasons: the P2.4/P2.6/P2.7 gates assert EXACT
+     * values of the two counters above and must keep their meaning ("the
+     * four-pass GQA partial"), and the online arm's own A/B needs to distinguish
+     * "the online kernel ran" from "some GQA kernel ran", which is the same
+     * vacuity argument that put the first two counters here. Read through
+     * sg_gpu_splitk_online_dispatches. */
+    uint64_t splitk_online_dispatches;
     /* The largest n_splits any decode step at this max_ctx can ask for, i.e.
      * splitk_n_splits(max_ctx). n_splits is nondecreasing in seq and seq is
      * capped at max_ctx, so the three buffers below and g->splitk_scratch can
@@ -881,8 +923,10 @@ static sg_err check_sizes(const char *kernel, const sg_gpu_buf *a, const sg_gpu_
         need_o = need_a;
     } else if (strcmp(kernel, "k_attn_decode_splitk_partial") == 0 ||
                strcmp(kernel, "k_attn_decode_splitk_combine") == 0 ||
-               strcmp(kernel, "k_attn_decode_splitk_partial_gqa") == 0) {
-        /* P2.2 (and P2.4's GQA partial, which binds exactly the same eight).
+               strcmp(kernel, "k_attn_decode_splitk_partial_gqa") == 0 ||
+               strcmp(kernel, "k_attn_decode_splitk_partial_gqa_online") == 0) {
+        /* P2.2 (and P2.4's GQA partial, which binds exactly the same eight,
+         * and P2.8's online partial, which binds seven of them).
          * A ROUTING rule rather than a size rule: the partial kernels bind six
          * device buffers (q, k, v, m, s, acc) plus a score scratch and the
          * combine four (m, s, acc, out), so the (a, b, o) triple this
@@ -893,8 +937,8 @@ static sg_err check_sizes(const char *kernel, const sg_gpu_buf *a, const sg_gpu_
          * one-shots call and which guards every product with mul_ck exactly
          * as the rules above do. */
         return gpu_errf("gpu: %s binds more device buffers than sg_gpu_run_op's "
-                        "(a, b, out); use sg_gpu_run_attn_splitk_partial/_gqa/_combine",
-                        kernel);
+                        "(a, b, out); use sg_gpu_run_attn_splitk_partial/_gqa/"
+                        "_gqa_online/_combine", kernel);
     } else {
         return gpu_errf("gpu: no size rule for kernel '%s'", kernel);
     }
@@ -1000,7 +1044,8 @@ static sg_err check_params(const char *kernel, const uint32_t *p) {
         }
     } else if (strcmp(kernel, "k_attn_decode_splitk_partial") == 0 ||
                strcmp(kernel, "k_attn_decode_splitk_combine") == 0 ||
-               strcmp(kernel, "k_attn_decode_splitk_partial_gqa") == 0) {
+               strcmp(kernel, "k_attn_decode_splitk_partial_gqa") == 0 ||
+               strcmp(kernel, "k_attn_decode_splitk_partial_gqa_online") == 0) {
         /* P2.2. ONE params array serves both dispatches (surge.h documents it
          * that way, and the test fills it once), so both kernels get ONE rule:
          * a caller must not be able to get an array past the partial only to
@@ -1037,7 +1082,15 @@ static sg_err check_params(const char *kernel, const uint32_t *p) {
          * with n_kv*repeat == n_heads, so no group runs off the end and none
          * is skipped. A group WIDER than SG_SPLITK_GQA_MAX is still answered
          * correctly (the kernel's default arm walks it one head at a time), so
-         * it is a policy question for splitk_gqa_use, not a validity one. */
+         * it is a policy question for splitk_gqa_use, not a validity one.
+         *
+         * P2.8's online partial shares it too, and adds NO head_dim ceiling
+         * here on purpose: head_dim > SG_TG makes that kernel re-stream the
+         * split once per SG_TG-wide band of output dims, which is slower than
+         * the four-pass kernel but still exactly correct, so it is the same
+         * kind of policy question (splitk_online_use declines it) rather than a
+         * validity one. A rejection here would instead break the one-shot for a
+         * shape the kernel answers correctly. */
     }
     return SG_OK;
 }
@@ -1253,15 +1306,77 @@ static uint32_t splitk_use(const sg_gpu *g, uint32_t seq) {
 static uint32_t splitk_gqa_n_splits(uint32_t seq, uint32_t cap);
 static uint32_t splitk_gqa_cap_of(const sg_gpu *g);
 
-static bool splitk_gqa_use(const sg_gpu *g, uint32_t n_heads, uint32_t n_kv,
-                           uint32_t seq) {
-    if (!g->attn_splitk_gqa) return false;
+/* Everything above that is about the SHAPE AND THE GRID rather than about which
+ * switch is on: the group must be worth sharing, must fit in registers, and the
+ * dispatch must still fill the machine. Factored out for P2.8, whose online
+ * kernel is a GQA-shared kernel with the same grid, the same group-size band and
+ * the same occupancy problem, so it must ask the same three questions. Splitting
+ * this out rather than copying it is the point: a change to the measured floor
+ * or to the band must reach both arms or the second one silently keeps the old
+ * policy. */
+static bool splitk_gqa_shape_ok(const sg_gpu *g, uint32_t n_heads, uint32_t n_kv,
+                                uint32_t seq) {
     if (n_kv == 0 || n_heads % n_kv != 0) return false;
     uint32_t repeat = n_heads / n_kv;
     if (repeat < 2 || repeat > SG_SPLITK_GQA_MAX) return false;
     /* uint64_t so a caller's absurd n_kv cannot wrap the product into a pass. */
     uint64_t tgs = (uint64_t)splitk_gqa_n_splits(seq, splitk_gqa_cap_of(g)) * n_kv;
     return tgs >= SG_SPLITK_GQA_MIN_TG;
+}
+
+/* P2.8: forward declaration, because the four-pass GQA arm now has to yield to
+ * the online arm when both switches are set (see below), and the online
+ * predicate needs splitk_gqa_shape_ok above. */
+static bool splitk_online_use(const sg_gpu *g, uint32_t n_heads, uint32_t n_kv,
+                              uint32_t hd, uint32_t seq);
+
+static bool splitk_gqa_use(const sg_gpu *g, uint32_t n_heads, uint32_t n_kv,
+                           uint32_t seq) {
+    if (!g->attn_splitk_gqa) return false;
+    /* P2.8: with BOTH kernel switches set the online arm is the one that runs
+     * (it is the more specific request), so this predicate must answer false
+     * there or the encoder's two counters would double-count one dispatch. It
+     * takes head_dim from the state's own config because this entry point is
+     * not given one; g->cfg.head_dim is exactly the head_dim every decode step
+     * of this state dispatches with. With attn_splitk_online false, which is the
+     * default, splitk_online_use is false for every shape and this line changes
+     * nothing about P2.4's through P2.7's behaviour. */
+    if (splitk_online_use(g, n_heads, n_kv, g->cfg.head_dim, seq)) return false;
+    return splitk_gqa_shape_ok(g, n_heads, n_kv, seq);
+}
+
+/* =====================================================================
+ * P2.8: whether a decode step uses the ONLINE-SOFTMAX GQA partial
+ * =====================================================================
+ *
+ * The same three shape/grid questions splitk_gqa_use asks (via the shared
+ * splitk_gqa_shape_ok), plus ONE MORE that is specific to this kernel:
+ *
+ *   head_dim <= SG_TG.
+ *
+ * That is the accumulator-storage boundary, not a tuning choice. The online
+ * kernel keeps its running acc in registers by giving each thread exactly one
+ * output dim, which works while head_dim fits one SG_TG-wide band. Past that
+ * the kernel re-streams the split (and re-reads K) once per band: still exactly
+ * correct, which is why the one-shot entry point accepts it and check_params
+ * does not reject it, but strictly more traffic than the four-pass kernel it is
+ * supposed to beat. Both real shapes are inside the bound (27B head_dim 256 ==
+ * SG_TG, 4B dense 128), so the decline costs surge nothing today.
+ *
+ * NO SEPARATE SPLIT POLICY. The online arm dispatches with
+ * splitk_gqa_n_splits(seq, cap), P2.5's measured GQA policy, because it has the
+ * same grid shape and the same per-threadgroup reuse; whether streaming moves
+ * the saturation point is a MEASUREMENT nobody has taken, and inventing a second
+ * policy without one would be a guess. Noted in
+ * docs/17082026_splitk_gqa_threadgroups.md as an open question.
+ *
+ * OFF BY DEFAULT (attn_splitk_online), so this returns false for every shape
+ * unless SURGE_ATTN_SPLITK_ONLINE=1 was accepted by sg_gpu_state_new. */
+static bool splitk_online_use(const sg_gpu *g, uint32_t n_heads, uint32_t n_kv,
+                              uint32_t hd, uint32_t seq) {
+    if (!g->attn_splitk_online) return false;
+    if (hd == 0 || hd > SG_TG) return false;
+    return splitk_gqa_shape_ok(g, n_heads, n_kv, seq);
 }
 
 /* The same predicate, for the gate (P2.4 fix round 1, review finding I1/M4).
@@ -1280,10 +1395,33 @@ bool sg_gpu_splitk_gqa_selected(const sg_gpu *g, uint32_t n_heads,
 }
 
 /* What enc_attn_splitk actually encoded since the last sg_gpu_state_new, split
- * by kernel (P2.4 fix round 1, review finding I1). Either pointer may be NULL. */
+ * by kernel (P2.4 fix round 1, review finding I1). Either pointer may be NULL.
+ *
+ * P2.8: `gqa` still counts ONLY the four-pass GQA partial. The online arm has
+ * its own counter (sg_gpu_splitk_online_dispatches) so the exact-count
+ * assertions the P2.6/P2.7 gates make keep meaning what they meant. */
 void sg_gpu_splitk_dispatch_counts(const sg_gpu *g, uint64_t *per_head, uint64_t *gqa) {
     if (per_head) *per_head = g ? g->splitk_partial_dispatches : 0;
     if (gqa) *gqa = g ? g->splitk_gqa_dispatches : 0;
+}
+
+/* P2.8, the same predicate the encoder consults, for the gate. It CALLS
+ * splitk_online_use rather than restating it, so a test of the head_dim bound,
+ * of the group-size band or of P2.7's threadgroup floor is a test of the
+ * function that actually picks the kernel. Read-only; NULL g answers false. */
+bool sg_gpu_splitk_online_selected(const sg_gpu *g, uint32_t n_heads,
+                                   uint32_t n_kv_heads, uint32_t head_dim,
+                                   uint32_t seq) {
+    if (!g) return false;
+    return splitk_online_use(g, n_heads, n_kv_heads, head_dim, seq);
+}
+
+/* How many online partials enc_attn_splitk encoded since the last
+ * sg_gpu_state_new. Same vacuity argument as the two counters above: the online
+ * arm's end-to-end A/B compares greedy TOKENS, which agree whether or not the
+ * kernel was ever selected, so a gate has to be able to say that it was. */
+uint64_t sg_gpu_splitk_online_dispatches(const sg_gpu *g) {
+    return g ? g->splitk_online_dispatches : 0;
 }
 
 /* =====================================================================
@@ -1805,19 +1943,22 @@ static bool splitk_sizes(const uint32_t *p, uint64_t *need_q, uint64_t *need_kv,
     return true;
 }
 
-/* The shared body of BOTH split-K partial one-shots (P2.4). The per-head
- * k_attn_decode_splitk_partial and the GQA-shared
- * k_attn_decode_splitk_partial_gqa take the same eight bindings, the same
- * params array, the same buffer sizes and the same score scratch; they differ
- * only in the pipeline and in the grid's y extent (query heads against KV
- * heads). Factored rather than copied so the two cannot drift on a validation
- * rule: every rejection surge.h documents is checked HERE, once.
+/* The shared body of ALL THREE split-K partial one-shots (P2.4, extended by
+ * P2.8). The per-head k_attn_decode_splitk_partial, the GQA-shared
+ * k_attn_decode_splitk_partial_gqa and the online
+ * k_attn_decode_splitk_partial_gqa_online take the same params array, the same
+ * six device buffers and the same buffer sizes; they differ only in the
+ * pipeline, in the grid's y extent (query heads against KV heads) and in
+ * whether they need the score scratch at all. Factored rather than copied so
+ * they cannot drift on a validation rule: every rejection surge.h documents is
+ * checked HERE, once.
  *
- * `kn` is the kernel name for the error messages, `ki` its pipeline index, and
- * `gqa` picks the grid. The arguments are already NULL-checked by the two
- * public entry points below, which do it under their own names. */
+ * `kn` is the kernel name for the error messages, `ki` its pipeline index,
+ * `gqa` picks the grid, and `scratch` says whether buffer 7 exists on this
+ * kernel. The arguments are already NULL-checked by the three public entry
+ * points below, which do it under their own names. */
 static sg_err splitk_partial_run(sg_gpu *g, const char *kn, int ki, bool gqa,
-                                 void *q, void *k, void *v,
+                                 bool scratch, void *q, void *k, void *v,
                                  void *m, void *s, void *acc,
                                  const uint32_t params[8]) {
     sg_err e = check_params(kn, params);
@@ -1880,9 +2021,16 @@ static sg_err splitk_partial_run(sg_gpu *g, const char *kn, int ki, bool gqa,
      * the same bytes, and this kernel is specifically meant to be dispatched
      * from the batched decode encoder alongside kernels that use it. Owning a
      * separate allocation makes that a non-question instead of a rule the next
-     * task has to remember. */
-    e = splitk_scratch_ensure(g, need_scratch);
-    if (sg_failed(e)) return e;
+     * task has to remember.
+     *
+     * P2.8's online partial has no score row at all, so it does not ask for the
+     * allocation and does not bind it below. That is the whole memory saving of
+     * the streaming form, and it is expressed as "this arm never mentions the
+     * buffer" rather than as a smaller size request. */
+    if (scratch) {
+        e = splitk_scratch_ensure(g, need_scratch);
+        if (sg_failed(e)) return e;
+    }
 
     __block sg_err rc = SG_OK;
     @autoreleasepool {
@@ -1898,8 +2046,11 @@ static sg_err splitk_partial_run(sg_gpu *g, const char *kn, int ki, bool gqa,
                        atIndex:(NSUInteger)(3 + i)];
             }
             [enc setBytes:params length:8 * sizeof(uint32_t) atIndex:6];
-            /* The DEDICATED split-K scratch, not g->scratch (see above). */
-            [enc setBuffer:g->splitk_scratch offset:0 atIndex:7];
+            /* The DEDICATED split-K scratch, not g->scratch (see above), and
+             * only for the two kernels that declare it: the online partial has
+             * seven bindings and binding an eighth would be a claim about a
+             * buffer it does not have. */
+            if (scratch) [enc setBuffer:g->splitk_scratch offset:0 atIndex:7];
             /* The SG_K_HEADS2D grid: x = split, y = query head (per-head
              * partial) or KV head (GQA partial), matching the kernel's
              * tg.x / tg.y. Both grid attributes are declared uint2 there, the
@@ -1930,7 +2081,8 @@ sg_err sg_gpu_run_attn_splitk_partial(sg_gpu *g, void *q, void *k, void *v,
         return (sg_err){"gpu: sg_gpu_run_attn_splitk_partial got a NULL argument"};
     }
     return splitk_partial_run(g, "k_attn_decode_splitk_partial",
-                              KI_ATTN_SPLITK_PARTIAL, false, q, k, v, m, s, acc, params);
+                              KI_ATTN_SPLITK_PARTIAL, false, true,
+                              q, k, v, m, s, acc, params);
 }
 
 /* P2.4. The GQA-shared twin: identical arguments, identical validation,
@@ -1946,7 +2098,29 @@ sg_err sg_gpu_run_attn_splitk_partial_gqa(sg_gpu *g, void *q, void *k, void *v,
         return (sg_err){"gpu: sg_gpu_run_attn_splitk_partial_gqa got a NULL argument"};
     }
     return splitk_partial_run(g, "k_attn_decode_splitk_partial_gqa",
-                              KI_ATTN_SPLITK_PARTIAL_GQA, true, q, k, v, m, s, acc, params);
+                              KI_ATTN_SPLITK_PARTIAL_GQA, true, true,
+                              q, k, v, m, s, acc, params);
+}
+
+/* P2.8. The ONLINE-SOFTMAX twin of the GQA partial: identical arguments,
+ * identical validation, identical output LAYOUT, and (unlike the pair above)
+ * NOT identical output bytes, because streaming reorders the exponential sums.
+ * See surge.h for what is and is not promised, and note what this entry point
+ * does NOT touch: g->splitk_scratch is neither grown nor bound, so this is also
+ * the dispatch that proves the streaming form needs no score row.
+ *
+ * Separate entry point rather than a flag in the params array for P2.4's
+ * reason: the array is contracted to serve the combine dispatch too, and the
+ * per-op gate's job is to run the arms on the SAME inputs and compare. */
+sg_err sg_gpu_run_attn_splitk_partial_gqa_online(sg_gpu *g, void *q, void *k, void *v,
+                                                 void *m, void *s, void *acc,
+                                                 const uint32_t params[8]) {
+    if (!g || !q || !k || !v || !m || !s || !acc || !params) {
+        return (sg_err){"gpu: sg_gpu_run_attn_splitk_partial_gqa_online got a NULL argument"};
+    }
+    return splitk_partial_run(g, "k_attn_decode_splitk_partial_gqa_online",
+                              KI_ATTN_SPLITK_PARTIAL_GQA_ONLINE, true, false,
+                              q, k, v, m, s, acc, params);
 }
 
 sg_err sg_gpu_run_attn_splitk_combine(sg_gpu *g, void *m, void *s, void *acc,
@@ -2667,14 +2841,24 @@ static void enc_attn_splitk(sg_enc *E, void *q, void *k, void *v, void *out,
      * threadgroup floor, so the SAME step can pick the per-head partial early
      * in a sequence and the GQA one later. That is why the two dispatch
      * counters below are BOTH nonzero over a long run with the switch on. */
-    bool gqa = splitk_gqa_use(g, p[0], p[1], p[3]);
+    /* P2.8: THREE arms now, and the online one is a GQA arm. splitk_gqa_use
+     * already answers false when the online kernel is selected (see its body),
+     * so the two predicates are mutually exclusive and `gqa` below is purely
+     * "is the grid one threadgroup per KV head", which both GQA kernels are. */
+    bool online = splitk_online_use(g, p[0], p[1], p[2], p[3]);
+    bool gqa = online || splitk_gqa_use(g, p[0], p[1], p[3]);
     NSUInteger rows = gqa ? (NSUInteger)p[1] : n_heads;
-    /* Record WHICH kernel this dispatch is, for the gate (finding I1): the two
-     * are contracted to produce the same bytes, so nothing downstream can tell
-     * them apart, and a gate that cannot either would pass while the GQA path
-     * quietly stopped being selected. Diagnostics only, read through
-     * sg_gpu_splitk_dispatch_counts; no computed value depends on them. */
-    if (gqa) g->splitk_gqa_dispatches++; else g->splitk_partial_dispatches++;
+    /* Record WHICH kernel this dispatch is, for the gate (finding I1): the
+     * four-pass pair is contracted to produce the same bytes, so nothing
+     * downstream can tell them apart, and a gate that cannot either would pass
+     * while the GQA path quietly stopped being selected. The online arm's own
+     * A/B has the same problem for a different reason: it agrees on greedy
+     * TOKENS by design, so only a counter can show it ran. Diagnostics only,
+     * read through sg_gpu_splitk_dispatch_counts and
+     * sg_gpu_splitk_online_dispatches; no computed value depends on them. */
+    if (online) g->splitk_online_dispatches++;
+    else if (gqa) g->splitk_gqa_dispatches++;
+    else g->splitk_partial_dispatches++;
 
     /* Task P2.5: p[6] as the caller built it is splitk_use's PER-HEAD
      * n_splits (splitk_n_splits(seq)); the GQA kernel saturates at a lower
@@ -2697,12 +2881,16 @@ static void enc_attn_splitk(sg_enc *E, void *q, void *k, void *v, void *out,
      * sg_gpu_splitk_gqa_n_splits_at reports exactly it. */
     uint32_t pd[8];
     memcpy(pd, p, sizeof pd);
+    /* P2.8: the online arm is a GQA arm and takes the SAME measured GQA policy;
+     * `gqa` is true for it, so this line covers both without a second case. */
     if (gqa) pd[6] = splitk_gqa_n_splits(p[3], splitk_gqa_cap_of(g));
     NSUInteger n_splits = (NSUInteger)pd[6];
 
-    /* The partial: q=0, kc=1, vc=2, m=3, s=4, acc=5, params=6, scores=7. */
-    [e setComputePipelineState:g->pipes[gqa ? KI_ATTN_SPLITK_PARTIAL_GQA
-                                            : KI_ATTN_SPLITK_PARTIAL]];
+    /* The partial: q=0, kc=1, vc=2, m=3, s=4, acc=5, params=6, scores=7 (the
+     * online partial has no buffer 7, see below). */
+    int partial_ki = online ? KI_ATTN_SPLITK_PARTIAL_GQA_ONLINE
+                            : (gqa ? KI_ATTN_SPLITK_PARTIAL_GQA : KI_ATTN_SPLITK_PARTIAL);
+    [e setComputePipelineState:g->pipes[partial_ki]];
     [e setBuffer:bufof(q) offset:(NSUInteger)offof(q) atIndex:0];
     [e setBuffer:bufof(k) offset:(NSUInteger)offof(k) atIndex:1];
     [e setBuffer:bufof(v) offset:(NSUInteger)offof(v) atIndex:2];
@@ -2710,7 +2898,12 @@ static void enc_attn_splitk(sg_enc *E, void *q, void *k, void *v, void *out,
     [e setBuffer:bufof(g->b_sk_s) offset:(NSUInteger)offof(g->b_sk_s) atIndex:4];
     [e setBuffer:bufof(g->b_sk_acc) offset:(NSUInteger)offof(g->b_sk_acc) atIndex:5];
     [e setBytes:pd length:8 * sizeof(uint32_t) atIndex:6];
-    [e setBuffer:g->splitk_scratch offset:0 atIndex:7];
+    /* Buffer 7 exists on the two four-pass partials only. The online kernel
+     * holds its running (m, s, acc) in registers and threadgroup memory, so the
+     * split-K score scratch is not part of its signature and is not bound here
+     * (it stays ALLOCATED, because the other two arms of the same run still use
+     * it; see the note in surge.h on what dropping it would save). */
+    if (!online) [e setBuffer:g->splitk_scratch offset:0 atIndex:7];
     /* SG_K_HEADS2D: x = split, y = query head (per-head partial) or KV head
      * (GQA partial), matching the kernel's tg.x / tg.y. gpu_grid's (groups,
      * elems) pair cannot carry two group dimensions (it says so at its default
@@ -3201,10 +3394,12 @@ static void gpu_free_state(sg_gpu *g) {
     g->splitk_max_splits = 0;
     g->attn_splitk = false;
     g->attn_splitk_gqa = false;    /* P2.4: re-read from the env on the next state */
+    g->attn_splitk_online = false; /* P2.8: same, SURGE_ATTN_SPLITK_ONLINE */
     g->splitk_gqa_cap = 0;         /* P2.6: 0 == "the measured default", see
                                     * splitk_gqa_cap_of; re-read on the next state */
     g->splitk_partial_dispatches = 0;
     g->splitk_gqa_dispatches = 0;
+    g->splitk_online_dispatches = 0;
 
     void *shared[] = { g->b_x, g->b_h, g->b_r, g->b_qg, g->b_ctx, g->b_ffg,
                        g->b_ffu, g->b_qkv, g->b_ab, g->b_gates, g->b_y,
@@ -3548,6 +3743,41 @@ sg_err sg_gpu_state_new(sg_gpu *g, const sg_model *m, uint32_t max_ctx) {
     }
     g->attn_splitk_gqa = gqa_on && g->attn_splitk;
 
+    /* Task P2.8: SURGE_ATTN_SPLITK_ONLINE selects the ONLINE-SOFTMAX GQA
+     * partial, k_attn_decode_splitk_partial_gqa_online, once split-K itself is
+     * on. DEFAULT 0. It is a peer of SURGE_ATTN_SPLITK_GQA, not a modifier of
+     * it: the online kernel is already GQA-shared, and if both are set the
+     * online one runs (splitk_gqa_use yields to it).
+     *
+     * REJECTED, NOT IGNORED, on anything that is not exactly "0" or "1", which
+     * is SURGE_SPLITK_GQA_CAP's rule below rather than the warn-and-default rule
+     * the two switches above use, and for the same reason P2.6 gave: the gate
+     * for this switch is an A/B, and the two arms of an A/B agree perfectly when
+     * the "on" arm was silently never turned on. A typo ("on", "true", "yes",
+     * "1 ") would make that gate pass vacuously, so it fails loudly here
+     * instead. There is nothing lost by refusing: the only values that mean
+     * anything are the two spellings accepted. */
+    const char *on_env = getenv("SURGE_ATTN_SPLITK_ONLINE");
+    bool online_on = false;
+    if (on_env && on_env[0] != '\0') {
+        if (strcmp(on_env, "1") == 0) {
+            online_on = true;
+        } else if (strcmp(on_env, "0") != 0) {
+            gpu_free_state(g);
+            return gpu_errf("gpu: SURGE_ATTN_SPLITK_ONLINE='%s' must be exactly 0 or 1 "
+                            "(default 0; it selects the online-softmax split-K partial, "
+                            "and a silently ignored value would make its A/B vacuous)",
+                            on_env);
+        }
+    }
+    g->attn_splitk_online = online_on && g->attn_splitk;
+    if (g->attn_splitk_online) {
+        fprintf(stderr, "gpu: SURGE_ATTN_SPLITK_ONLINE=1, decode attention uses the "
+                        "online-softmax GQA split-K partial where the policy admits it "
+                        "(head_dim <= %u, GQA group in [2, %u], >= %u threadgroups)\n",
+                SG_TG, SG_SPLITK_GQA_MAX, SG_SPLITK_GQA_MIN_TG);
+    }
+
     /* Task P2.6: SURGE_SPLITK_GQA_CAP overrides the GQA split policy's measured
      * saturation cap (SG_SPLITK_GQA_N_SPLITS_CAP == 256). Unset keeps the
      * measured value, which is the shipped policy and the only one anyone
@@ -3599,6 +3829,7 @@ sg_err sg_gpu_state_new(sg_gpu *g, const sg_model *m, uint32_t max_ctx) {
      * did". */
     g->splitk_partial_dispatches = 0;
     g->splitk_gqa_dispatches = 0;
+    g->splitk_online_dispatches = 0;
     g->splitk_max_splits = 0;
 
     uint64_t half = 0;

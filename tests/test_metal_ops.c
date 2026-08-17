@@ -3202,6 +3202,386 @@ static void metal_attn_splitk_gqa_bit_identical(void) {
     splitk_gqa_n_splits_policy();
 }
 
+/* --------------------------------------------------------------------
+ * P2.8: k_attn_decode_splitk_partial_gqa_online (online softmax)
+ * --------------------------------------------------------------------
+ *
+ * WRITTEN WITH THE GPU HELD BY A 256K BENCHMARK and never executed when
+ * committed, exactly like the P2.2 and P2.4 blocks above.
+ *
+ * THE BAR IS NOT BYTE-IDENTITY AND MUST NOT BE. The online kernel replaces the
+ * four-pass kernel's device-memory score row with a running (m, s, acc) that is
+ * rescaled by exp(m_old - m_new) as each 256-key tile is folded in. That
+ * REORDERS the exponential sums, so s and acc differ from the four-pass kernels
+ * in the last bits whenever a split spans more than one tile. Gating on memcmp
+ * here would be gating on a property the design does not have; the correctness
+ * standard is the P2.2 one, agreement with sg_ref_attn_decode_splitk (and with
+ * sg_ref_attn_decode) to float rounding, plus determinism.
+ *
+ * THREE THINGS ARE STILL EXACT, and each is asserted below because each would
+ * hide a real bug if it drifted:
+ *
+ *   1. `m`. A maximum is order-independent, and the online kernel gives thread
+ *      lid the SAME subset of the split's keys the four-pass kernel does, so
+ *      every m must be bit-identical to the four-pass GQA kernel's. If it is
+ *      not, the streaming loop visited a different key set, which no tolerance
+ *      should absorb. (The one theoretical exception is a tie between +0.0 and
+ *      -0.0 scores, where the fold's `b > a` keeps whichever came first; a dot
+ *      product of hundreds of random f32s hitting exactly zero does not happen
+ *      in this fixture.)
+ *   2. The empty-split encoding, m = -INFINITY / s = 0 / acc = 0, checked
+ *      structurally by splitk_check_partials, which every shape below reaches
+ *      because its split list ends with a count greater than seq.
+ *   3. Determinism: repeated dispatches must be byte-identical to each other.
+ *
+ * The s/acc/out byte differences against the four-pass kernel are REPORTED
+ * rather than asserted, because the interesting number is how small they are,
+ * and because "zero differences" is a legitimate outcome for the shapes whose
+ * splits fit one tile (one key per lane, same trees, same order). */
+static void online_report_diff(const char *label, const float *a, const float *b, size_t n) {
+    size_t ndiff = 0;
+    double worst = 0.0;
+    for (size_t i = 0; i < n; i++) {
+        if (memcmp(&a[i], &b[i], sizeof(float)) != 0) {
+            ndiff++;
+            double d = fabs((double)a[i] - (double)b[i]);
+            if (d > worst) worst = d;
+        }
+    }
+    fprintf(stderr, "   %-46s %llu/%llu floats differ, worst |delta| %.3e\n",
+            label, (unsigned long long)ndiff, (unsigned long long)n, worst);
+}
+
+/* One (shape, q_stride) sweep for the online partial: per n_splits, run it plus
+ * the shared combine, compare the result against BOTH CPU oracles, check the
+ * partial structure, and compare m bit for bit against the four-pass GQA kernel
+ * on the same inputs.
+ *
+ * THE SPLIT LIST is P2.4's, including the per-shape count above seq for the
+ * empty-split case. The low counts matter more here than they did there: with
+ * n_splits 1 a 1000-key sequence is FOUR tiles in one split, which is the only
+ * regime where the rescale factor is ever anything but an exact 1.0, and
+ * therefore the only regime this kernel's streaming update is really under test.
+ * With n_splits 7 the same sequence gives ~143 keys per split, one tile, where
+ * the online kernel should land on the four-pass kernel's exact bytes. */
+static void splitk_online_shape(const char *what, uint32_t n_heads, uint32_t n_kv,
+                                uint32_t hd, uint32_t seq, uint32_t q_stride,
+                                uint32_t seed) {
+    const uint32_t splits[] = {1, 2, 3, 7, 64, 257, seq + seq / 4 + 1};
+    uint32_t out_n = n_heads * hd;
+    uint64_t kvn = (uint64_t)seq * n_kv * hd;
+    float scale = (float)(1.0 / sqrt((double)hd));
+
+    lcg_seed(seed);
+    float *q = xmalloc((size_t)n_heads * q_stride * sizeof *q);
+    for (uint32_t h = 0; h < n_heads; h++) {
+        float *qh = q + (size_t)h * q_stride;
+        for (uint32_t i = 0; i < hd; i++) qh[i] = lcg_next();
+        /* Not query data. NaN-poisoned for P2.4's reason: the online kernel also
+         * reaches head h0+j through a j*q_stride stride rather than its own base
+         * pointer, so an off-by-one there turns every comparison into NaN. */
+        for (uint32_t i = hd; i < q_stride; i++) qh[i] = (float)NAN;
+    }
+
+    uint16_t *k16 = xmalloc((size_t)kvn * sizeof *k16);
+    uint16_t *v16 = xmalloc((size_t)kvn * sizeof *v16);
+    float *k32 = xmalloc((size_t)kvn * sizeof *k32);
+    float *v32 = xmalloc((size_t)kvn * sizeof *v32);
+    for (uint64_t i = 0; i < kvn; i++) {
+        k16[i] = sg_f32_to_f16(lcg_next() * 2.0f);
+        v16[i] = sg_f32_to_f16(lcg_next() * 2.0f);
+        k32[i] = sg_f16_to_f32(k16[i]);   /* the f16 rounding, widened back exactly */
+        v32[i] = sg_f16_to_f32(v16[i]);
+    }
+
+    float *want_direct = xmalloc(out_n * sizeof *want_direct);
+    sg_ref_attn_decode(q, k32, v32, n_heads, n_kv, hd, seq, q_stride, scale, want_direct);
+
+    gbuf qb = gb_from(q, (uint64_t)n_heads * q_stride);
+    gbuf16 kb = gb16_new(kvn), vb = gb16_new(kvn);
+    memcpy(kb.h, k16, (size_t)kvn * sizeof(uint16_t));
+    memcpy(vb.h, v16, (size_t)kvn * sizeof(uint16_t));
+
+    float *want_split = xmalloc(out_n * sizeof *want_split);
+    for (size_t si = 0; si < sizeof splits / sizeof splits[0]; si++) {
+        uint32_t ns = splits[si];
+        uint32_t p[8] = {n_heads, n_kv, hd, seq, q_stride, f32_bits(scale), ns, 0};
+        uint64_t parts = (uint64_t)n_heads * ns;
+        gbuf m1 = gb_new(parts), s1 = gb_new(parts), a1 = gb_new(parts * hd);
+        gbuf m2 = gb_new(parts), s2 = gb_new(parts), a2 = gb_new(parts * hd);
+        gbuf o1 = gb_new(out_n), o2 = gb_new(out_n);
+        gb_poison(&m1); gb_poison(&s1); gb_poison(&a1); gb_poison(&o1);
+        gb_poison(&m2); gb_poison(&s2); gb_poison(&a2); gb_poison(&o2);
+
+        /* THE ONLINE PARTIAL RUNS FIRST, P2.4's finding-M2 ordering for a
+         * stronger reason here: it is the kernel under test, and it must not be
+         * able to pass by reading anything the four-pass kernel left in the
+         * shared splitk_scratch. It does not bind that buffer at all, so running
+         * it first means the buffer may still hold the PREVIOUS iteration's
+         * bytes for a different shape when it runs. */
+        sg_err e = sg_gpu_run_attn_splitk_partial_gqa_online(g_gpu, qb.b, kb.b, vb.b,
+                                                            m2.b, s2.b, a2.b, p);
+        tt_assert(!sg_failed(e), "splitk online partial (%s, n_splits %u): %s",
+                  what, ns, e.msg ? e.msg : "ok");
+        if (!sg_failed(e)) {
+            e = sg_gpu_run_attn_splitk_combine(g_gpu, m2.b, s2.b, a2.b, o2.b, p);
+            tt_assert(!sg_failed(e), "splitk combine after online (%s, n_splits %u): %s",
+                      what, ns, e.msg ? e.msg : "ok");
+        }
+        if (!sg_failed(e)) {
+            e = sg_gpu_run_attn_splitk_partial_gqa(g_gpu, qb.b, kb.b, vb.b,
+                                                  m1.b, s1.b, a1.b, p);
+            tt_assert(!sg_failed(e), "splitk four-pass gqa partial (%s, n_splits %u): %s",
+                      what, ns, e.msg ? e.msg : "ok");
+        }
+        if (!sg_failed(e)) {
+            e = sg_gpu_run_attn_splitk_combine(g_gpu, m1.b, s1.b, a1.b, o1.b, p);
+            tt_assert(!sg_failed(e), "splitk combine after four-pass (%s, n_splits %u): %s",
+                      what, ns, e.msg ? e.msg : "ok");
+        }
+        if (!sg_failed(e)) {
+            char lbl[128];
+
+            /* Nothing below can be read out of a buffer the dispatch never
+             * wrote (P2.4 finding M1). m and s are strict: m is finite or
+             * -INFINITY and s is 0.0 or >= 1.0, neither of which can coincide
+             * with the poison word. */
+            snprintf(lbl, sizeof lbl, "online %s K=%-3u m", what, ns);
+            gqa_not_poison(lbl, m2.h, (size_t)parts, true);
+            snprintf(lbl, sizeof lbl, "online %s K=%-3u s", what, ns);
+            gqa_not_poison(lbl, s2.h, (size_t)parts, true);
+            snprintf(lbl, sizeof lbl, "online %s K=%-3u acc", what, ns);
+            gqa_not_poison(lbl, a2.h, (size_t)(parts * hd), false);
+            snprintf(lbl, sizeof lbl, "online %s K=%-3u out", what, ns);
+            gqa_not_poison(lbl, o2.h, (size_t)out_n, false);
+
+            /* The empty-split encoding and the s >= 1.0 invariant, structurally. */
+            snprintf(lbl, sizeof lbl, "online partials (%s, K=%u)", what, ns);
+            splitk_check_partials(lbl, m2.h, s2.h, a2.h, n_heads, hd, seq, ns);
+
+            /* m is exact (see the block comment). This is the assertion that
+             * proves the streaming loop covered the same keys. */
+            snprintf(lbl, sizeof lbl, "online %s K=%-3u m vs four-pass", what, ns);
+            gqa_same_bytes(lbl, m1.h, m2.h, (size_t)parts);
+
+            /* The primary correctness gate: the CPU oracles. */
+            sg_ref_attn_decode_splitk(q, k32, v32, n_heads, n_kv, hd, seq,
+                                      q_stride, scale, ns, want_split);
+            snprintf(lbl, sizeof lbl, "online %s K=%-3u vs ref_splitk", what, ns);
+            check_rel(lbl, o2.h, want_split, out_n);
+            snprintf(lbl, sizeof lbl, "online %s K=%-3u vs ref_decode", what, ns);
+            check_rel(lbl, o2.h, want_direct, out_n);
+
+            /* Reported, not asserted: how far the reordered sums actually moved.
+             * Only for the first two split counts, which is where a split spans
+             * several tiles and the rescale is live; printing all seven per
+             * shape would bury the accuracy lines above. */
+            if (si < 2) {
+                snprintf(lbl, sizeof lbl, "online %s K=%-3u s vs four-pass", what, ns);
+                online_report_diff(lbl, s1.h, s2.h, (size_t)parts);
+                snprintf(lbl, sizeof lbl, "online %s K=%-3u out vs four-pass", what, ns);
+                online_report_diff(lbl, o1.h, o2.h, (size_t)out_n);
+            }
+        }
+
+        gb_free(&m1); gb_free(&s1); gb_free(&a1); gb_free(&o1);
+        gb_free(&m2); gb_free(&s2); gb_free(&a2); gb_free(&o2);
+    }
+
+    gb_free(&qb); gb16_free(&kb); gb16_free(&vb);
+    free(q); free(k16); free(v16); free(k32); free(v32);
+    free(want_direct); free(want_split);
+}
+
+/* 100 reruns of the online partial + combine on identical inputs must be
+ * byte-identical to each other. This is the gate that matters most for this
+ * kernel: the four-pass kernels could lean on a memcmp against each other,
+ * while everything the online form changes (a running accumulator, a rescale
+ * every thread recomputes, a transpose through threadgroup memory) is exactly
+ * the kind of change that reaches for an atomic or a simd_sum. The shape is
+ * P2.4's, and n_splits 7 over seq 1000 also gives a split that is one tile plus
+ * a remainder. */
+static void splitk_online_determinism(void) {
+    const uint32_t n_heads = 32, n_kv = 8, hd = 128, seq = 1000, q_stride = 2 * hd;
+    const uint32_t ns = 7;
+    uint32_t out_n = n_heads * hd;
+    uint64_t kvn = (uint64_t)seq * n_kv * hd;
+    float scale = (float)(1.0 / sqrt((double)hd));
+
+    lcg_seed(0x7B2Eu);
+    float *q = xmalloc((size_t)n_heads * q_stride * sizeof *q);
+    for (uint32_t i = 0; i < n_heads * q_stride; i++) q[i] = lcg_next();
+    uint16_t *k16 = xmalloc((size_t)kvn * sizeof *k16);
+    uint16_t *v16 = xmalloc((size_t)kvn * sizeof *v16);
+    for (uint64_t i = 0; i < kvn; i++) {
+        k16[i] = sg_f32_to_f16(lcg_next() * 2.0f);
+        v16[i] = sg_f32_to_f16(lcg_next() * 2.0f);
+    }
+
+    gbuf qb = gb_from(q, (uint64_t)n_heads * q_stride);
+    gbuf16 kb = gb16_new(kvn), vb = gb16_new(kvn);
+    memcpy(kb.h, k16, (size_t)kvn * sizeof(uint16_t));
+    memcpy(vb.h, v16, (size_t)kvn * sizeof(uint16_t));
+    gbuf mb = gb_new((uint64_t)n_heads * ns);
+    gbuf sb = gb_new((uint64_t)n_heads * ns);
+    gbuf ab = gb_new((uint64_t)n_heads * ns * hd);
+    gbuf ob = gb_new(out_n);
+    uint32_t p[8] = {n_heads, n_kv, hd, seq, q_stride, f32_bits(scale), ns, 0};
+
+    size_t ms_bytes = (size_t)n_heads * ns * sizeof(float);
+    size_t acc_bytes = (size_t)n_heads * ns * hd * sizeof(float);
+    size_t out_bytes = (size_t)out_n * sizeof(float);
+    uint8_t *first_m = xmalloc(ms_bytes), *first_s = xmalloc(ms_bytes);
+    uint8_t *first_acc = xmalloc(acc_bytes), *first_out = xmalloc(out_bytes);
+    uint32_t mism_m = 0, mism_s = 0, mism_acc = 0, mism_out = 0;
+
+    for (int rep = 0; rep < 100; rep++) {
+        gb_poison(&mb); gb_poison(&sb); gb_poison(&ab); gb_poison(&ob);
+        sg_err e = sg_gpu_run_attn_splitk_partial_gqa_online(g_gpu, qb.b, kb.b, vb.b,
+                                                            mb.b, sb.b, ab.b, p);
+        if (!sg_failed(e)) e = sg_gpu_run_attn_splitk_combine(g_gpu, mb.b, sb.b, ab.b, ob.b, p);
+        tt_assert(!sg_failed(e), "splitk online determinism rep %d: %s", rep,
+                  e.msg ? e.msg : "ok");
+        if (sg_failed(e)) break;
+        if (rep == 0) {
+            memcpy(first_m, mb.h, ms_bytes);
+            memcpy(first_s, sb.h, ms_bytes);
+            memcpy(first_acc, ab.h, acc_bytes);
+            memcpy(first_out, ob.h, out_bytes);
+        } else {
+            if (memcmp(first_m, mb.h, ms_bytes) != 0) mism_m++;
+            if (memcmp(first_s, sb.h, ms_bytes) != 0) mism_s++;
+            if (memcmp(first_acc, ab.h, acc_bytes) != 0) mism_acc++;
+            if (memcmp(first_out, ob.h, out_bytes) != 0) mism_out++;
+        }
+    }
+    tt_assert(mism_m == 0 && mism_s == 0 && mism_acc == 0 && mism_out == 0,
+              "online split-K partial over 99 reruns: m differed on %u, s on %u, "
+              "acc on %u, out on %u", mism_m, mism_s, mism_acc, mism_out);
+    if (mism_m == 0 && mism_s == 0 && mism_acc == 0 && mism_out == 0) {
+        fprintf(stderr, "   online split-K partial: m/s/acc/out byte-identical "
+                        "over 100 reruns\n");
+    }
+
+    free(first_m); free(first_s); free(first_acc); free(first_out);
+    free(q); free(k16); free(v16);
+    gb_free(&qb); gb16_free(&kb); gb16_free(&vb);
+    gb_free(&mb); gb_free(&sb); gb_free(&ab); gb_free(&ob);
+}
+
+/* The online entry point must reject everything the other two do: all three
+ * share splitk_partial_run, so this checks they are still wired to the SAME
+ * validation rather than to a second copy of it. */
+static void splitk_online_rejects_bad_arguments(void) {
+    const uint32_t n_heads = 4, n_kv = 2, hd = 8, seq = 16, ns = 3;
+    uint32_t good[8] = {n_heads, n_kv, hd, seq, hd, f32_bits(0.35f), ns, 0};
+    gbuf qb = gb_new((uint64_t)n_heads * hd);
+    gbuf16 kb = gb16_new((uint64_t)seq * n_kv * hd), vb = gb16_new((uint64_t)seq * n_kv * hd);
+    gbuf mb = gb_new((uint64_t)n_heads * ns), sb = gb_new((uint64_t)n_heads * ns);
+    gbuf ab = gb_new((uint64_t)n_heads * ns * hd), ob = gb_new((uint64_t)n_heads * hd);
+    sg_err e;
+
+    e = sg_gpu_run_attn_splitk_partial_gqa_online(g_gpu, NULL, kb.b, vb.b, mb.b, sb.b,
+                                                 ab.b, good);
+    tt_assert(sg_failed(e), "splitk online partial should reject a NULL q");
+
+    uint32_t zero_k[8]; memcpy(zero_k, good, sizeof good); zero_k[6] = 0;
+    e = sg_gpu_run_attn_splitk_partial_gqa_online(g_gpu, qb.b, kb.b, vb.b, mb.b, sb.b,
+                                                 ab.b, zero_k);
+    tt_assert(sg_failed(e), "splitk online partial should reject n_splits == 0");
+
+    uint32_t bad_gqa[8]; memcpy(bad_gqa, good, sizeof good); bad_gqa[1] = 3;
+    e = sg_gpu_run_attn_splitk_partial_gqa_online(g_gpu, qb.b, kb.b, vb.b, mb.b, sb.b,
+                                                 ab.b, bad_gqa);
+    tt_assert(sg_failed(e),
+              "splitk online partial should reject n_heads not a multiple of n_kv");
+
+    uint32_t bad_stride[8]; memcpy(bad_stride, good, sizeof good); bad_stride[4] = hd - 1;
+    e = sg_gpu_run_attn_splitk_partial_gqa_online(g_gpu, qb.b, kb.b, vb.b, mb.b, sb.b,
+                                                 ab.b, bad_stride);
+    tt_assert(sg_failed(e), "splitk online partial should reject q_stride < head_dim");
+
+    uint32_t big_k[8]; memcpy(big_k, good, sizeof good); big_k[6] = ns + 1;
+    e = sg_gpu_run_attn_splitk_partial_gqa_online(g_gpu, qb.b, kb.b, vb.b, mb.b, sb.b,
+                                                 ab.b, big_k);
+    tt_assert(sg_failed(e),
+              "splitk online partial should reject buffers sized for fewer splits");
+
+    e = sg_gpu_run_attn_splitk_partial_gqa_online(g_gpu, qb.b, kb.b, vb.b, mb.b, mb.b,
+                                                 ab.b, good);
+    tt_assert(sg_failed(e), "splitk online partial should reject m and s being one buffer");
+
+    e = sg_gpu_run_op(g_gpu, "k_attn_decode_splitk_partial_gqa_online", qb.b, kb.b,
+                      ob.b, good);
+    tt_assert(sg_failed(e),
+              "sg_gpu_run_op should refuse k_attn_decode_splitk_partial_gqa_online");
+
+    gb_free(&qb); gb16_free(&kb); gb16_free(&vb);
+    gb_free(&mb); gb_free(&sb); gb_free(&ab); gb_free(&ob);
+}
+
+/* The DEFAULT, asserted rather than assumed: with no state created on this gpu
+ * (so SURGE_ATTN_SPLITK_ONLINE was never read and attn_splitk_online is false),
+ * the decode path must never select the online kernel, for any shape, including
+ * the two real ones at a depth where every other condition is satisfied. This is
+ * the "off by default" claim as a check instead of a comment; the switched-on
+ * behaviour needs a loaded model and lives in tests/test_gpu_fwd.c. */
+static void splitk_online_off_by_default(void) {
+    struct { const char *shape; uint32_t n_heads, n_kv, hd, seq; } cases[] = {
+        { "27B 24h/4kv/256d @262144", 24, 4, 256, 262144 },
+        { "4B  32h/8kv/128d @262144", 32, 8, 128, 262144 },
+        { "27B 24h/4kv/256d @16384",  24, 4, 256, 16384  },
+    };
+    for (size_t i = 0; i < sizeof cases / sizeof cases[0]; i++) {
+        bool sel = sg_gpu_splitk_online_selected(g_gpu, cases[i].n_heads, cases[i].n_kv,
+                                                 cases[i].hd, cases[i].seq);
+        tt_assert(!sel, "online split-K must be OFF by default, but %s reported selected",
+                  cases[i].shape);
+    }
+    tt_assert(sg_gpu_splitk_online_selected(NULL, 24, 4, 256, 262144) == false,
+              "sg_gpu_splitk_online_selected(NULL, ...) must answer false");
+    tt_assert(sg_gpu_splitk_online_dispatches(g_gpu) == 0,
+              "no decode step ran on this gpu, so the online dispatch count must be 0");
+    tt_assert(sg_gpu_splitk_online_dispatches(NULL) == 0,
+              "sg_gpu_splitk_online_dispatches(NULL) must answer 0");
+}
+
+static void metal_attn_splitk_online_matches_ref(void) {
+    /* Shape coverage, and what each row is here to reach:
+     *   the two REAL decode shapes at both q_stride conventions (repeat 4 with
+     *     head_dim 128, repeat 6 with head_dim 256 == SG_TG, the widest head_dim
+     *     that keeps the running accumulator in one register per head);
+     *   repeat 1 through 8, one shape each, so every arm of the kernel's
+     *     switch(repeat) is dispatched (P2.4's finding I2 applies verbatim: the
+     *     arms are near-duplicates and only a dispatch at that exact group size
+     *     can catch a copy-paste in one of them);
+     *   repeat 16, PAST SG_SPLITK_GQA_MAX, so the one-head-at-a-time default arm
+     *     runs and must still be correct;
+     *   head_dim 320 > SG_TG, the ONE regime where the dbase loop runs twice and
+     *     the kernel re-streams the split per band of output dims. The policy
+     *     declines that shape for the decode path, but the kernel must still
+     *     answer correctly, and the second band is deliberately PARTIAL (320 =
+     *     256 + 64), so only 64 of 256 threads own an output dim in it.
+     * seq 1000 with n_splits 1 gives four tiles in one split, which is where the
+     * rescale is live; every row also gets a split count above its seq, so the
+     * empty-split encoding is exercised at every group size. */
+    splitk_online_shape("32x8x128 seq200 dense r4", 32, 8, 128, 200, 128, 0x7C0A1u);
+    splitk_online_shape("32x8x128 seq1000 gated r4", 32, 8, 128, 1000, 256, 0x7C0A2u);
+    splitk_online_shape("24x4x256 seq1000 dense r6", 24, 4, 256, 1000, 256, 0x7C0A3u);
+    splitk_online_shape("24x4x256 seq1000 gated r6", 24, 4, 256, 1000, 512, 0x7C0A4u);
+    splitk_online_shape("8x8x64 seq300 r1", 8, 8, 64, 300, 64, 0x7C0A5u);
+    splitk_online_shape("4x2x32 seq300 r2", 4, 2, 32, 300, 32, 0x7C0A6u);
+    splitk_online_shape("6x2x64 seq300 r3", 6, 2, 64, 300, 128, 0x7C0A7u);
+    splitk_online_shape("10x2x32 seq300 gated r5", 10, 2, 32, 300, 64, 0x7C0A8u);
+    splitk_online_shape("14x2x32 seq300 r7", 14, 2, 32, 300, 32, 0x7C0A9u);
+    splitk_online_shape("16x2x32 seq300 r8", 16, 2, 32, 300, 32, 0x7C0AAu);
+    splitk_online_shape("16x1x64 seq300 r16", 16, 1, 64, 300, 64, 0x7C0ABu);
+    splitk_online_shape("8x2x320 seq600 r4 hd>SG_TG", 8, 2, 320, 600, 320, 0x7C0ACu);
+    splitk_online_determinism();
+    splitk_online_rejects_bad_arguments();
+    splitk_online_off_by_default();
+}
+
 static void metal_attn_splitk_matches_ref(void) {
     /* The real decode shape this exists for: Qwen3-4B-Instruct-2507's
      * 32 query heads over 8 kv heads, head_dim 128 (repeat 4). Two sequence
@@ -3259,6 +3639,7 @@ int main(void) {
     tt_run("metal_attn_prefill_matches_decode", metal_attn_prefill_matches_decode);
     tt_run("metal_attn_splitk_matches_ref", metal_attn_splitk_matches_ref);
     tt_run("metal_attn_splitk_gqa_bit_identical", metal_attn_splitk_gqa_bit_identical);
+    tt_run("metal_attn_splitk_online_matches_ref", metal_attn_splitk_online_matches_ref);
     tt_run("metal_conv1d_chunk_matches_step", metal_conv1d_chunk_matches_step);
     tt_run("metal_delta_gates_chunk_matches", metal_delta_gates_chunk_matches);
     tt_run("metal_delta_chunk_matches_multi", metal_delta_chunk_matches_multi);

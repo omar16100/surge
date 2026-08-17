@@ -1297,6 +1297,183 @@ static void mini_f16_splitk_gqa_cap_override_greedy_matches(void) {
     free(seed);
 }
 
+/* --------------------------------------------------------------------
+ * Task P2.8: the ONLINE-softmax split-K arm's env var and selection policy
+ * --------------------------------------------------------------------
+ *
+ * WHAT THIS GATES AND WHAT IT DELIBERATELY DOES NOT. It costs no forward passes:
+ * every assertion is about sg_gpu_state_new's parse of SURGE_ATTN_SPLITK_ONLINE
+ * and about sg_gpu_splitk_online_selected, which calls the same predicate the
+ * decode encoder consults. That covers the three things that would otherwise
+ * exist only as comments: the value is REJECTED rather than ignored, the
+ * head_dim <= SG_TG bound is real, and the online arm inherits the GQA group
+ * band and P2.7's threadgroup floor instead of quietly having its own.
+ *
+ * IT DOES NOT ASSERT TOKEN OR LOGIT AGREEMENT, and that is on purpose rather
+ * than for cost. The online kernel is NOT byte-identical to the four-pass ones
+ * (streaming reorders the exponential sums), so the end-to-end statement is
+ * "same greedy tokens, logits agreeing to float rounding", and the honest place
+ * for a token divergence is a report with the argmax margin at the divergence,
+ * not a red `make check`. That comparison is the deferred real-model A/B in
+ * docs/17082026_splitk_gqa_threadgroups.md, on the 4B Q8_0 checkpoint at a depth
+ * where the floor admits the kernel; this fixture has 2 kv heads, so it would
+ * need 16384 positions before the online kernel is even selected.
+ *
+ * The state's max_ctx is small on purpose: no forward runs, and the policy is a
+ * pure function of its arguments rather than of max_ctx. */
+static void mini_f16_splitk_online_policy(void) {
+    sg_gguf *gg = NULL;
+    sg_err e = sg_gguf_open(MINI_DIR "/model.gguf", &gg);
+    tt_assert(!sg_failed(e), "sg_gguf_open: %s", e.msg ? e.msg : "ok");
+    if (sg_failed(e)) return;
+
+    sg_model m;
+    e = sg_model_from_gguf(gg, &m);
+    tt_assert(!sg_failed(e), "sg_model_from_gguf: %s", e.msg ? e.msg : "ok");
+    if (sg_failed(e)) { sg_gguf_close(gg); return; }
+
+    e = sg_gpu_load_model(g_gpu, &m);
+    tt_assert(!sg_failed(e), "sg_gpu_load_model: %s", e.msg ? e.msg : "ok");
+    if (sg_failed(e)) { sg_model_free(&m); sg_gguf_close(gg); return; }
+
+    /* sg_gpu_splitk_gqa_selected has no head_dim argument, so it reads the
+     * STATE's head_dim to decide whether the online arm has taken the dispatch
+     * (see splitk_gqa_use). The mutual-exclusion assertion below therefore needs
+     * this fixture's own head_dim to be inside the online bound. */
+    tt_assert(m.cfg.head_dim > 0 && m.cfg.head_dim <= SPLITK_CAP_GATE_TG,
+              "this gate needs the fixture's head_dim (%u) to be in [1, %u], the "
+              "online kernel's register bound", m.cfg.head_dim, SPLITK_CAP_GATE_TG);
+
+    const uint32_t n = 1024u;              /* no forwards; keep the state cheap */
+    const uint32_t deep = SPLITK_GQA_DEEP_SEQ;   /* 65536: past the P2.7 floor */
+    setenv("SURGE_ATTN_SPLITK", "1", 1);
+    setenv("SURGE_ATTN_SPLITK_GQA", "0", 1);
+
+    /* 1. REJECTED, NOT IGNORED. Every one of these would otherwise silently mean
+     *    "off" and make an A/B whose on-arm was never on pass perfectly. */
+    const char *bad[] = { "on", "true", "yes", "2", "-1", "01", "1 ", " 1", "00", "x" };
+    for (size_t i = 0; i < sizeof bad / sizeof bad[0]; i++) {
+        setenv("SURGE_ATTN_SPLITK_ONLINE", bad[i], 1);
+        e = sg_gpu_state_new(g_gpu, &m, n);
+        tt_assert(sg_failed(e),
+                  "SURGE_ATTN_SPLITK_ONLINE='%s' must be rejected, not ignored "
+                  "(an ignored value makes the online A/B vacuous)", bad[i]);
+    }
+
+    /* 2. "0" is accepted and selects nothing, which is also the shipped default. */
+    setenv("SURGE_ATTN_SPLITK_ONLINE", "0", 1);
+    e = sg_gpu_state_new(g_gpu, &m, n);
+    tt_assert(!sg_failed(e), "SURGE_ATTN_SPLITK_ONLINE=0 must be accepted: %s",
+              e.msg ? e.msg : "ok");
+    tt_assert(!sg_gpu_splitk_online_selected(g_gpu, 24, 4, 256, deep)
+                  && !sg_gpu_splitk_online_selected(g_gpu, 32, 8, 128, deep),
+              "with SURGE_ATTN_SPLITK_ONLINE=0 no shape may select the online kernel");
+
+    /* 3. "1" is accepted, and the two REAL decode shapes are admitted at depth.
+     *    27B head_dim 256 is exactly SG_TG, the boundary that matters: it is the
+     *    widest head_dim whose acc fits one register per head per thread, and it
+     *    is the shape this whole line of work is measured on. */
+    setenv("SURGE_ATTN_SPLITK_ONLINE", "1", 1);
+    e = sg_gpu_state_new(g_gpu, &m, n);
+    tt_assert(!sg_failed(e), "SURGE_ATTN_SPLITK_ONLINE=1 must be accepted: %s",
+              e.msg ? e.msg : "ok");
+    if (sg_failed(e)) { sg_model_free(&m); sg_gguf_close(gg); return; }
+    tt_assert(sg_gpu_splitk_online_selected(g_gpu, 24, 4, 256, deep),
+              "the 27B shape (24h/4kv/256d, head_dim == SG_TG) must be admitted at "
+              "seq %u", deep);
+    tt_assert(sg_gpu_splitk_online_selected(g_gpu, 32, 8, 128, deep),
+              "the 4B dense shape (32h/8kv/128d) must be admitted at seq %u", deep);
+
+    /* 4. The head_dim bound, both sides of it. 257 and 512 are past the point
+     *    where a thread owns one output dim, so the kernel would re-stream the
+     *    split per band and lose to the four-pass kernel it replaces. */
+    tt_assert(!sg_gpu_splitk_online_selected(g_gpu, 24, 4, SPLITK_CAP_GATE_TG + 1, deep),
+              "head_dim %u (one past SG_TG) must be declined: that is where the "
+              "running accumulator stops fitting in registers",
+              SPLITK_CAP_GATE_TG + 1);
+    tt_assert(!sg_gpu_splitk_online_selected(g_gpu, 24, 4, 512, deep),
+              "head_dim 512 must be declined for the same reason");
+    tt_assert(!sg_gpu_splitk_online_selected(g_gpu, 24, 4, 0, deep),
+              "head_dim 0 must be declined");
+
+    /* 5. The GQA group band, inherited rather than re-stated. */
+    tt_assert(!sg_gpu_splitk_online_selected(g_gpu, 8, 8, 128, deep),
+              "repeat 1 must be declined: there is nothing to share");
+    tt_assert(!sg_gpu_splitk_online_selected(g_gpu, 18, 2, 128, deep),
+              "repeat 9 must be declined: past SG_SPLITK_GQA_MAX");
+    tt_assert(!sg_gpu_splitk_online_selected(g_gpu, 32, 5, 128, deep),
+              "a n_heads that is not a multiple of n_kv_heads must be declined");
+    tt_assert(!sg_gpu_splitk_online_selected(g_gpu, 32, 0, 128, deep),
+              "n_kv_heads 0 must be declined");
+
+    /* 6. P2.7's threadgroup floor, inherited too: the same shape is admitted at
+     *    depth and declined at short context. This fixture's 2 kv heads need 64
+     *    splits, i.e. seq 16384, so seq 2048 gives 8 * 2 == 16 threadgroups. */
+    tt_assert(!sg_gpu_splitk_online_selected(g_gpu, 4, MINI_KV_HEADS,
+                                             m.cfg.head_dim, 2048u),
+              "the online arm must obey the P2.7 floor: 4h/2kv at seq 2048 is "
+              "%u splits x %u kv threadgroups, under the floor of %u",
+              sg_gpu_splitk_gqa_n_splits_at(g_gpu, 2048u), MINI_KV_HEADS,
+              SPLITK_GQA_MIN_TG);
+    tt_assert(sg_gpu_splitk_online_selected(g_gpu, 4, MINI_KV_HEADS,
+                                            m.cfg.head_dim, deep),
+              "the same shape must be admitted at seq %u, or the decline above is "
+              "not about the floor", deep);
+
+    /* 7. MUTUAL EXCLUSION. With both kernel switches on, the online arm takes the
+     *    dispatch and the four-pass GQA predicate must answer false, or the
+     *    encoder's two counters would both claim one dispatch. */
+    setenv("SURGE_ATTN_SPLITK_GQA", "1", 1);
+    e = sg_gpu_state_new(g_gpu, &m, n);
+    tt_assert(!sg_failed(e), "sg_gpu_state_new (both switches on): %s",
+              e.msg ? e.msg : "ok");
+    if (!sg_failed(e)) {
+        tt_assert(sg_gpu_splitk_online_selected(g_gpu, 4, MINI_KV_HEADS,
+                                                m.cfg.head_dim, deep),
+                  "with both switches on the online arm must be selected");
+        tt_assert(!sg_gpu_splitk_gqa_selected(g_gpu, 4, MINI_KV_HEADS, deep),
+                  "with both switches on the FOUR-PASS GQA predicate must answer "
+                  "false for the state's own shape, or one dispatch would be "
+                  "counted twice");
+        /* And with only the GQA switch on, the four-pass arm is selected again,
+         * so the line above is about precedence and not a blanket false. */
+        setenv("SURGE_ATTN_SPLITK_ONLINE", "0", 1);
+        e = sg_gpu_state_new(g_gpu, &m, n);
+        tt_assert(!sg_failed(e), "sg_gpu_state_new (gqa only): %s",
+                  e.msg ? e.msg : "ok");
+        if (!sg_failed(e)) {
+            tt_assert(sg_gpu_splitk_gqa_selected(g_gpu, 4, MINI_KV_HEADS, deep),
+                      "with only SURGE_ATTN_SPLITK_GQA=1 the four-pass GQA arm must "
+                      "be selected at seq %u", deep);
+        }
+    }
+
+    /* 8. Split-K off means online off: the online kernel reads half-typed
+     *    separate K and V, and the incumbent path has no split-K at all. */
+    setenv("SURGE_ATTN_SPLITK", "0", 1);
+    setenv("SURGE_ATTN_SPLITK_ONLINE", "1", 1);
+    e = sg_gpu_state_new(g_gpu, &m, n);
+    tt_assert(!sg_failed(e), "sg_gpu_state_new (splitk off, online on): %s",
+              e.msg ? e.msg : "ok");
+    if (!sg_failed(e)) {
+        tt_assert(!sg_gpu_splitk_online_selected(g_gpu, 24, 4, 256, deep),
+                  "with SURGE_ATTN_SPLITK=0 the online arm must be off too");
+    }
+
+    /* 9. No forward ran on any of these states, so the counter must be 0. This is
+     *    the anti-vacuity anchor for the deferred end-to-end gate: that gate's
+     *    claim is that the counter becomes NONZERO. */
+    tt_assert(sg_gpu_splitk_online_dispatches(g_gpu) == 0,
+              "no decode step ran, so the online dispatch count must be 0, got %llu",
+              (unsigned long long)sg_gpu_splitk_online_dispatches(g_gpu));
+
+    unsetenv("SURGE_ATTN_SPLITK_ONLINE");
+    unsetenv("SURGE_ATTN_SPLITK_GQA");
+    unsetenv("SURGE_ATTN_SPLITK");
+    sg_model_free(&m);
+    sg_gguf_close(gg);
+}
+
 /* Q8_0 now loads on the Metal path (M3.2+M3.3). This env-guarded check wants
  * a real Q8_0 gguf, loads it, and greedily decodes a few tokens, asserting the
  * outputs are valid (in-vocab, finite logits) and NOT degenerate (not the same
@@ -1409,6 +1586,10 @@ int main(void) {
      * byte-identity assertion. */
     tt_run("mini_f16_splitk_gqa_cap_override_greedy_matches",
            mini_f16_splitk_gqa_cap_override_greedy_matches);
+    /* P2.8: the online-softmax arm's env parse and selection policy. No forwards,
+     * so it costs nothing and runs last; the end-to-end token comparison for that
+     * arm is a deferred real-model gate, for the reason stated at the subtest. */
+    tt_run("mini_f16_splitk_online_policy", mini_f16_splitk_online_policy);
     unsetenv("SURGE_KV_DTYPE");
 
     fprintf(stderr, "worst relative logit gap vs ref: %.3e\n", g_worst_rel);

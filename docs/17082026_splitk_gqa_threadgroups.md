@@ -787,3 +787,202 @@ threadgroups) while the same shape with the default cap must be SELECTED.
 `attn_splitk_gqa` still defaults to `false`. P2.7 removes the last measured reason not to flip
 it (a short-context regression) and makes the flip non-regressive on both real shapes; the flip
 itself remains the user's call.
+
+## P2.8: online (streaming) softmax in the GQA partial
+
+New kernel `k_attn_decode_splitk_partial_gqa_online` (`src/kernels.metal`), selected by
+`SURGE_ATTN_SPLITK_ONLINE=1`, **default OFF**. The four-pass GQA partial stays intact and
+reachable; this is an A/B, not a replacement.
+
+The four-pass kernel writes every score of a split into `splitk_scratch` and walks that row
+three more times (maximum, exponentiate, accumulate). The online kernel keeps a running
+`(m, s, acc)` per head and updates it as each 256-key tile is folded in, rescaling by
+`exp(m_old - m_new)` when the running maximum moves. It has **seven bindings, not eight**: no
+`scores` argument, and neither the one-shot nor the encoder grows or binds `splitk_scratch` on
+that path.
+
+### Where the running accumulator lives, which is the whole design problem
+
+A per-thread `acc[R][head_dim]` does not exist: at `R = 8` and `head_dim = 256` that is 2048
+floats per thread, 2 MB per threadgroup. The two pieces of state are therefore attached to
+different roles, which is the same split the four-pass kernel already makes between its phases:
+
+| state | who holds it | cost |
+|---|---|---|
+| `m`, `s` | UNIFORM across the threadgroup (they come off a fold tree), so every thread keeps its own copy | `2R` registers |
+| `acc[d]` | exactly ONE thread, the one that owns output dim `d` (`d = dbase + lid`) | `R` registers, not `R*head_dim` |
+| this thread's own key's score | private | `R` registers |
+
+Total streaming state is `4R` floats per thread, 32 at `R = 8`. That works because
+`head_dim <= SG_TG`, which holds for every shape surge targets (27B 256, exactly `SG_TG`; 4B
+dense 128). For `head_dim > SG_TG` the kernel's `dbase` loop runs more than once and re-streams
+the split per 256-wide band of output dims: still exactly correct (gated below at `head_dim`
+320, which makes the second band deliberately partial), but it re-reads K, so
+`splitk_online_use` declines those shapes. Same kind of policy decline as a GQA group wider than
+`SG_SPLITK_GQA_MAX`, which this kernel also still answers correctly one head at a time.
+
+The price is a transpose through threadgroup memory, and it is unavoidable: the score of key `t`
+is computed by the thread that owns key `t` and consumed by every thread that owns an output
+dim, so an `R x SG_TG` block has to change hands. Device memory is what the four-pass kernel
+uses for exactly that and is what this kernel exists to avoid. The buffer is
+`SG_SPLITK_GQA_MAX * SG_TG` floats (**8 KB**, sized for the worst-case group so nothing on the
+host has to agree with the kernel about an allocation length) and it does double duty as the
+fold-tree scratch. Two new helpers `tg_max_group<R>` / `tg_sum_group<R>` fold all R heads in one
+pass of the same fixed stride schedule, which is bit-identical to R separate `tg_max`/`tg_sum`
+calls (no row reads another row's data) but keeps the barrier count independent of `R`; that
+matters because the online kernel folds once per TILE rather than once per split.
+
+Determinism is unchanged: each thread streams the SAME fixed subset of keys the four-pass kernel
+gives it (`lid`, `lid+256`, ...), cross-thread combination is only ever a fixed-shape tree, every
+`acc` slot has exactly one writer, and the rescale is a multiply by a value every thread
+recomputes identically from the tree's output.
+
+### Byte-identity is NOT the bar, and three things are still exact
+
+Streaming reorders the exponential sums, so `s` and `acc` differ from the four-pass kernels in
+the last bits whenever a split spans more than one tile. Still exact, and asserted:
+
+1. **`m`**, bit-identical to the four-pass GQA kernel. A maximum is order-independent and the
+   key subsets match, so a difference here would mean the streaming loop visited different keys.
+2. **The empty-split encoding** `m = -INFINITY / s = 0 / acc = 0`, checked structurally.
+3. **Determinism**, 100 reruns byte-identical.
+
+Measured bonus: when a split fits ONE tile the whole triple comes out bit-identical (one key per
+lane, same trees, same order). Observed at every shape, e.g. `32x8x128 seq200` at every split
+count and `24x4x256 seq1000` at K=2: `0/N floats differ, worst |delta| 0.000e+00`.
+
+### Gates run, all on hardware (the 256K benchmark holding the GPU cleared at 22:42)
+
+1. `xcrun -sdk macosx metal -fno-fast-math -Wall -c src/kernels.metal` clean; `metallib` links;
+   `k_attn_decode_splitk_partial_gqa_online` present in the library.
+2. `clang -fsyntax-only -std=c11 -Wall -Wextra -Werror -Isrc -I.` on `src/metal.m`,
+   `tests/test_metal_ops.c`, `tests/test_gpu_fwd.c`, `tests/bench_splitk.c`, with and without
+   `-DSURGE_NO_METAL`: clean. Also compiled under `make debug`'s ASan/UBSan flag set.
+3. `make debug`: rc 0, **83523 checks, 0 failures, 0 sanitizer diagnostics**, identical to the
+   P2.4/P2.5/P2.6/P2.7 baseline (the Metal test files collapse to skip stubs there, so the new
+   subtests add no checks to this count).
+4. `make check`: **87257 checks, 0 failures** (86099 at the parent commit, +1158: +1122 in
+   `test_metal_ops.bin`, +36 in `test_gpu_fwd.bin`). `test_cli_prefill` 11 cases and
+   `test_cli_bench` 14 cases green. Every earlier gate unchanged: the P2.4/P2.7 positive control
+   still reports **513 GQA dispatches + 15360 per-head with the switch on, 15873 per-head with
+   it off, logits byte-identical at 16896/16896**, and the P2.6 cap gate still reports
+   **257/257 positions differ above the divergence seq, 0 of 16639 below, argmax 16896/16896**.
+5. **Accuracy vs the CPU oracles** (`metal_attn_splitk_online_matches_ref`, 12 shapes x 7 split
+   counts x 2 oracles): worst **rel 2.109e-06, abs 4.172e-07**, at `24x4x256 seq1000 dense r6`
+   with K=1251 (a split count above seq, i.e. mostly empty splits, which the four-pass sweep
+   never tested). Apples to apples at P2.2's own headline point, `32x8x128 seq1000 gated`:
+
+   | n_splits | four-pass per-head rel | online rel |
+   |---|---|---|
+   | 1 | 1.027e-06 | 1.118e-06 |
+   | 2 | 5.479e-07 | 6.707e-07 |
+   | 3 | 4.880e-07 | 4.564e-07 |
+   | 7 | 3.082e-07 | 3.353e-07 |
+   | 64 | 3.424e-07 | 2.981e-07 |
+   | 257 | 4.794e-07 | 5.589e-07 |
+
+   So not materially worse, and better at two of the six points. `worst relative error across all
+   ops` for the whole per-op suite is still 2.524e-06 and still belongs to `matmul_f32`, not to
+   this kernel.
+6. **100x determinism**: `online split-K partial: m/s/acc/out byte-identical over 100 reruns`.
+7. **Real-model greedy A/B**, `Qwen3-4B-Instruct-2507-Q8_0.gguf`, 5267-token prompt (the first
+   17000 bytes of the three gate docs concatenated, sha256 `03ce9a25...`), `-n 64 --margins`,
+   three arms, only the env vars changed. All three dispatch the same `n_splits` (20), so the
+   kernel is the only variable:
+
+   | arm | `SURGE_ATTN_SPLITK_GQA` | `SURGE_ATTN_SPLITK_ONLINE` | decode | `gen_ids` |
+   |---|---|---|---|---|
+   | B0 | 0 | 0 | 26.85 tok/s | sha256 `70f22515...` |
+   | B1 | 0 | 1 | 22.98 tok/s | sha256 `70f22515...` |
+   | B2 | 1 | 0 | 24.84 tok/s | sha256 `70f22515...` |
+
+   - **B0 vs B1: `gen_ids` BYTE-IDENTICAL, 0 of 64 token mismatches, and 62 of 64 margins
+     DIFFER**, which is what makes the token match non-vacuous. Largest absolute margin
+     perturbation 3.310e-03. The smallest decision margin was 1.068974e-02 (position 56) and the
+     perturbation on that same position was 5.302e-04, **20x headroom**.
+   - **B0 vs B2, the control: margins AND `gen_ids` byte-identical** (0 of 64 margins differ).
+     P2.4's byte-identity contract holding at real depth, and the proof that B1's divergence
+     comes from the online kernel and from nothing else.
+8. **Timing A/B**, `./tests/bench_splitk.bin --reps 20 --seqs 8192,32768,131072,262144`, `--gqa`
+   against `--gqa --online`, 3 alternating rounds, median of the 3. At the split count the decode
+   policy would dispatch:
+
+   | shape | seq | n_splits | four-pass us | online us | online speedup | per round |
+   |---|---|---|---|---|---|---|
+   | 27B 24h/4kv/256d | 8192 | 32 | 591.45 | 530.75 | **1.114x** | 1.092/1.114/1.116 |
+   | 27B 24h/4kv/256d | 32768 | 128 | 997.50 | 984.95 | **1.013x** | 0.992/1.013/0.954 |
+   | 27B 24h/4kv/256d | 131072 | 256 | 2368.00 | 2250.00 | **1.052x** | 1.083/1.052/1.071 |
+   | 27B 24h/4kv/256d | 262144 | 256 | 4195.05 | 3850.35 | **1.090x** | 1.092/1.090/1.083 |
+   | 4B 32h/8kv/128d | 8192 | 32 | 527.55 | 520.45 | 1.014x | 1.011/1.014/0.989 |
+   | 4B 32h/8kv/128d | 32768 | 128 | 922.75 | 938.10 | 0.984x | 0.959/0.984/1.003 |
+   | 4B 32h/8kv/128d | 131072 | 256 | 2024.00 | 2603.05 | **0.778x** | 0.791/0.778/0.783 |
+   | 4B 32h/8kv/128d | 262144 | 256 | 3472.15 | 5032.85 | **0.690x** | 0.685/0.690/0.701 |
+
+### What that measurement means, and why the switch stays off
+
+**The 27B shape wins at every decode-policy point, 1.013x to 1.114x, and the 4B shape loses at
+depth, down to 0.690x.** The losses are large, tightly reproducible across the three rounds
+(spread under 0.02) and concentrated: on the 4B they appear from 256 threadgroups up
+(`n_splits >= 32`), the worst single point being 0.605x at seq 262144 with `n_splits` 64, while
+the same shape at 128 threadgroups (`n_splits` 16) is 1.043x. The end-to-end 4B run above is
+consistent (B1 slowest of the three arms despite running second, so it is not thermal drift).
+
+The best-supported explanation, and it is a HYPOTHESIS the numbers only bound rather than prove:
+the 8 KB threadgroup allocation limits how many threadgroups a core can hold, which costs
+nothing while the grid is smaller than a couple of threadgroups per core and costs a lot once it
+is not. Two observations point at it and one narrows it:
+
+- the 27B at 256 threadgroups (`n_splits` 64) also loses, 0.966x, so the effect is not unique to
+  the 4B;
+- the 4B at the SAME 256 threadgroups loses much harder (0.644x), and the difference between the
+  two shapes there is `head_dim` 128 against 256. At `head_dim` 128 only half the 256 threads
+  own an output dim, so the online kernel's per-tile V phase runs at half occupancy while its
+  threadgroup-memory footprint is unchanged. That is exactly the phase-4 thread waste step 4 of
+  the decode plan addresses, which makes step 4 a PREREQUISITE for this kernel on that shape
+  rather than an independent nicety;
+- barrier count does not explain it: the 4B at seq 262144 with `n_splits` 16 folds 64 tiles
+  (about 1400 barriers) and WINS 1.043x, while `n_splits` 256 folds 4 tiles (about 88 barriers)
+  and loses 0.690x.
+
+Two follow-ups, in order of expected value:
+
+1. **Size the threadgroup buffer to the actual group**, `R * SG_TG * 4` bytes via a host-provided
+   `[[threadgroup(0)]]` length instead of the static worst-case 8 KB. That is 4 KB for the 4B's
+   `R = 4` and 6 KB for the 27B's `R = 6`. It was deliberately NOT done in this task: the failure
+   mode of a wrong length is threadgroup memory corruption, and the task was written with the GPU
+   held, so the safe form was the one that cannot be under-allocated.
+2. **Step 4 of the decode plan** (phase-4 thread waste), which is where the `head_dim < SG_TG`
+   half of the loss lives.
+
+`SURGE_ATTN_SPLITK_ONLINE` therefore stays **OFF by default**, and so does `attn_splitk_gqa`. On
+the evidence above the online kernel is a win on the shape the project is measured on and a loss
+on the other real shape, so turning it on would need a policy that admits only the first, and
+that policy would be fitted to two shapes at four depths. Not this task's call.
+
+### The env var is REJECTED, not ignored, on a bad value
+
+`SURGE_ATTN_SPLITK_ONLINE` accepts exactly `0` and `1`; anything else makes
+`sg_gpu_state_new` return an error. This follows P2.6's rule rather than the warn-and-default
+rule `SURGE_ATTN_SPLITK` and `SURGE_ATTN_SPLITK_GQA` use, and for the same reason: the gate for
+this switch is an A/B, and an A/B whose on-arm was silently never turned on passes perfectly.
+`mini_f16_splitk_online_policy` (`tests/test_gpu_fwd.c`, no forward passes, so it costs nothing)
+gates that plus the `head_dim <= SG_TG` bound, the inherited group band, the inherited P2.7
+floor, and the mutual exclusion with the four-pass GQA arm.
+
+### What the online path would save if it became the only partial
+
+`splitk_scratch` is sized `n_heads * (max_ctx + n_splits)` floats, which at the 27B's 24 heads
+and 262144 context is about **25 MB**, the largest scratch surge allocates for decode. This task
+does not delete it or change `splitk_sizes`: the four-pass kernels still need it, and the online
+path simply never mentions it.
+
+### Not measured
+
+- Whether the GQA split policy (`splitk_gqa_n_splits`, cap 256) is still the right one for the
+  streaming kernel. The online arm dispatches with it because it has the same grid and the same
+  per-threadgroup reuse; the sweep above shows the online kernel's best `n_splits` on the 27B at
+  seq 262144 is 512 or 1024 (1.124x, 1.142x) rather than 256, so a re-fit is open.
+- The 27B end to end. The real-model A/B above is the 4B, the checkpoint the brief names; the
+  27B-Q8_0 run is a separate manual gate.
+- Occupancy directly (no Metal capture was taken), which is why the explanation above is labelled
+  a hypothesis.

@@ -928,6 +928,56 @@ sg_err sg_gpu_run_attn_splitk_partial_gqa(sg_gpu *g, void *q, void *k, void *v,
                                           void *m, void *s, void *acc,
                                           const uint32_t params[8]);
 
+/* THE ONLINE-SOFTMAX GQA PARTIAL (Task P2.8), the third alternative for the
+ * same job: same arguments, same params array, same buffer sizes, same
+ * [n_heads, n_splits] m/s and [n_heads, n_splits, head_dim] acc layout, same
+ * (n_splits, n_kv_heads) grid as the GQA partial above, and the SAME COMBINE
+ * consumes its output. It dispatches k_attn_decode_splitk_partial_gqa_online.
+ *
+ * WHAT IS DIFFERENT INSIDE. The two partials above are four-pass kernels: they
+ * write every score of the split into a device-memory row and then walk it three
+ * more times (maximum, exponentiate, accumulate). This one keeps a running
+ * (m, s, acc) per head and updates it as each key is visited, rescaling by
+ * exp(m_old - m_new) whenever the running maximum moves. So the score row is
+ * gone, and with it the whole reason the split-K score scratch exists: THIS
+ * ENTRY POINT NEITHER GROWS NOR BINDS g's split-K scratch buffer. (The buffer is
+ * still allocated by sg_gpu_state_new, because the other two arms still need it.
+ * If the online kernel ever became the only partial, that allocation would go
+ * away entirely: it is sized n_heads * (max_ctx + n_splits) floats, which at the
+ * 27B's 24 heads and 262144 context is about 25 MB, the largest scratch surge
+ * allocates for decode.)
+ *
+ * NOT BYTE-IDENTICAL TO THE OTHER TWO, AND THAT IS INHERENT. Streaming changes
+ * the ORDER in which the exponentials are summed, so `s` and the `acc` sums
+ * differ in the last bits from the four-pass kernels whenever a split spans more
+ * than one 256-key tile. What IS exact: `m` (a maximum is order-independent),
+ * the empty-split m=-INFINITY/s=0/acc=0 encoding, and in fact the whole triple
+ * when a split fits in a single tile, because each thread then holds exactly one
+ * key and the folds are the same trees over the same lanes. The bar for this
+ * kernel is therefore the P2.2 bar (agreement with sg_ref_attn_decode_splitk to
+ * float rounding, plus determinism, plus byte-exact greedy tokens end to end),
+ * NOT the memcmp the GQA partial above can promise.
+ *
+ * DETERMINISM IS UNCHANGED. Each thread streams its own fixed subset of the
+ * split's keys, cross-thread combination is only ever a fixed-shape tree with a
+ * data-independent stride schedule, and every acc slot has exactly one writer.
+ * Repeated dispatches on identical inputs are byte-identical.
+ *
+ * SAME DOMAIN AND SAME REJECTIONS as the two entry points above, checked by the
+ * same code. head_dim > 256 is ACCEPTED and answered correctly, but the kernel
+ * then re-streams the split once per 256-wide band of output dims (that is where
+ * the running accumulator has to live: one register per head per thread, which
+ * needs one output dim per thread), so it re-reads K and the decode path routes
+ * those shapes to a four-pass kernel instead. Same for a GQA group wider than 8.
+ *
+ * NOT THE DECODE DEFAULT. sg_gpu_forward dispatches it only under
+ * SURGE_ATTN_SPLITK_ONLINE=1 (see sg_gpu_state_new below): it was written while
+ * the GPU was held by a benchmark, so no timing and no accuracy figure had been
+ * observed when it landed. */
+sg_err sg_gpu_run_attn_splitk_partial_gqa_online(sg_gpu *g, void *q, void *k, void *v,
+                                                 void *m, void *s, void *acc,
+                                                 const uint32_t params[8]);
+
 /* TWO OBSERVATION POINTS FOR THE GQA GATE (P2.4 fix round 1). Both are
  * read-only diagnostics: no kernel reads them, no buffer size or dispatch shape
  * depends on them, so they cannot change any computed output.
@@ -967,6 +1017,34 @@ sg_err sg_gpu_run_attn_splitk_partial_gqa(sg_gpu *g, void *q, void *k, void *v,
 bool sg_gpu_splitk_gqa_selected(const sg_gpu *g, uint32_t n_heads,
                                 uint32_t n_kv_heads, uint32_t seq);
 void sg_gpu_splitk_dispatch_counts(const sg_gpu *g, uint64_t *per_head, uint64_t *gqa);
+
+/* THE SAME TWO OBSERVATION POINTS FOR THE ONLINE ARM (Task P2.8), and they carry
+ * the vacuity argument above even more directly: the online partial is contracted
+ * to agree with the four-pass ones on greedy TOKENS, not on bits, so an A/B that
+ * only compares tokens passes both when the kernel ran and when it was never
+ * selected. Read-only diagnostics; nothing computed depends on them.
+ *
+ * sg_gpu_splitk_online_selected calls the same internal predicate the decode
+ * encoder consults. It needs `head_dim` as well as the GQA triple, because the
+ * online kernel's own extra condition is head_dim <= 256: that is where its
+ * running accumulator stops fitting in one register per head per thread. It
+ * reflects the current state's SURGE_ATTN_SPLITK_ONLINE, so it answers false for
+ * every shape while the switch is off (the default). NULL g answers false.
+ *
+ * Everything else the GQA policy requires still applies to this arm, through the
+ * same shared predicate: the group must be in [2, 8] and the dispatch must clear
+ * P2.7's floor of 128 threadgroups. When BOTH kernel switches are on, the online
+ * arm is the one that runs and sg_gpu_splitk_gqa_selected answers false, so the
+ * two never both claim the same dispatch.
+ *
+ * sg_gpu_splitk_online_dispatches counts what sg_gpu_forward ENCODED since the
+ * last sg_gpu_state_new, exactly like sg_gpu_splitk_dispatch_counts (whose `gqa`
+ * counter still means the FOUR-PASS GQA partial only, so the existing exact-count
+ * gates keep their meaning). One-shot entry points are not counted. */
+bool sg_gpu_splitk_online_selected(const sg_gpu *g, uint32_t n_heads,
+                                   uint32_t n_kv_heads, uint32_t head_dim,
+                                   uint32_t seq);
+uint64_t sg_gpu_splitk_online_dispatches(const sg_gpu *g);
 
 /* Task P2.5: the GQA partial's OWN split count, the diagnostic counterpart of
  * sg_gpu_splitk_gqa_selected above. sg_gpu_forward's decode encoder computes
@@ -1131,6 +1209,25 @@ sg_err sg_gpu_run_rmsnorm_gated_chunk(sg_gpu *g, void *y, void *z, void *out, vo
  * It is ignored unless split-K itself is on, and for GQA groups outside
  * [2, 8], where it would buy nothing. Default 0 because no hardware gate has
  * been run on that kernel yet, not because it is known to be slower.
+ *
+ * SURGE_ATTN_SPLITK_ONLINE (Task P2.8) is a THIRD kernel choice at the same
+ * point, and a peer of SURGE_ATTN_SPLITK_GQA rather than a modifier of it.
+ * Default 0. 1 selects k_attn_decode_splitk_partial_gqa_online, the
+ * online-softmax (streaming) form of the GQA partial: one pass over the keys
+ * with a running (m, s, acc) instead of a score row in device memory, so it
+ * never touches the split-K score scratch. It obeys the same GQA group band and
+ * the same P2.7 threadgroup floor, and additionally requires head_dim <= 256
+ * (where its running accumulator stops fitting in registers); shapes outside
+ * that go to a four-pass partial. When both this and SURGE_ATTN_SPLITK_GQA are
+ * 1, this one wins.
+ *
+ * UNLIKE THE GQA CHOICE, IT CHANGES THE LAST BITS: streaming reorders the
+ * exponential sums, so expect the same generated token ids and logits that agree
+ * to float rounding, the same relationship SURGE_ATTN_SPLITK=0/1 has. And unlike
+ * the two switches above, an unusable value is REJECTED rather than warned about
+ * and ignored, for SURGE_SPLITK_GQA_CAP's reason below: the gate for this switch
+ * is an A/B, and an A/B whose "on" arm was silently never turned on passes
+ * vacuously. Accepted values are exactly "0" and "1".
  *
  * SURGE_SPLITK_GQA_CAP (Task P2.6) overrides the GQA split policy's measured
  * saturation cap, 256 (see sg_gpu_splitk_gqa_n_splits above). IT IS A GATE AND

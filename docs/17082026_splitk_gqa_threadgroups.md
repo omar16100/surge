@@ -346,7 +346,7 @@ none.)
    (the positive control) still reports **577 GQA dispatches with the switch on, 0 per-head;
    577 per-head with it off; logits byte-identical at 1600/1600 positions** -- the exact same
    numbers the P2.4 hardware run recorded, proving P2.5 did not perturb it (the mini fixture's
-   seq never exceeds `SPLITK_GATE_N` == 1600, far below the 65536 point where the two split
+   seq never exceeds `SPLITK_GATE_N` == 1600, far below the 65792 point where the two split
    policies would first diverge).
 6. `./tests/bench_splitk.bin --seqs 8192,32768,131072,262144 --gqa`, re-run fresh for this
    task (not the brief's original sweep):
@@ -382,3 +382,25 @@ greedy A/B on an actual GGUF, and whether `splitk_gqa_use` needs a short-sequenc
 threadgroup-count floor the way `splitk_use` has one for the per-head kernel (see "WHAT IS NOT
 DECIDED HERE" in `splitk_gqa_use`'s comment, `src/metal.m`) -- neither was touched by this
 task and neither was required for its gates to pass.
+
+### Residual gap before the default can be flipped
+
+Everything above is gated, but one thing is NOT, and it should be settled before
+`attn_splitk_gqa` becomes the default rather than after.
+
+surge's correctness standard is **byte-exact greedy TOKENS**, not identical logits. From seq
+65792 on, the GQA policy deliberately picks a different `n_splits` than the per-head path, so
+the two agree only to float rounding. Nothing currently verifies that greedy tokens still match
+at a depth where the cap actually binds: the positive control runs at seq <= 1600 and the
+byte-identity subtest pins `n_splits` on both sides, so both bypass exactly the regime this
+task introduced.
+
+The margin argument says it is fine, but it is an argument, not a gate: M2 measured a
+top1-to-top2 logit gap around 8360x the observed perturbation, and P2.4 measured a worst logit
+delta of 9.537e-07 against a smallest margin of 1.385e-03, three orders of headroom.
+
+**The gate that closes it**: a real-model greedy A/B at a prompt longer than 65791 tokens,
+`SURGE_ATTN_SPLITK_GQA=0` versus `=1`, asserting gen_ids are byte-identical. The 27B Q8_0 GGUF
+and the 234158-token NIAH prompt already on this machine are exactly that case. Cost is one
+decode run per arm. It was not done in this task only because a 256K benchmark held the GPU for
+most of it.

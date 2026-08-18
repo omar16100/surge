@@ -36,9 +36,29 @@ surge-ref: src/cli_ref.c $(LIB_SRC)
 # accumulators to 1e-4 relative with precise::exp / precise::sqrt.
 METALLIB = src/kernels.metallib
 METAL_DEFS = -DSG_METALLIB_PATH='"$(CURDIR)/src/kernels.metallib"'
-$(METALLIB): src/kernels.metal
-	xcrun -sdk macosx metal -fno-fast-math -Wall -c $< -o src/kernels.air
-	xcrun -sdk macosx metallib src/kernels.air -o $@
+#
+# TWO .metal SOURCES, ONE METALLIB (task R1). Metal compiles each translation
+# unit to its own .air and `metallib` links them, so moving the split-K decode
+# kernels into src/kernels_splitk.metal (done when kernels.metal passed the
+# ~2000-line guideline) changes nothing the host can see: metal.m still looks
+# every kernel up by name in this one library. THE FLAGS MUST STAY IDENTICAL
+# ON BOTH -- losing -fno-fast-math on one of the two would be a silent
+# numerics change across half the library -- which is why they are one
+# variable used by one pattern rule rather than typed out per source.
+#
+# kernels_common.metal.h is a prerequisite of every .air because make does not
+# scan #include lines: without it, editing the shared tg_sum/tg_max/SG_TG
+# header would leave a stale metallib that still passes every test. THAT LIST
+# IS HAND-MAINTAINED. It is exhaustive today (one header, no other #include in
+# either source but <metal_stdlib>), and any #include added to either .metal
+# source has to be added here too or its edits will not trigger a rebuild.
+METAL_SRC = src/kernels.metal src/kernels_splitk.metal
+METAL_AIR = $(METAL_SRC:.metal=.air)
+METAL_CFLAGS = -fno-fast-math -Wall
+src/%.air: src/%.metal src/kernels_common.metal.h
+	xcrun -sdk macosx metal $(METAL_CFLAGS) -c $< -o $@
+$(METALLIB): $(METAL_AIR)
+	xcrun -sdk macosx metallib $^ -o $@
 
 # The tests that link src/metal.m need the frameworks and the metallib, so
 # they get a static pattern rule instead of the generic one above (an
@@ -157,6 +177,6 @@ debug:
 	@rm -f $(TESTS:.c=.bin)
 	@rm -rf $(TESTS:.c=.bin.dSYM)
 clean:
-	rm -f $(TESTS:.c=.bin) surge-info surge-ref surge surge-bench $(BENCH_SPLITK) $(METALLIB) src/kernels.air
+	rm -f $(TESTS:.c=.bin) surge-info surge-ref surge surge-bench $(BENCH_SPLITK) $(METALLIB) $(METAL_AIR)
 	rm -rf $(TESTS:.c=.bin.dSYM) surge-info.dSYM surge-ref.dSYM surge.dSYM surge-bench.dSYM
 .PHONY: check debug clean

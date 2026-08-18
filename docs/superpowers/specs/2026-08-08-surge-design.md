@@ -212,7 +212,7 @@ yet ruled on. Consolidated write-up with every source:
 ### What decode attention actually needed, and that it is DONE
 
 The missing term was OCCUPANCY. The incumbent kernel `k_attn_decode_f16`
-(`src/kernels.metal:483`) is dispatched one threadgroup per query head
+(`src/kernels.metal:455`) is dispatched one threadgroup per query head
 (`src/metal.m:1743`), which is what the decode path did at every depth before P2.3. On
 the 27B's 24-head shape that gave only 24 of this machine's 80 GPU cores work, with one
 threadgroup walking the entire KV sequence

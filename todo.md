@@ -2106,7 +2106,7 @@ touched.
   Layout: `q` is `[n_heads, q_stride]` (only `q[h][0..head_dim)` is the query, matching
   P1's gate/query split -- the gate half at `[head_dim, q_stride)` on the hybrid is
   NEVER read); `kc`/`vc` are `[seq, n_kv_heads, head_dim]` head-interleaved (the `sg_kv`
-  layout); GQA is `hk = h/(n_heads/n_kv_heads)`, matching `src/kernels.metal:499-500`
+  layout); GQA is `hk = h/(n_heads/n_kv_heads)`, matching `src/kernels.metal:471-472`
   exactly including its repeat==0 fallback. Numerics: max-subtracted softmax, double
   accumulation, one round to float at the end (this file's existing precision policy).
   Both public functions are thin wrappers over one static core, `attn_decode_core`
@@ -2239,7 +2239,7 @@ tolerance loosened, no existing gate (including P2.0's own) touched.
 **Hand-off note (not a fix, disclosed as requested):** the reviewer found `seq==0`
 DIVERGES from the Metal kernel this oracle is meant to check -- `surge.h` documents
 `seq==0` as writing `out[d]=0.0` for every head, but `k_attn_decode_f16`
-(`src/kernels.metal:497`) returns early there, leaving `out` completely UNWRITTEN. A
+(`src/kernels.metal:469`) returns early there, leaving `out` completely UNWRITTEN. A
 future byte-for-byte Metal-vs-oracle comparison at `seq==0` would spuriously disagree
 unless the harness pre-zeroes or special-cases it. Documented explicitly in both
 `sg_ref_attn_decode`'s and `sg_ref_attn_decode_splitk`'s `surge.h` contracts under a new
@@ -2306,7 +2306,7 @@ from data.
 
 **3. `seq == 0`, the P2.1 hand-off divergence, resolved by choosing the oracle's
 behavior.** `k_attn_decode_f16` folds `seq == 0` into its early return and leaves `out`
-UNWRITTEN (`src/kernels.metal:497`); the CPU oracle writes `out[d] = 0.0`. The new pair
+UNWRITTEN (`src/kernels.metal:469`); the CPU oracle writes `out[d] = 0.0`. The new pair
 takes the ORACLE's side: at `seq == 0` every split is empty, so every triple is the
 `-INFINITY`/0/0 encoding and the combine's all-empty branch writes 0.0. `check_params`
 therefore accepts `seq == 0` (unlike `sg_gpu_run_attn_decode_f16`, which rejects it), and
@@ -3388,7 +3388,7 @@ edits to the spec:
 2. **M4 milestone line** marked AMENDED and pointed at the new section. The bar itself is
    left in place, unedited.
 3. **New section "M4 amendment (2026-08-18)"**: the occupancy diagnosis with code anchors
-   (`src/kernels.metal:483`, `src/metal.m:1743`), the P2.3-to-P4.0 task table with each
+   (`src/kernels.metal:455`, `src/metal.m:1743`), the P2.3-to-P4.0 task table with each
    task's measured effect, the cumulative 28.3x shipping by default, the two
    counter-intuitive results (the split policy is a CAP not a rescaling, worst candidate
    13.4 percent regret; the occupancy guard is a threadgroup count not a `seq` threshold,
@@ -3448,3 +3448,67 @@ test_cli_bench.sh at all: SURGE_NO_METAL excludes that whole recipe block). Only
 `tests/test_cli_bench.sh` touched; Makefile, engine, kernels untouched.
 
 Full report: `.superpowers/sdd/2026-08-09-surge-m3-m5/task-B5.1-report.md`.
+
+## Task R1 Results: split the split-K kernels out of `src/kernels.metal` (2026-08-18)
+
+PURE CODE MOVE, no behaviour change. `src/kernels.metal` was 2548 lines against this
+project's ~2000-line guideline, grown there entirely by P2.3 to P4.0's split-K decode work.
+Two earlier implementers proposed exactly this split and deferred it until no further
+split-K work was queued; that condition held, so it is done here rather than under a later
+task that also has to change behaviour.
+
+What moved to `src/kernels_splitk.metal` (1277 lines): the whole tail of the old file,
+lines 1308 to 2548 VERBATIM. `k_attn_decode_splitk_partial`,
+`k_attn_decode_splitk_combine`, `k_attn_decode_splitk_partial_gqa`,
+`k_attn_decode_splitk_partial_gqa_online`, the `splitk_partial_group<R>` /
+`splitk_partial_group_online<R>` templates, the `tg_max_group<R>` / `tg_sum_group<R>` fold
+trees, `attn_combine_weight`, `SG_UNROLL_R`, `SG_SPLITK_GQA_MAX`, `SG_SPLITK_ONLINE_RED`,
+`SG_SPLITK_ONLINE_KW_MIN` and their `static_assert`s. Every one of them was checked to have
+no caller outside the split-K family before it moved.
+
+What did NOT move: the determinism mandate (still `src/kernels.metal:7-27`, byte-identical,
+so every `:7-27` reference in `surge.h`, `src/ref.c` and `docs/c4model.md` still resolves),
+`tg_sum` / `tg_max` / `SG_TG` (shared, so ONE definition, in the new
+`src/kernels_common.metal.h` that BOTH .metal files include -- never a second copy), and
+every non-split-K kernel. `src/metal.m` was deliberately not touched (4641 lines, the worse
+offender in absolute terms, but a different seam; bundling the two would make a byte-identity
+failure impossible to localize).
+
+Build: the Makefile's metallib rule became a pattern rule over `METAL_SRC`, one `.air` per
+source with the flags in ONE variable (`-fno-fast-math -Wall`) so they cannot drift apart,
+linked by `metallib` into the same `src/kernels.metallib`. `src/kernels_common.metal.h` is a
+prerequisite of every `.air` because make does not scan `#include` lines. `clean` and
+`.gitignore` cover the second `.air`.
+
+Gates. (1) `xcrun metallib` output BYTE-IDENTICAL to the parent commit's: `cmp` rc 0 on
+200293 bytes, which is stronger than the AIR-per-function bar the task set. (2) AIR
+equivalence per function anyway, by the P2.4 method (`xcrun metal -fno-fast-math -Wall -S`,
+then diff per function after expanding attribute sets and canonicalizing metadata
+numbering): 37 of 37 functions IDENTICAL, 0 differing, all 14 module globals identical, 35
+`air.kernel` entries = 31 + 4, `metal-nm` lists all 35. (3) `make check` 87604 checks 0
+failures, EXACTLY the parent's count, 19 blocks; all 51 ok/skip lines present, and the only
+5 whose text differs are the wall-clock ones (b8 rest-accounting, seg command-buffer count,
+p30 pacing/clamp timings) whose gen_ids are byte-identical. The P2.4/P2.6/P2.7 control lines
+are byte-identical to the parent: `513 GQA dispatches with the switch on ... 15873 per-head
+with it off, logits byte-identical at 16896/16896 positions`, `257/257 positions differ
+above the divergence seq, 0 of 16639 below`, `m/s/acc/out byte-identical over 100 reruns`
+for all three partial kernels. (4) `make debug` rc 0, 83614 checks 0 failures (the parent's
+count), no sanitizer diagnostics, ok-lines byte-identical.
+
+One consequence worth naming: extracting `SG_TG`/`tg_sum`/`tg_max` shifted everything below
+by 28 lines, so the `k_attn_decode_f16` line references were retargeted (`483-537` ->
+`455-509`, `497` -> `469`, `499-500` -> `471-472`) in `surge.h`, `docs/c4model.md`, the
+design spec, and in the moved comment that used to say a bare `(:497)` and now says
+`(src/kernels.metal:469)`. Three other comment edits inside the moved block were needed for
+the same reason: `k_attn_decode_f16 above` became `k_attn_decode_f16 (src/kernels.metal,
+the sibling translation unit of this one)`, and `tg_max's own NaN rule at the top of this
+file` became `... in kernels_common.metal.h`, since neither is in this file any more (both
+found by external review, not by the compiler: a dangling `above` compiles fine). The four
+live-code anchors in THIS file's earlier entries were retargeted too, so every
+`src/kernels.metal:NNN` reference in the repo still resolves; the dated gate docs quote
+shell commands rather than line anchors and are untouched.
+
+Final line counts: `src/kernels.metal` 1295, `src/kernels_splitk.metal` 1277,
+`src/kernels_common.metal.h` 65 (was one file of 2548).
+
+Full report: `.superpowers/sdd/2026-08-09-surge-m3-m5/task-R1-report.md`.

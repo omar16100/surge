@@ -457,7 +457,7 @@ void sg_ref_attn_combine(const float *m, const float *s, const float *acc,
 
 /* Decode-attention CPU oracle (Task P2.1): the per-op reference for the
  * coming Metal split-K decode kernel, isolating exactly the attention core
- * `k_attn_decode_f16` computes (src/kernels.metal:483-537). `attn_layer`
+ * `k_attn_decode_f16` computes (src/kernels.metal:455-509). `attn_layer`
  * (src/ref.c, static) cannot serve this role: it is a whole hybrid-layer
  * function (projections, qk-norm, RoPE, KV write, attention, gate, o_proj),
  * not a standalone attention-core primitive.
@@ -474,7 +474,7 @@ void sg_ref_attn_combine(const float *m, const float *s, const float *acc,
  *   out     [n_heads, head_dim].
  *
  * GQA: query head h reads kv head h / (n_heads / n_kv_heads), matching
- * src/kernels.metal:499-500 exactly, including its fallback to kv head 0
+ * src/kernels.metal:471-472 exactly, including its fallback to kv head 0
  * when n_heads < n_kv_heads (repeat == 0).
  *
  * NUMERICS: max-subtracted softmax, double accumulation, one round to float
@@ -497,7 +497,7 @@ void sg_ref_attn_combine(const float *m, const float *s, const float *acc,
  * KNOWN DIVERGENCE FROM k_attn_decode_f16 AT seq==0 (review finding, P2.1
  * fix round 1): unlike the n_kv_heads==0/head_dim==0/n_heads==0 no-ops
  * above, seq==0 is NOT a no-op on the Metal kernel side. k_attn_decode_f16
- * (src/kernels.metal:497) folds `seq == 0u` into its own single early-return
+ * (src/kernels.metal:469) folds `seq == 0u` into its own single early-return
  * guard and leaves `out` COMPLETELY UNWRITTEN there -- it does NOT write
  * zeros. This oracle instead treats seq==0 as the well-defined "attention
  * over zero keys" case and writes an explicit 0.0 per the all-empty

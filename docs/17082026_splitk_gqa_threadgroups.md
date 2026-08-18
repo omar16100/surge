@@ -61,6 +61,11 @@ across heads is what it forbids.
 
 ## Switchable, and off by default
 
+> SUPERSEDED 2026-08-18 by task P4.0: the default is now `1`, and `SURGE_ATTN_SPLITK_GQA=0`
+> is what pins the per-head kernel. This section is left as written, because it is the
+> record of why the switch shipped off; the current status is in "P4.0: SHIPPED BY DEFAULT"
+> at the end of this document.
+
 `SURGE_ATTN_SPLITK_GQA=1` selects the GQA partial for decode; the default is `0`, the
 per-head kernel P2.3 measured and shipped. Read once, in `sg_gpu_state_new`, exactly like
 `SURGE_ATTN_SPLITK` and `SURGE_KV_DTYPE`, so one binary can run both sides of the A/B.
@@ -147,6 +152,9 @@ partitioned, so it changes rounding, while `SURGE_ATTN_SPLITK_GQA=0/1` is contra
 change nothing at all.
 
 ## Flipping the default, when the gates pass
+
+> DONE 2026-08-18 (task P4.0), exactly as prescribed here. See "P4.0: SHIPPED BY DEFAULT"
+> at the end of this document for the gate results.
 
 One line, `src/metal.m`, in `sg_gpu_state_new`: `bool gqa_on = false;` becomes the same
 `sk_env`-style default-on parse `SURGE_ATTN_SPLITK` uses, i.e. default true with `"0"`
@@ -373,6 +381,9 @@ none.)
    vastly better than "half the per-head optimum" (3.8%/13.4%).
 
 ### Still open, and still not this task's decision
+
+> SETTLED 2026-08-18 by task P4.0: the default is now `true`. The "separate, deliberate,
+> outward-facing decision" this paragraph defers to was made by the user on that date.
 
 `attn_splitk_gqa` defaults to `false` in `sg_gpu_state_new`; `SURGE_ATTN_SPLITK_GQA=1` stays
 the opt-in. P2.5 removes the ONE reason the P2.4 gate doc gave for staying off (the wrong split
@@ -1180,3 +1191,80 @@ degenerate case the merge has no special case for.
   runs of the identical three arms gave 38.47/25.40/16.71 and then 39.72/41.16/34.66 tok/s, because
   each arm's 64 decode tokens follow its own 70-second prefill and the M3 Ultra's power state has
   not settled. Gate 8 is the timing authority; gate 7 is a correctness gate.
+
+## P4.0: SHIPPED BY DEFAULT (2026-08-18)
+
+**`attn_splitk_gqa` now defaults to ON.** The user approved the flip on 2026-08-18; that
+approval is the authority for it, and this section is the record of the gates run for it.
+`docs/index.md`, `docs/c4model.md` and `todo.md` were updated with it.
+
+Exactly one behavioural line changed, in `sg_gpu_state_new` (`src/metal.m`): `bool gqa_on =
+false;` became `bool gqa_on = true;` with the parse polarity inverted, so the block is now
+character-for-character the shape `SURGE_ATTN_SPLITK` has used since P2.3 (default on, `"0"`
+pins the incumbent, an unrecognized value warns and keeps the default). Note that the
+`g->attn_splitk_gqa = false;` line in `gpu_free_state` is NOT the default and was not flipped:
+it is a teardown reset, exactly like `attn_splitk`'s, and the effective value is
+`gqa_on && g->attn_splitk`, so the f32 KV path and `SURGE_ATTN_SPLITK=0` still force it off.
+
+Nothing else moved. `SURGE_ATTN_SPLITK_ONLINE` stays OFF (P2.8/P2.9 measured it 1.9-5% behind
+best-vs-best on the 4B, and the user declined that flip), `SG_SPLITK_GQA_N_SPLITS_CAP` stays
+256, `SG_SPLITK_GQA_MIN_TG` stays 128, and the kernels, the split policy, `sg_ref_*`, the
+combine and `src/sched.c` were not touched.
+
+### What turns it off, and where the default is not the GQA kernel
+
+`SURGE_ATTN_SPLITK_GQA=0` pins `k_attn_decode_splitk_partial` for every step, read once per
+`sg_gpu_state_new`. That is the A/B control and it is gated in both directions below, on
+dispatch counters rather than by inspection.
+
+The default is also not the GQA kernel wherever the P2.7 predicate declines it, which is a
+property of the SHAPE and the GRID, not of the switch: a GQA group outside [2, 8], a decode
+step below the split-K threshold of 1024 keys, the f32 KV path, and above all a dispatch that
+would be under 128 threadgroups (`splitk_gqa_n_splits(seq, cap) * n_kv_heads`). On the 4B dense
+shape (32 heads / 8 kv) that last one means seq 4096; on the 27B decode shape (24/4), seq 8192.
+So ONE run legitimately dispatches both kernels, and where it stops dispatching the per-head one
+is where the floor sits.
+
+### Gates run for the flip
+
+GPU checked idle (`pgrep -f "bench_niah|mlx_raw_niah|omlx|llama-server|surge-bench"` empty)
+before each.
+
+| # | gate | result |
+|---|---|---|
+| 1 | `make check` | GREEN. Diff against the pre-change baseline is the new default arm plus timing noise; see below |
+| 2 | `make debug` (ASan/UBSan, `-DSURGE_NO_METAL`) | rc 0, **0 sanitizer diagnostics**, and the per-subtest check counts are IDENTICAL to a stashed pre-change run of the same command |
+| 3 | env override BOTH ways, on the P2.4 dispatch counters | `=0` -> 15873 per-head / 0 GQA; `=1` -> 15360 per-head / 513 GQA; UNSET -> 15360 / 513, i.e. identical to `=1` (mini fixture, 16896 positions). On the real 4B above the floor: UNSET -> 0 per-head / 2268 GQA, `=0` -> 2268 / 0, `=1` -> 0 / 2268 |
+| 4 | real-model greedy equivalence, ABOVE the floor | 4B Q8_0, 5267-token prompt (sha256 `03ce9a25...`, the P2.8 prompt), decode at seq 5268..5330, 20 splits x 8 kv = 160 threadgroups: **0 of 64 generated tokens differ** across UNSET / `=0` / `=1`, with the counters above proving different kernels ran. `./surge ... -n 64` `gen_ids` sha256 `323e1c06...` for all three arms |
+| 4b | real-model greedy equivalence, BELOW the floor | same model, 3789-token prompt (sha256 `e4346426...`), decode at seq 3790..3852, 14 splits x 8 kv = 112 threadgroups: **all three arms dispatch 2268 per-head and 0 GQA**, so the guard declines the GQA kernel with the switch on, and `gen_ids` are byte-identical (sha256 `21431f6a...`). The identity is trivial there BY DESIGN, and the counters are what prove it is trivial for the right reason |
+| 5 | determinism on the now-default path | **100 reps x 16896 positions with the env var UNSET: 0 reps differed in ANY logit bit, 0 differed in dispatch counters, and every rep dispatched 15360 per-head + 513 GQA**, so it is a determinism gate on the GQA path and not on whatever the default happened to pick. Plus the unchanged kernel-level `GQA split-K partial: m/s/acc/out byte-identical over 100 reruns` in `make check`, and 5 reps of the real 4B above the floor (0 logit-bit differences, 540 GQA + 0 per-head each) |
+
+### What moved in `make check`, and why
+
+Nothing that any earlier gate asserted. The P2.4 control and the P2.6 cap-override subtest both
+PIN `SURGE_ATTN_SPLITK_GQA` explicitly in both of their arms, so they measure the same two
+kernels they always did and print the same numbers (`513 GQA dispatches with the switch on ... +
+15360 per-head below it, 15873 per-head with it off, logits byte-identical at 16896/16896`, and
+the cap-override line unchanged at `257/257 positions differ above the divergence seq, 0 of
+16639 below`).
+
+That is exactly why P4.0 added a THIRD arm to the P2.4 control, with the env var UNSET:
+
+```
+split-K GQA default (P4.0, env UNSET): 513 GQA + 15360 per-head dispatches,
+identical to the =1 arm; logits byte-identical to the =0 arm at 16896/16896 positions
+```
+
+`tests/test_gpu_fwd.c` therefore goes from 233 to 237 checks (the third arm's `state_new`, the
+counter equality against the `=1` arm, the policy table under the default, and the byte
+comparison against the `=0` arm). Every other subtest's check count is unchanged. The only other
+differences against the baseline log are `surge-bench`'s throughput lines (B6 slopes, B8/P3.0
+pacing, `phys_footprint`), which are run-to-run noise on this box and cannot be caused by this
+change: those runs decode at seq <= 1036 on a 2-kv-head fixture, three orders of magnitude under
+the 16384 this fixture needs to reach 128 threadgroups, so the per-head kernel runs there in
+both builds.
+
+The subtests that run with the env var UNSET and were therefore genuinely re-pointed by the flip
+are `mini_f16_splitk_decode_matches_incumbent` (seq 1600) and every `surge`/`surge-bench` CLI
+case; all of them are below the floor on this fixture, so the kernel they dispatch is unchanged,
+which is what the identical output proves.

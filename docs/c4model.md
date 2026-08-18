@@ -63,9 +63,13 @@ optionally Accelerate for the CPU reference path. No third-party libraries.
   `k_attn_decode_splitk_partial` + `k_attn_decode_splitk_combine` once the sequence
   reaches 1024 keys, `k_attn_decode_f16` below that and under `SURGE_ATTN_SPLITK=0`, and
   `k_attn_decode` on the f32-KV path; Task P2.4 adds the GQA-shared
-  `k_attn_decode_splitk_partial_gqa` as a same-bytes alternative to the partial, reached
-  only under `SURGE_ATTN_SPLITK_GQA=1`, gated on hardware 2026-08-17 and still off by
-  default; Task P2.8 adds `k_attn_decode_splitk_partial_gqa_online`, the streaming form of
+  `k_attn_decode_splitk_partial_gqa` as a same-bytes alternative to the partial, gated on
+  hardware 2026-08-17 and **SHIPPED AS THE DEFAULT PARTIAL SINCE TASK P4.0 (2026-08-18)**,
+  so a decode step at or above the occupancy floor (`n_splits * n_kv_heads >= 128`, task
+  P2.7) now dispatches the GQA partial and one below that floor still dispatches the
+  per-head one, in the SAME run; `SURGE_ATTN_SPLITK_GQA=0` pins the per-head partial
+  everywhere and is the A/B control. The two write the same bytes at a fixed `n_splits`.
+  Task P2.8 adds `k_attn_decode_splitk_partial_gqa_online`, the streaming form of
   that partial, reached only under `SURGE_ATTN_SPLITK_ONLINE=1`, also gated on hardware
   2026-08-17 and also off by default because it is measurably faster on the 27B shape and
   measurably slower on the 4B one) or
@@ -517,10 +521,13 @@ optionally Accelerate for the CPU reference path. No third-party libraries.
     `KI_ATTN_SPLITK_PARTIAL_GQA` on the existing `SG_K_HEADS2D` class, the two partial
     one-shots refactored onto ONE shared body (`splitk_partial_run`, so they cannot drift
     on a validation rule), public `sg_gpu_run_attn_splitk_partial_gqa`, and
-    `enc_attn_splitk` selecting pipeline + grid height. SWITCHABLE AND OFF BY DEFAULT:
-    `SURGE_ATTN_SPLITK_GQA=1` opts in (read in `sg_gpu_state_new` like `SURGE_ATTN_SPLITK`),
-    and `splitk_gqa_use` declines groups outside [2, 8]; the default stays the per-head
-    kernel P2.3 measured, because nothing here has been run. No threadgroup-count floor was
+    `enc_attn_splitk` selecting pipeline + grid height. SWITCHABLE, AND SINCE TASK P4.0
+    (2026-08-18) ON BY DEFAULT: `SURGE_ATTN_SPLITK_GQA=0` (read in `sg_gpu_state_new` like
+    `SURGE_ATTN_SPLITK`) is what pins the per-head kernel now, and `splitk_gqa_use` still
+    declines groups outside [2, 8] and grids under P2.7's 128-threadgroup floor. When this
+    text was written nothing here had been run and the default was OFF; what moved it is
+    P2.4's byte-identity, P2.6's real-model greedy gate where the split policies diverge,
+    and P2.7's floor. No threadgroup-count floor was
     invented: the GQA grid is `repeat`x smaller, so a short-sequence crossover probably
     exists and `tests/bench_splitk.bin --gqa` (new flag) is the instrument for it. Verified:
     the Metal compile (`-fno-fast-math -Wall`, 0 warnings) and `metallib` link with the new

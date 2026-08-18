@@ -17,6 +17,7 @@ held. It is superseded, on the same day, by the GPU gates actually running:
 | P2.8 online-softmax GQA partial (`k_attn_decode_splitk_partial_gqa_online`) | **DONE AND GATED ON HARDWARE 2026-08-17**: one streaming pass, no device-memory score row, no `splitk_scratch` binding. Worst rel 2.109e-06 vs both CPU oracles over 12 shapes x 7 split counts, 100x byte-identical, real-model 4B `gen_ids` byte-identical with 62 of 64 margins differing. Timing is TWO-SIDED: 1.013x-1.114x on the 27B at every decode-policy point, 0.690x-0.984x on the 4B at depth. `SURGE_ATTN_SPLITK_ONLINE` stays OFF by default for exactly that reason. See Task P2.8 Results at the end of this file. |
 | P2.9 key groups in the online partial's V phase | **DONE AND GATED ON HARDWARE 2026-08-18**: at `head_dim < SG_TG` the tile's KEYS are split across `SG_TG/kw` key groups so every thread owns an output dim, and the groups are merged with the split-K combine's own log-sum-exp weights at no extra threadgroup memory. **The 4B's deep regression is gone: 0.690x -> 1.015x at seq 262144 and 0.763x -> 0.954x at 131072, 1.25x-1.57x faster than P2.8's kernel wherever it used to lose**, with the 27B `n_kgroups == 1` path unmoved (0.980x-1.033x, inside single-arm round spread). P2.8's OTHER suspect was then measured: cutting the 8 KB scratch to 4 KB is worth only 0.4%-1.8%. 87509 checks 0 failures, worst rel 2.109e-06 (unchanged, and on the path this task does not touch), 100x byte-identical on the new path, real-model 4B `gen_ids` byte-identical. Four-pass kernels untouched. Both switches still OFF. See Task P2.9 Results at the end of this file. |
 | P2.6 greedy-token gate for the diverging split policies (`SURGE_SPLITK_GQA_CAP`) | **DONE AND GATED**: the cap is runtime-settable so the two arms really do pick different n_splits at a reachable seq. New `make check` subtest (321/321 positions differ above the divergence seq, 0 of 1279 below, argmax 1600/1600 agree), three applied-and-run mutations, and a real-model 4B A/B where `gen_ids` are byte-identical while 63 of 64 margins differ. Default cap stays 256 and `SURGE_ATTN_SPLITK_GQA` stays OFF. See Task P2.6 Results at the end of this file. |
+| P4.0 flip `attn_splitk_gqa` ON by default | **DONE AND GATED ON HARDWARE 2026-08-18, user-approved that day.** The GQA-shared partial is now the SHIPPED decode partial wherever P2.7's floor admits it; `SURGE_ATTN_SPLITK_GQA=0` pins the per-head one. `make check` green with the P2.4/P2.6 control lines UNMOVED (both arms pin the switch), plus a new third arm that measures the DEFAULT: 513 GQA + 15360 per-head dispatches, identical to the `=1` arm, logits byte-identical to the `=0` arm at 16896/16896 positions. Real 4B Q8_0: above the floor the default dispatches 2268 GQA / 0 per-head and `=0` dispatches 2268 per-head / 0 GQA, with `gen_ids` byte-identical across all three arms; below the floor all three arms dispatch per-head, also byte-identical. `SURGE_ATTN_SPLITK_ONLINE` still OFF, cap still 256, floor still 128, `sched.c` untouched. See Task P4.0 Results at the end of this file. |
 
 What that means concretely: the CPU oracles (P2.0, P2.1) are proven; the Metal kernels
 (P2.2) have now been executed against both of them on real hardware and matched; the
@@ -3284,3 +3285,80 @@ than run 4; run 4 was the FASTEST run and reported EIGHT, because it had a fast 
 against.
 
 Full write-up: `docs/18082026_decode_pacing.md`.
+
+
+## Task P4.0 Results: flip `attn_splitk_gqa` ON by default (`src/metal.m`), 2026-08-18
+
+**DONE AND GATED ON HARDWARE. USER-APPROVED 2026-08-18.** The GQA-shared split-K partial
+`k_attn_decode_splitk_partial_gqa` is now the decode partial surge ships, wherever P2.7's
+occupancy floor admits it. `SURGE_ATTN_SPLITK_GQA=0` pins the per-head partial.
+
+**One behavioural line.** In `sg_gpu_state_new`, `bool gqa_on = false;` became `bool gqa_on =
+true;` with the parse polarity inverted, making the block identical in shape to the
+`SURGE_ATTN_SPLITK` block above it. The `g->attn_splitk_gqa = false;` in `gpu_free_state` is a
+TEARDOWN RESET and was deliberately not touched: the effective value is `gqa_on &&
+g->attn_splitk`, so `SURGE_ATTN_SPLITK=0` and the f32 KV path still force it off, and a
+torn-down gpu still answers "nothing selected". Everything else in the change is comments,
+docs, and one added test arm.
+
+**Nothing else flipped.** `SURGE_ATTN_SPLITK_ONLINE` stays OFF (offered and declined: it is a
+9-12% win on the 27B but 1.9-5% behind best-vs-best on the 4B), `SG_SPLITK_GQA_N_SPLITS_CAP`
+stays 256, `SG_SPLITK_GQA_MIN_TG` stays 128, and the kernels, the split policy, `sg_ref_*`, the
+combine and `src/sched.c` were not touched.
+
+**Why it was safe to flip, all three already gated before this task:** byte-identity against
+the per-head partial at a fixed `n_splits` (P2.4), byte-exact greedy tokens on a real model
+where the two split policies pick DIFFERENT `n_splits` (P2.6: 321/321 positions differ
+numerically, argmax agrees 1600/1600), and the measured occupancy floor that keeps the kernel
+out of every point where the sweep saw it lose (P2.7). Measured 1.74x over the per-head partial
+at the 27B 262144 decode shape, 28.3x over the original decode kernel.
+
+**The gates that moved, and the one that was added.** `make check` is green, and the P2.4 and
+P2.6 subtests print exactly the numbers they printed before, because both of their arms PIN the
+env var and so were never measuring the default. That is the hazard this task had to close, so
+the P2.4 positive control got a THIRD arm with the env var UNSET:
+
+```
+split-K GQA decode: 513 GQA dispatches with the switch on (seq >= 16384, the P2.7 floor)
+  + 15360 per-head below it, 15873 per-head with it off, logits byte-identical at 16896/16896
+split-K GQA default (P4.0, env UNSET): 513 GQA + 15360 per-head dispatches, identical to
+  the =1 arm; logits byte-identical to the =0 arm at 16896/16896 positions   <- NEW
+```
+
+`tests/test_gpu_fwd.c` goes 233 -> 237 checks; every other subtest's count is unchanged, and
+`make debug` (ASan/UBSan) is rc 0 with 0 diagnostics and check counts byte-identical to a
+stashed pre-change run of the same command. The remaining log differences against the baseline
+are `surge-bench` throughput lines (B6 slope, B8/P3.0 pacing, `phys_footprint`), which are
+run-to-run noise: those cases decode at seq <= 1036 on a 2-kv-head fixture and need 16384 to
+reach 128 threadgroups, so the kernel they dispatch did not change.
+
+**The env override, proved in both directions on the P2.4 counters, not by inspection.**
+
+| arm | mini fixture, 16896 positions | real 4B Q8_0, above the floor |
+|---|---|---|
+| `SURGE_ATTN_SPLITK_GQA=0` | 15873 per-head, 0 GQA | 2268 per-head, 0 GQA |
+| `SURGE_ATTN_SPLITK_GQA=1` | 15360 per-head, 513 GQA | 0 per-head, 2268 GQA |
+| UNSET (the new default) | 15360 per-head, 513 GQA | 0 per-head, 2268 GQA |
+
+**Real-model greedy equivalence (gate 4), the one that protects users.** Qwen3-4B-Instruct-2507
+Q8_0, 32 heads / 8 kv / head_dim 128 / 36 full-attention layers, `-n 64`, three arms each:
+
+| prompt | tokens | decode seq | threadgroups | default arm dispatches | `gen_ids` |
+|---|---|---|---|---|---|
+| `03ce9a25...` (P2.8's) | 5267 | 5268..5330 | 20 x 8 = 160, ABOVE the floor | 2268 GQA, 0 per-head | byte-identical across UNSET / `=0` / `=1`, 0 of 64 tokens differ, CLI sha256 `323e1c06...` |
+| `e4346426...` | 3789 | 3790..3852 | 14 x 8 = 112, BELOW the floor | 2268 per-head, 0 GQA | byte-identical, 0 of 64 differ, CLI sha256 `21431f6a...` |
+
+Below the floor the equality is TRIVIAL by design, and the counters are what prove it is trivial
+for the right reason (the guard declined the GQA kernel with the switch on) rather than because
+the switch never reached the encoder.
+
+**Determinism (gate 5), end to end on the now-default path.** 100 reps x 16896 positions on the
+mini fixture with the env var UNSET, comparing every logit BIT and re-reading the counters each
+rep: **0 reps differed in any logit bit, 0 differed in dispatch counters, every rep 15360
+per-head + 513 GQA**. The counter column is what makes it a gate on the GQA path rather than on
+whatever the default happened to select. `make check`'s kernel-level `GQA split-K partial:
+m/s/acc/out byte-identical over 100 reruns` is unchanged, and the real 4B above the floor
+repeated 5x with 0 logit-bit differences and 540 GQA + 0 per-head dispatches per rep (5 and not
+100 because each rep carries a ~70 s 4400-token prefill).
+
+Full write-up: the "P4.0: SHIPPED BY DEFAULT" section of `docs/17082026_splitk_gqa_threadgroups.md`.

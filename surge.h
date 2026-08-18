@@ -921,9 +921,10 @@ sg_err sg_gpu_run_attn_splitk_combine(sg_gpu *g, void *m, void *s, void *acc,
  * time, but buys no reuse, so the decode path routes those shapes to the
  * per-head kernel instead.
  *
- * NOT THE DECODE DEFAULT YET. sg_gpu_forward dispatches this kernel only under
- * SURGE_ATTN_SPLITK_GQA=1 (see sg_gpu_state_new below): it was written while
- * the GPU was busy and no hardware gate has been run on it. */
+ * THIS IS THE SHIPPED DECODE PARTIAL SINCE TASK P4.0 (2026-08-18). sg_gpu_forward
+ * dispatches it by default wherever the group band and the occupancy floor admit
+ * it; SURGE_ATTN_SPLITK_GQA=0 (see sg_gpu_state_new below) pins the per-head
+ * partial instead, which is what keeps the A/B runnable on one binary. */
 sg_err sg_gpu_run_attn_splitk_partial_gqa(sg_gpu *g, void *q, void *k, void *v,
                                           void *m, void *s, void *acc,
                                           const uint32_t params[8]);
@@ -996,7 +997,9 @@ sg_err sg_gpu_run_attn_splitk_partial_gqa_online(sg_gpu *g, void *q, void *k, vo
  * decline, of the not-a-multiple decline or of P2.7's threadgroup floor tests
  * the real rule rather than a copy of it. It reflects the CURRENT state's
  * SURGE_ATTN_SPLITK_GQA, KV dtype and SURGE_SPLITK_GQA_CAP, so it answers false
- * for every shape while the switch is off. A NULL g answers false.
+ * for every shape on a state that turned the switch off with =0 (since P4.0 that
+ * is the non-default arm, and it is also how a caller can prove the override
+ * still works). A NULL g answers false.
  *
  * `seq` is required because the answer DEPENDS on it (task P2.7): the GQA kernel
  * gives one threadgroup the whole GQA group, which divides the grid by `repeat`,
@@ -1201,14 +1204,18 @@ sg_err sg_gpu_run_rmsnorm_gated_chunk(sg_gpu *g, void *y, void *z, void *out, vo
  * deterministic (rerunning either one reproduces its own logits exactly).
  *
  * WHICH SPLIT-K PARTIAL runs is a second, independent env var read at the same
- * point (Task P2.4): SURGE_ATTN_SPLITK_GQA. Default 0, the per-head
- * k_attn_decode_splitk_partial. 1 selects the GQA-shared
- * k_attn_decode_splitk_partial_gqa, which reads each K/V element once per GQA
- * GROUP instead of once per query head and is contracted to produce the SAME
- * BYTES (unlike the split-K/incumbent choice above, which changes rounding).
- * It is ignored unless split-K itself is on, and for GQA groups outside
- * [2, 8], where it would buy nothing. Default 0 because no hardware gate has
- * been run on that kernel yet, not because it is known to be slower.
+ * point (Task P2.4): SURGE_ATTN_SPLITK_GQA. DEFAULT 1 SINCE TASK P4.0
+ * (2026-08-18): the GQA-shared k_attn_decode_splitk_partial_gqa, which reads each
+ * K/V element once per GQA GROUP instead of once per query head and is contracted
+ * to produce the SAME BYTES (unlike the split-K/incumbent choice above, which
+ * changes rounding). 0 pins the per-head k_attn_decode_splitk_partial P2.3
+ * shipped. It is ignored unless split-K itself is on, for GQA groups outside
+ * [2, 8], where it would buy nothing, and below the measured occupancy floor of
+ * 128 threadgroups, where the collapsed grid costs more than the traffic it saves
+ * (the per-head partial runs there instead, so a single long run legitimately
+ * dispatches BOTH kernels). The default moved only after byte-identity, the
+ * greedy-token gate where the two split policies diverge, and that floor were all
+ * gated on hardware; 1.74x over the per-head partial at the 27B 262144 shape.
  *
  * SURGE_ATTN_SPLITK_ONLINE (Task P2.8) is a THIRD kernel choice at the same
  * point, and a peer of SURGE_ATTN_SPLITK_GQA rather than a modifier of it.

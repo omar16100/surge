@@ -557,17 +557,26 @@ static void mini_f16_splitk_decode_matches_incumbent(void) {
  *      than P2.3's A/B could use (that one changes the partition of the sum, so
  *      it changes rounding; this one must not change anything).
  *
- * Both passes run the same ids through a fresh state, with SURGE_ATTN_SPLITK
- * pinned on so the split-K path is live in both. */
+ * All three passes run the same ids through a fresh state, with SURGE_ATTN_SPLITK
+ * pinned on so the split-K path is live in each.
+ *
+ * TASK P4.0 ADDED THE THIRD ARM: `gqa_mode == NULL` UNSETS SURGE_ATTN_SPLITK_GQA
+ * and therefore measures THE DEFAULT. That arm is the whole gate for the default
+ * flip: the "0" and "1" arms pin the switch explicitly, so they would keep
+ * passing unchanged whichever way the default pointed, and a flip that silently
+ * failed to take effect (or a later flip back) would show up nowhere. With the
+ * default ON, this arm must reproduce the "1" arm's dispatch counts EXACTLY. */
 static void splitk_gqa_gate_run(sg_model *m, const int32_t *ids, uint32_t n,
                                 const char *gqa_mode, float *logits_out,
                                 uint64_t *per_head_out, uint64_t *gqa_out,
                                 bool *policy_ok) {
     uint32_t vocab = m->cfg.vocab;
+    const char *label = gqa_mode ? gqa_mode : "<unset, the default>";
     setenv("SURGE_ATTN_SPLITK", "1", 1);
-    setenv("SURGE_ATTN_SPLITK_GQA", gqa_mode, 1);
+    if (gqa_mode) setenv("SURGE_ATTN_SPLITK_GQA", gqa_mode, 1);
+    else unsetenv("SURGE_ATTN_SPLITK_GQA");
     sg_err e = sg_gpu_state_new(g_gpu, m, n);
-    tt_assert(!sg_failed(e), "sg_gpu_state_new (gqa=%s): %s", gqa_mode,
+    tt_assert(!sg_failed(e), "sg_gpu_state_new (gqa=%s): %s", label,
               e.msg ? e.msg : "ok");
     if (sg_failed(e)) return;
 
@@ -576,7 +585,9 @@ static void splitk_gqa_gate_run(sg_model *m, const int32_t *ids, uint32_t n,
      * is asked at SPLITK_GQA_DEEP_SEQ so that P2.7's threadgroup floor is
      * satisfied for all of them and these cases stay about the GROUP BAND; the
      * floor itself is gated separately, in splitk_gqa_floor_policy below. */
-    bool on = strcmp(gqa_mode, "1") == 0;
+    /* P4.0: unset means the DEFAULT, and the default is now ON, so the unset arm
+     * must satisfy exactly the same policy table as the "1" arm. */
+    bool on = gqa_mode == NULL || strcmp(gqa_mode, "1") == 0;
     const uint32_t ds = SPLITK_GQA_DEEP_SEQ;
     *policy_ok =
         sg_gpu_splitk_gqa_selected(g_gpu, 32, 8, ds) == on &&   /* 4B dense, repeat 4 */
@@ -592,7 +603,7 @@ static void splitk_gqa_gate_run(sg_model *m, const int32_t *ids, uint32_t n,
         const float *gl = NULL;
         e = sg_gpu_forward(g_gpu, m, ids[t], t, &gl);
         if (sg_failed(e)) {
-            tt_assert(false, "sg_gpu_forward %u (gqa=%s): %s", t, gqa_mode,
+            tt_assert(false, "sg_gpu_forward %u (gqa=%s): %s", t, label,
                       e.msg ? e.msg : "ok");
             return;
         }
@@ -721,16 +732,22 @@ static void mini_f16_splitk_gqa_dispatches_and_matches(void) {
     for (uint32_t t = 0; t < n; t++) ids[t] = seed[t % n_seed];
 
     size_t lbytes = (size_t)n * vocab * sizeof(float);
-    float *l_off = xmalloc(lbytes), *l_on = xmalloc(lbytes);
+    float *l_off = xmalloc(lbytes), *l_on = xmalloc(lbytes), *l_def = xmalloc(lbytes);
     memset(l_off, 0, lbytes);
     memset(l_on, 0, lbytes);
-    uint64_t ph_off = 0, gq_off = 0, ph_on = 0, gq_on = 0;
-    bool pol_off = false, pol_on = false;
+    memset(l_def, 0, lbytes);
+    uint64_t ph_off = 0, gq_off = 0, ph_on = 0, gq_on = 0, ph_def = 0, gq_def = 0;
+    bool pol_off = false, pol_on = false, pol_def = false;
 
     splitk_gqa_gate_run(&m, ids, n, "0", l_off, &ph_off, &gq_off, &pol_off);
     splitk_gqa_gate_run(&m, ids, n, "1", l_on, &ph_on, &gq_on, &pol_on);
-    /* The P2.7 floor table, asserted against the live state the "1" run above
-     * left behind (the switch is on there, which the table requires). */
+    /* P4.0: the arm with NO env var set, i.e. what a user of this engine gets.
+     * Runs last of the three so the state it leaves behind is a DEFAULT one. */
+    splitk_gqa_gate_run(&m, ids, n, NULL, l_def, &ph_def, &gq_def, &pol_def);
+    /* The P2.7 floor table, asserted against the live state the run above left
+     * behind (the switch must be on there, which the table requires; since P4.0
+     * that state is the DEFAULT one, so this is also a check that the default
+     * reaches the same predicate the "1" arm does). */
     splitk_gqa_floor_policy();
 
     /* 1. THE POSITIVE CONTROL, and after P2.7 it is a two-sided one. Every step
@@ -786,33 +803,72 @@ static void mini_f16_splitk_gqa_dispatches_and_matches(void) {
               (unsigned long long)gq_on, (unsigned long long)ph_on,
               (unsigned long long)ph_off);
 
+    /* 1b. TASK P4.0: WHICH KERNEL THE DEFAULT PICKS. The two arms above pin the
+     *     switch explicitly, so they say nothing about the default and would pass
+     *     unchanged whichever way it pointed. This is the assertion that fails if
+     *     the default flips back, or if a flip forward never reached the encoder.
+     *
+     *     Stated as EXACT EQUALITY with the "1" arm rather than as `gq_def > 0`,
+     *     for the reason assertion 1 gives: an existence test also passes for a
+     *     default that reached the switch but lost the P2.7 floor, and the split
+     *     between the two counters is where that floor is.
+     *
+     *     Note what the `ph_off > 0 && gq_off == 0` assertion above now ALSO
+     *     proves, which it did not before this task: that SURGE_ATTN_SPLITK_GQA=0
+     *     still turns the GQA path off now that off is the non-default direction.
+     *     The override is gated in BOTH directions here, on counters. */
+    tt_assert(gq_def == gq_on && ph_def == ph_on,
+              "with SURGE_ATTN_SPLITK_GQA UNSET the decode path must dispatch "
+              "exactly what SURGE_ATTN_SPLITK_GQA=1 dispatches (gqa %llu vs %llu, "
+              "per-head %llu vs %llu): since task P4.0 the GQA partial is the "
+              "SHIPPED DEFAULT, so any difference means the default moved",
+              (unsigned long long)gq_def, (unsigned long long)gq_on,
+              (unsigned long long)ph_def, (unsigned long long)ph_on);
+
     /* 2. The policy rules, including the band edges that were previously only a
      *    comment. */
     tt_assert(pol_on, "with SURGE_ATTN_SPLITK_GQA=1 the group-size policy is wrong: "
                       "an in-band shape declined or an out-of-band one was accepted");
     tt_assert(pol_off, "with SURGE_ATTN_SPLITK_GQA=0 some shape still selected the "
                        "GQA kernel");
+    tt_assert(pol_def, "with SURGE_ATTN_SPLITK_GQA UNSET the group-size policy must "
+                       "answer exactly as it does with =1; it did not, so the "
+                       "default and the explicit opt-in are not the same state");
 
     /* 3. Now that the counters prove different kernels ran, byte-identity is the
      *    contract itself. memcmp, not float ==, for the P2.2 reason. */
-    uint32_t diff = 0;
+    uint32_t diff = 0, diff_def = 0;
     for (uint32_t t = 0; t < n; t++) {
         if (memcmp(l_off + (size_t)t * vocab, l_on + (size_t)t * vocab,
                    (size_t)vocab * sizeof(float)) != 0) diff++;
+        /* P4.0: the default arm against the PINNED-OFF arm, which is the
+         * statement a user cares about: turning the new default off changes no
+         * bit of any logit. Compared against l_off and not against l_on so this
+         * is an independent comparison rather than a transitive one. */
+        if (memcmp(l_off + (size_t)t * vocab, l_def + (size_t)t * vocab,
+                   (size_t)vocab * sizeof(float)) != 0) diff_def++;
     }
     tt_assert(diff == 0,
               "the GQA partial must be BYTE-IDENTICAL end to end: %u of %u "
               "positions have different logit bits", diff, n);
+    tt_assert(diff_def == 0,
+              "the DEFAULT decode path must be byte-identical to the one pinned "
+              "with SURGE_ATTN_SPLITK_GQA=0: %u of %u positions differ", diff_def, n);
 
     fprintf(stderr, "   split-K GQA decode: %llu GQA dispatches with the switch on "
                     "(seq >= %u, the P2.7 floor) + %llu per-head below it, %llu "
                     "per-head with it off, logits byte-identical at %u/%u positions\n",
             (unsigned long long)gq_on, SPLITK_GQA_FLOOR_SEQ,
             (unsigned long long)ph_on, (unsigned long long)ph_off, n - diff, n);
+    fprintf(stderr, "   split-K GQA default (P4.0, env UNSET): %llu GQA + %llu "
+                    "per-head dispatches, identical to the =1 arm; logits "
+                    "byte-identical to the =0 arm at %u/%u positions\n",
+            (unsigned long long)gq_def, (unsigned long long)ph_def,
+            n - diff_def, n);
 
     unsetenv("SURGE_ATTN_SPLITK_GQA");
     unsetenv("SURGE_ATTN_SPLITK");
-    free(l_on); free(l_off);
+    free(l_def); free(l_on); free(l_off);
     free(ids);
     sg_model_free(&m);
     sg_gguf_close(gg);

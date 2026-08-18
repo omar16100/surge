@@ -352,8 +352,10 @@ struct sg_gpu {
      * threadgroup per GQA GROUP, each K/V element read once for all the query
      * heads that share it) instead of the per-head
      * k_attn_decode_splitk_partial; the two write the same bytes, so this
-     * changes memory traffic and grid shape, never the answer. DEFAULT FALSE
-     * until the deferred hardware gates run: see splitk_gqa_use. */
+     * changes memory traffic and grid shape, never the answer. DEFAULT TRUE
+     * SINCE TASK P4.0 (2026-08-18): this is the shipped decode partial, and
+     * SURGE_ATTN_SPLITK_GQA=0 is what pins the per-head one. See
+     * splitk_gqa_use for the shape and occupancy conditions that still apply. */
     bool attn_splitk_gqa;
     /* --- Task P2.8: online (streaming) softmax in the GQA partial ---
      * Read from SURGE_ATTN_SPLITK_ONLINE at the last sg_gpu_state_new call, and
@@ -1242,13 +1244,17 @@ static uint32_t splitk_use(const sg_gpu *g, uint32_t seq) {
  * ship. The two write the SAME bytes into the same m/s/acc layout, so this
  * chooses memory traffic and grid shape, never the answer.
  *
- * OFF BY DEFAULT, and that is a statement about evidence, not about the
- * kernel: at the time it was written the GPU was held by a 256K benchmark, so
- * NOTHING about the GQA kernel had been run. P2.2 shipped its kernels the same
- * way (written, compiled, dispatched by nothing) and P2.3 flipped the default
- * only after the hardware gates passed. SURGE_ATTN_SPLITK_GQA=1 opts in, which
- * is what makes the A/B runnable on ONE binary; see docs/17082026_splitk_gqa_
- * threadgroups.md for the gates that have to pass before the default moves.
+ * ON BY DEFAULT SINCE TASK P4.0 (2026-08-18), and that is a statement about
+ * evidence, exactly as the earlier default of OFF was. P2.4 wrote this kernel
+ * with the GPU held by a 256K benchmark, so nothing about it had been run and it
+ * shipped switched off, the way P2.2 shipped its kernels. What moved the default
+ * is that the three things it was waiting for are gated: byte-identity against
+ * the per-head partial at a fixed n_splits (P2.4), byte-exact greedy tokens on a
+ * real model where the two split policies DIVERGE (P2.6), and the measured
+ * occupancy floor below, which keeps this kernel out of every point where the
+ * sweep saw it lose (P2.7). SURGE_ATTN_SPLITK_GQA=0 pins the per-head partial,
+ * which is what keeps the A/B runnable on ONE binary; see docs/17082026_splitk_
+ * gqa_threadgroups.md for the gate results.
  *
  * THE GROUP MUST BE WORTH SHARING AND MUST FIT IN REGISTERS:
  *   - repeat < 2 means no sharing exists (the GQA grid would be the per-head
@@ -2834,8 +2840,9 @@ static void enc_attn_splitk(sg_enc *E, void *q, void *k, void *v, void *out,
      * kernel gives one threadgroup the whole GQA group, so it reads each K/V
      * element ONCE instead of once per query head sharing it; it writes the
      * same m/s/acc bytes into the same layout, so nothing else here (the
-     * combine, the buffers, the scratch) changes with the choice. Off unless
-     * SURGE_ATTN_SPLITK_GQA=1 selects it; see splitk_gqa_use.
+     * combine, the buffers, the scratch) changes with the choice. ON by default
+     * since P4.0, wherever the policy admits it; SURGE_ATTN_SPLITK_GQA=0 pins
+     * the per-head partial. See splitk_gqa_use.
      *
      * P2.7: p[3] is seq, and the predicate needs it for the measured
      * threadgroup floor, so the SAME step can pick the per-head partial early
@@ -3392,6 +3399,11 @@ static void gpu_free_state(sg_gpu *g) {
     sg_gpu_buf_free(g->b_sk_s); g->b_sk_s = NULL;
     sg_gpu_buf_free(g->b_sk_acc); g->b_sk_acc = NULL;
     g->splitk_max_splits = 0;
+    /* These three are a TEARDOWN RESET, not the defaults. Each resolves its real
+     * value in sg_gpu_state_new from the env, and two of them (attn_splitk since
+     * P2.3, attn_splitk_gqa since P4.0) resolve to TRUE there. false here means
+     * "no state, so nothing is selected and nothing dispatches", which is what
+     * sg_gpu_splitk_gqa_selected must answer on a torn-down gpu. */
     g->attn_splitk = false;
     g->attn_splitk_gqa = false;    /* P2.4: re-read from the env on the next state */
     g->attn_splitk_online = false; /* P2.8: same, SURGE_ATTN_SPLITK_ONLINE */
@@ -3723,23 +3735,36 @@ sg_err sg_gpu_state_new(sg_gpu *g, const sg_model *m, uint32_t max_ctx) {
     g->attn_splitk = splitk_on && kv_dtype == SG_T_F16;
 
     /* Task P2.4: SURGE_ATTN_SPLITK_GQA selects WHICH split-K partial the
-     * decode path dispatches, once split-K itself is on. DEFAULT 0, the
-     * per-head k_attn_decode_splitk_partial P2.3 measured and shipped; "1"
-     * selects the GQA-shared k_attn_decode_splitk_partial_gqa, which reads
-     * each K/V element once per GQA group instead of once per query head.
+     * decode path dispatches, once split-K itself is on. DEFAULT 1 SINCE TASK
+     * P4.0 (2026-08-18, user-approved): the GQA-shared
+     * k_attn_decode_splitk_partial_gqa, which reads each K/V element once per
+     * GQA GROUP instead of once per query head. "0" pins the per-head
+     * k_attn_decode_splitk_partial P2.3 measured and shipped, which is what
+     * keeps the A/B runnable on ONE binary and is why that kernel stays
+     * reachable rather than being deleted.
      *
-     * OFF BY DEFAULT BECAUSE NOTHING ABOUT IT HAS BEEN RUN: the GPU was held
-     * by a 256K benchmark for the whole of P2.4, so the kernel is compiled and
-     * reachable but ungated. That is exactly how P2.2 shipped its kernels, and
-     * P2.3 flipped its default only after the hardware gates passed. Same
-     * unrecognized-value warning as the two env vars above. */
+     * THE FLIP WAS NOT FREE, IT WAS GATED. Three things had to be true, and each
+     * has a gate (docs/17082026_splitk_gqa_threadgroups.md):
+     *   - the two four-pass partials are BYTE-IDENTICAL at a fixed n_splits
+     *     (P2.4), so this switch cannot change the answer wherever the two split
+     *     policies agree, which is every seq below 65792 at the shipped cap;
+     *   - where the GQA policy picks a DIFFERENT n_splits (P2.5), the greedy
+     *     tokens were gated on a real model rather than argued from margins
+     *     (P2.6: 321/321 positions differ numerically, argmax agrees 1600/1600);
+     *   - the occupancy floor (P2.7) keeps the GQA kernel out of every shape and
+     *     depth where the sweep MEASURED it losing, so the flip cannot regress
+     *     short context. Measured 1.74x over the per-head partial at the 27B
+     *     262144 decode shape.
+     *
+     * Same warn-and-keep-the-default rule for an unrecognized value as the two
+     * env vars above; the one spelling that turns this off is exactly "0". */
     const char *gq_env = getenv("SURGE_ATTN_SPLITK_GQA");
-    bool gqa_on = false;
-    if (gq_env && strcmp(gq_env, "1") == 0) {
-        gqa_on = true;
-    } else if (gq_env && gq_env[0] != '\0' && strcmp(gq_env, "0") != 0) {
+    bool gqa_on = true;
+    if (gq_env && strcmp(gq_env, "0") == 0) {
+        gqa_on = false;
+    } else if (gq_env && gq_env[0] != '\0' && strcmp(gq_env, "1") != 0) {
         fprintf(stderr, "gpu: SURGE_ATTN_SPLITK_GQA='%s' not recognized (want 0 or 1); "
-                        "using 0\n", gq_env);
+                        "using 1\n", gq_env);
     }
     g->attn_splitk_gqa = gqa_on && g->attn_splitk;
 

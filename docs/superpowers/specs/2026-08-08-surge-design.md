@@ -127,12 +127,40 @@ margin comes from overhead MLX pays and surge does not:
 4. Fused residual+RMSNorm+matvec chains to remove activation round-trips.
 5. Head-interleaved KV so 32k-depth GQA reads stay coalesced (KV reads are the
    second-order bandwidth term at depth).
+6. Added 2026-08-18, after measurement: decode-attention PARALLELISM. The five items
+   above are bandwidth and overhead levers, and at depth the dominant term was neither.
+   See "M4 amendment (2026-08-18)" below for what was measured and shipped.
 
 Budget: 2-3 weeks of profiling iteration in M4. Instrumentation first: every kernel
 reports bytes-moved/elapsed so the gap to roofline is always attributable. Risk stated
 honestly: if mlx-lm's overhead is smaller than measured elsewhere, the margin may land
 at 2-3 percent; the paired protocol is the referee and the result is published either
 way.
+
+Measurement discipline for M4, added 2026-08-18 because the decode work (tasks P2.3 to
+P4.0) needed all of it. M4 is a performance milestone on a machine whose firmware power
+limiter makes naive performance numbers unreliable, so an M4 measured badly will reach
+confident wrong conclusions. Full protocol, not restated here:
+`/Users/macmini/projects/llm-rnd/docs/benchmarking_methodology.md`.
+
+- Decode tok/s from `surge-bench` CANNOT rank two kernels on this machine. Three
+  IDENTICAL arms measured 38.47 / 25.40 / 16.71 tok/s, and after 150 s of idle the same
+  three reversed to 39.72 / 41.16 / 34.66 (`docs/18082026_decode_pacing.md:11-15`). That
+  is power state, not kernels.
+- Prefer a same-run A/B harness where one exists. `tests/bench_splitk.bin` times both
+  arms in one process on identical shapes, so its output is a ratio rather than an
+  isolated number, which is where every kernel ratio in the decode work came from
+  (`docs/18082026_decode_optimization_summary.md:133-142`).
+- Use `--reps 20` or more for anything you intend to conclude from. At default
+  repetitions two crossover findings in that work reversed, because the effects are a
+  few percent and at or below this machine's noise floor
+  (`docs/18082026_decode_optimization_summary.md:144-146`).
+- Run the fresh GEMM gate per arm, not once per session. On 2026-08-17 a four-arm surge
+  A/B measured it once up front, read 0.90 TFLOPS off a still-clamped GPU, and all four
+  arms were correctly voided; the accept bar is 20.5 TFLOPS and recovery from a clamped
+  state takes 60 to 120 s of genuine idle
+  (`/Users/macmini/projects/llm-rnd/docs/benchmarking_methodology.md:26-43`). The gate is
+  itself GPU work.
 
 ## Testing
 
@@ -152,7 +180,10 @@ way.
 - M2: Metal bf16 decode path byte-exact vs ref at temp 0.
 - M3: fused Q8_0 decode at >= 90 percent of roofline; correctness gate passes.
 - M4: kernel excellence: autotune + repack + fusion until paired-protocol decode beats
-  mlx-lm at 2k/8k/32k. The bar of the whole sub-project.
+  mlx-lm at 2k/8k/32k. The bar of the whole sub-project. AMENDED 2026-08-18: tasks P2.3
+  to P4.0 measured and rebuilt the decode path, and the framing on this line missed its
+  dominant term. See "M4 amendment (2026-08-18)" below, which records what decode
+  actually needed and raises a prefill RECOMMENDATION for the owner to accept or reject.
 - M5: kv.c to 128k + tiled prefill path + long-context gate run.
 - M6: server.c + cli.c; API conformance tests; chat template.
 - M7: sched.c pacing + clamp detection + fanpro hook; sustained-session A/B published.
@@ -160,13 +191,135 @@ way.
 - M9: bench.c leaderboard entry, docs, llm-rnd cross-links. Ship.
 
 Review cadence per llm-rnd convention: external review (codex/kimi when quota returns,
-internal adversarial agent otherwise) at M1, M4, and M9 minimum.
+internal adversarial agent otherwise) at M1, M4, and M9 minimum. Added 2026-08-18: M4's
+review should check that the measurement discipline above was actually followed, because
+end-to-end decode tok/s on this machine reversed the order of three identical arms
+(`docs/18082026_decode_pacing.md:11-15`), so a kernel A/B run the wrong way returns a
+confident answer rather than an obviously noisy one.
+
+## M4 amendment (2026-08-18): measured decode, and the prefill question
+
+M4 as written above treats decode as a bandwidth-and-fusion problem. Tasks P2.3 through
+P4.0 measured it, and the dominant term was neither bandwidth nor fusion. This section
+records what decode attention actually needed, what now ships, the two results that would
+be re-derived wrongly if the spec stayed silent, and one recommendation the owner has not
+yet ruled on. Consolidated write-up with every source:
+`docs/18082026_decode_optimization_summary.md`. Per-task gate docs:
+`docs/16082026_splitk_decode_gate.md` (P2.3),
+`docs/17082026_splitk_gqa_threadgroups.md` (P2.4 to P2.9 and P4.0),
+`docs/18082026_decode_pacing.md` (P3.0).
+
+### What decode attention actually needed, and that it is DONE
+
+The missing term was OCCUPANCY. The incumbent kernel `k_attn_decode_f16`
+(`src/kernels.metal:483`) is dispatched one threadgroup per query head
+(`src/metal.m:1743`), which is what the decode path did at every depth before P2.3. On
+the 27B's 24-head shape that gave only 24 of this machine's 80 GPU cores work, with one
+threadgroup walking the entire KV sequence
+(`docs/18082026_decode_optimization_summary.md:13-15`). No amount of autotune, repack or
+fusion addresses that. Splitting the KV sequence across threadgroups does, and nothing on
+the M4 line above proposed it.
+
+| task | change | measured effect |
+|---|---|---|
+| P2.3 | split-K (flash decoding) wired into `enc_attn` | 9.8x on real 4B decode at 32825 tokens (1.74 to 17.12 tok/s) |
+| P2.4 | one threadgroup per GQA GROUP instead of per query head | a further 1.74x at the 27B 262144 shape |
+| P2.5 | GQA-specific split policy, `clamp(min(seq / SG_TG, 256), 4, 1024)` (`src/metal.m:1491`) | mean regret 0.43 percent against the per-point optimum, versus 3.1 percent for the inherited policy |
+| P2.6 | greedy-token gate where the two split policies diverge | closed the last correctness gap |
+| P2.7 | occupancy floor, `n_splits * n_kv_heads >= 128` (`src/metal.m:1305`) | removed a measured 0.822x regression at short context |
+| P2.8 | online softmax, one streaming pass, no device score row | 27B 1.013x to 1.114x; 4B 0.690x to 0.984x, so shipped OFF |
+| P2.9 | key groups in the online V phase | 4B 262144 went 0.690x to 1.015x; 27B unmoved |
+| P3.0 | decode pacing with clamp detection (`src/sched.c`) | mechanism correct and gated; effect NOT demonstrated |
+| P4.0 | flip `attn_splitk_gqa` ON by default (`src/metal.m:3762`) | user-approved 2026-08-18 |
+
+Cumulative on the kernel that matters: 28.3x over the original decode attention at the
+27B `24h/4kv/256d` shape at 262144, and this SHIPS BY DEFAULT as of P4.0
+(`docs/18082026_decode_optimization_summary.md:35-36`, and the 4217.15 us at 256 splits
+against the incumbent in `docs/17082026_splitk_gqa_threadgroups.md:210`). Correctness
+held throughout at the ladder above: `make check` 87600 checks and `make debug` 83614
+checks, both 0 failures, with byte-identity claimed only where it applies and positive
+controls that count dispatches rather than assert equality
+(`docs/18082026_decode_optimization_summary.md:97-108`).
+
+Online softmax stays OFF (`SURGE_ATTN_SPLITK_ONLINE`): a 9 to 12 percent win on the 27B,
+still 1.9 to 5 percent behind best-vs-best on the 4B
+(`docs/18082026_decode_optimization_summary.md:119-120`).
+
+### Two counter-intuitive results, because they are the reusable part
+
+Both are cases where the obvious rule was measured to be wrong, and both would be
+re-derived wrongly by the next person planning M4.
+
+**The split policy is a CAP, not a rescaling.** "GQA wants half the per-head splits" fits
+the two deepest data points and is the WORST of four candidates at 13.4 percent
+worst-case regret, because the optimum saturates with depth rather than scaling with it
+(`docs/18082026_decode_optimization_summary.md:39-52`):
+
+| policy | mean regret | worst |
+|---|---|---|
+| `seq/SG_TG` (inherited) | 3.1% | 7.3% |
+| `min(seq/SG_TG, 256)` (shipped) | 0.43% | 2.73% |
+| `min(seq/SG_TG, 512)` | 1.5% | 4.2% |
+| `seq/(2*SG_TG)` (the intuition) | 3.8% | 13.4% |
+
+A two-point extrapolation would have shipped a 13 percent regression.
+
+**The occupancy guard is a threadgroup count, not a sequence length.** The GQA kernel
+collapses `repeat` threadgroups into one, dividing the grid by `repeat`, so at seq 2048
+the 27B gets 8 * 4 = 32 threadgroups against 80 cores and measures 0.822x, slower than
+the kernel it replaces. A `seq` threshold cannot express the fix: the per-shape
+crossovers are 1.7x apart in `seq` (5120-6144 on the 27B, 3072-4096 on the 4B) AND in the
+OPPOSITE order from the threadgroup view, because the 4B has twice the kv heads. One
+threadgroup threshold separates every measured point; one `seq` threshold must either
+admit a 27B loss or reject 4B wins
+(`docs/18082026_decode_optimization_summary.md:54-63`).
+
+### RECOMMENDATION to the owner: M4's remaining target is prefill
+
+This is a recommendation, not a decision taken here. The M4 bar above is unchanged and is
+not deleted: "paired-protocol decode beats mlx-lm at 2k/8k/32k" stands until the owner
+rules otherwise.
+
+Two things about that bar are worth putting in front of the owner. First, its work is
+substantially done while the bar itself is unmeasured: P2.3 to P4.0 rebuilt decode
+attention, but no gate doc or ledger entry records the paired-protocol comparison against
+mlx-lm at 2k/8k/32k ever having been run, so the milestone cannot be called met.
+
+Second, the two gaps now point in opposite directions. On the identical 234,158-token raw
+prompt at 262144, surge prefills at 2.99 tok/s compute (2.08 wall, the difference being
+B8's deliberate duty-cycle idle) against llama.cpp's 95.6 and mlx-lm's 101.9, roughly 32x
+behind (`/Users/macmini/projects/llm-rnd/docs/256k_comparison.md:118-127` and `:221-222`).
+And prefill is where surge's wall time goes: the completed 256K run took 31.4 h of which
+112359 s was prefill, roughly 99 percent of the run
+(`/Users/macmini/projects/llm-rnd/docs/256k_comparison.md:365`,
+`docs/18082026_decode_optimization_summary.md:112-113`).
+
+Recommendation: move M4's emphasis to the prefill path and keep the decode bar as a
+non-regression check rather than as the milestone's work. The owner accepts or rejects
+this; no milestone above has been changed on the strength of it.
+
+Two honesty notes that belong with the recommendation. surge's published 256K row is
+STALE: it records 0.537 tok/s decode and predates every task in the table above.
+Refreshing it costs about 31 hours that are roughly 99 percent prefill, which none of
+this work improved. And the decode gain is not yet an end-to-end claim: the
+attention-only projection is about 14.8 tok/s, the honest band is 8 to 15, it has never
+been measured end to end at that depth, and at 21120 tokens the measured end-to-end gain
+was only 1.07x because attention is not the dominant cost there
+(`docs/18082026_decode_optimization_summary.md:112-116`).
 
 ## Risks
 
 - The M4 margin may be small (2-3 percent); mitigations are speculation and sustained
   mode, which win regardless, but the stated bar is M4's and a miss is reported, not
-  spun.
+  spun. REVISITED 2026-08-18: this risk anticipated the wrong axis. On decode the
+  headroom was not a few percent of MLX overhead, it was 28.3x of surge's own occupancy
+  loss on the attention kernel at the 27B 262144 shape
+  (`docs/18082026_decode_optimization_summary.md:35-36`). That is a kernel-level ratio
+  against surge's previous kernel, NOT a margin over mlx-lm, and the paired-protocol
+  comparison at 2k/8k/32k that the bar names has still not been run. The risk that
+  remains is on the other axis: surge is roughly 32x BEHIND llama.cpp on prefill on the
+  same prompt (`/Users/macmini/projects/llm-rnd/docs/256k_comparison.md:221-222`). See
+  the M4 amendment above.
 - GGUF Q8_0 for Qwen3.6-27B must exist or be produced (llama.cpp quantize can make it
   from the bf16 safetensors; conversion is a documented step, not engine code).
 - mlx-lm is a moving target; the comparison pins 0.31.3 (the installed daily driver).

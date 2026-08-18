@@ -3362,3 +3362,53 @@ repeated 5x with 0 logit-bit differences and 540 GQA + 0 per-head dispatches per
 100 because each rep carries a ~70 s 4400-token prefill).
 
 Full write-up: the "P4.0: SHIPPED BY DEFAULT" section of `docs/17082026_splitk_gqa_threadgroups.md`.
+
+## Task P5.0 Results: bring the M4 spec section in line with what P2.3 to P4.0 measured (2026-08-18)
+
+DOCS ONLY. No code, no build, no `make check`, no Metal binary: a 256K `bench_niah_mlx`
+benchmark held the GPU for the whole task. Every number written into the spec was copied
+from an existing gate doc, the consolidated summary, or the llm-rnd comparison, and cited
+there. Nothing was re-derived or re-measured.
+
+Files touched: `docs/superpowers/specs/2026-08-08-surge-design.md`, `docs/index.md`,
+`todo.md`. `docs/c4model.md` deliberately NOT touched (it already covers these
+components).
+
+The M4 milestone line framed decode as "autotune + repack + fusion" and never mentioned
+splitting the KV sequence across threadgroups, which is what actually fixed it. Four
+edits to the spec:
+
+1. **Performance plan** gains a 6th item (decode-attention PARALLELISM, added after
+   measurement) and a "Measurement discipline for M4" block under the instrumentation
+   budget: `surge-bench` decode tok/s cannot rank kernels here (38.47 / 25.40 / 16.71
+   reversing to 39.72 / 41.16 / 34.66 after 150 s idle), prefer the same-run
+   `tests/bench_splitk.bin` A/B, use `--reps 20` or more, run the fresh GEMM gate per arm.
+   Points at `/Users/macmini/projects/llm-rnd/docs/benchmarking_methodology.md` rather
+   than restating it.
+2. **M4 milestone line** marked AMENDED and pointed at the new section. The bar itself is
+   left in place, unedited.
+3. **New section "M4 amendment (2026-08-18)"**: the occupancy diagnosis with code anchors
+   (`src/kernels.metal:483`, `src/metal.m:1743`), the P2.3-to-P4.0 task table with each
+   task's measured effect, the cumulative 28.3x shipping by default, the two
+   counter-intuitive results (the split policy is a CAP not a rescaling, worst candidate
+   13.4 percent regret; the occupancy guard is a threadgroup count not a `seq` threshold,
+   crossovers 1.7x apart and in the opposite order), and a RECOMMENDATION section.
+4. **Risks**: the "M4 margin may be small (2-3 percent)" line is kept and annotated. It
+   anticipated the wrong axis; the residual risk moved to prefill.
+
+**The recommendation is marked as a recommendation, not a decision.** M4's decode work is
+substantially done but its bar is UNMEASURED: no gate doc or ledger entry records the
+paired-protocol comparison against mlx-lm at 2k/8k/32k ever being run, so the milestone
+cannot be called met. Meanwhile on the identical 234,158-token prompt at 262144 surge
+prefills at 2.99 tok/s compute against llama.cpp's 95.6 and mlx-lm's 101.9, roughly 32x
+behind, and the completed 256K run was 31.4 h of which 112359 s was prefill (roughly 99
+percent). The spec recommends M4's emphasis move to prefill with the decode bar retained
+as a non-regression check, and says explicitly that the owner accepts or rejects it and
+that no milestone was changed on the strength of it. The existing decode bar is not
+deleted.
+
+Sources cited in the spec: `docs/18082026_decode_optimization_summary.md`,
+`docs/16082026_splitk_decode_gate.md`, `docs/17082026_splitk_gqa_threadgroups.md`,
+`docs/18082026_decode_pacing.md`,
+`/Users/macmini/projects/llm-rnd/docs/256k_comparison.md`,
+`/Users/macmini/projects/llm-rnd/docs/benchmarking_methodology.md`.

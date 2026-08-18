@@ -3412,3 +3412,39 @@ Sources cited in the spec: `docs/18082026_decode_optimization_summary.md`,
 `docs/18082026_decode_pacing.md`,
 `/Users/macmini/projects/llm-rnd/docs/256k_comparison.md`,
 `/Users/macmini/projects/llm-rnd/docs/benchmarking_methodology.md`.
+
+## Task B5.1 Results: bos-toggle case fix (`tests/test_cli_bench.sh`), 2026-08-18
+
+TEST ONLY, per the brief: `tests/test_cli_bench.sh` case (3) "BOS toggle" asserted `--bos ==
+--no-bos + 1` unconditionally, which only holds when the pointed-at GGUF actually carries
+`tokenizer.ggml.bos_token_id`. B5's own gate table only ever exercised the 27B (which has one);
+pointing `SURGE_BENCH_TOK_MODEL` at the 4B (`Qwen3-4B-Instruct-2507-Q8_0.gguf`, no BOS, the model
+most of this project's real-model gates use) hard-failed a legitimate input.
+
+Fix branches on whether the model actually has a usable `bos_token_id` (id present AND >= 0),
+detected via `surge-info` (new optional 3rd positional arg to the script, `${3:-./surge-info}`,
+auto-built in-script with `make --no-print-directory surge-info` only on the env-gated path so
+the unset/hermetic path is untouched) rather than parsing the GGUF in shell, since it already
+dumps every kv pair and the exact key `src/cli_bench.c` itself checks.
+
+- model HAS a bos_token_id: unchanged original assertion, `--bos == --no-bos + 1`.
+- model has NO bos_token_id: discovered (had to actually run it, not assumed) that
+  `surge-bench --bos` is not silent here, it HARD ERRORS (`src/cli_bench.c:435-438`, "--bos
+  requested but this model has no tokenizer.ggml.bos_token_id", rc=1, no `n_prompt_tokens` line
+  at all) rather than proceeding as `--no-bos` would. So the honest invariant is stronger than
+  the brief's fallback guess of "the two counts are equal": the case asserts the refusal itself
+  (nonzero rc, the exact stderr message, no n_prompt_tokens line for the --bos arm), a positive
+  control that would catch a future regression to either silently-equal OR silently-succeeding
+  behavior, not just a "did something fail" check. No skip path for the no-BOS case (would have
+  silently dropped the coverage).
+
+Gates: `SURGE_BENCH_TOK_MODEL=<4B> make check` (no-BOS branch, now passes, does not skip),
+`SURGE_BENCH_TOK_MODEL=<27B> make check` (has-BOS branch, `bos_token_id=248044`, unchanged
+assertion still passes), plain `make check` (unset, unchanged skip path) -- all three green, 0
+failures anywhere in any of the three full logs, and every non-bos-toggle "N checks, 0 failures"
+block byte-identical across all three (diffed the full logs, not just the tail). `make debug`
+rc 0, no sanitizer diagnostics (this path never touches surge/surge-bench/surge-info/
+test_cli_bench.sh at all: SURGE_NO_METAL excludes that whole recipe block). Only
+`tests/test_cli_bench.sh` touched; Makefile, engine, kernels untouched.
+
+Full report: `.superpowers/sdd/2026-08-09-surge-m3-m5/task-B5.1-report.md`.

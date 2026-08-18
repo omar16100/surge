@@ -15,7 +15,12 @@
 #       exit 3 (never 0) -- before any GPU load.
 #
 #   (3) BOS toggle (env-gated on SURGE_BENCH_TOK_MODEL, a GGUF with a real
-#       tokenizer): `--bos` vs `--no-bos` change n_prompt_tokens by exactly 1.
+#       tokenizer): asserts the invariant the pointed-at GGUF actually
+#       supports, detected via `surge-info`. A model with a real
+#       tokenizer.ggml.bos_token_id: `--bos` vs `--no-bos` change
+#       n_prompt_tokens by exactly 1. A model without one: `--bos` cannot add
+#       a token that does not exist, so surge-bench refuses the run outright
+#       (see src/cli_bench.c), and that refusal is what gets asserted.
 #       Skipped cleanly when the env var is unset (make check stays hermetic).
 #
 # Later tasks appended their own blocks below: B6's decode-slope verification,
@@ -25,11 +30,12 @@
 # Wired into `make check` (Metal only) and `make bench-check`. Skips cleanly
 # (exit 0) if the binaries are missing or the machine has no Metal device.
 #
-# Usage: bash tests/test_cli_bench.sh [surge] [surge-bench]
+# Usage: bash tests/test_cli_bench.sh [surge] [surge-bench] [surge-info]
 set -u
 
 SURGE="${1:-./surge}"
 BENCH="${2:-./surge-bench}"
+INFO="${3:-./surge-info}"
 GGUF="tests/fixtures/mini_fwd/model.gguf"
 ST="tests/fixtures/mini_fwd"
 
@@ -162,11 +168,24 @@ else
 fi
 
 # ------------------------------------------------------------------
-# (3) BOS toggle (env-gated): --bos vs --no-bos changes n_prompt_tokens by 1.
+# (3) BOS toggle (env-gated): asserts the invariant the pointed-at GGUF
+# actually supports, not one assumed. `--bos` cannot add a token the
+# tokenizer does not have, so a GGUF without tokenizer.ggml.bos_token_id is a
+# real, legitimate configuration and needs its own real assertion, not a
+# skip (a skip would fix a red suite by silently losing the coverage).
+#
+# Detected via `surge-info` (it already reads GGUF metadata) rather than
+# parsing the GGUF in shell: it dumps every kv pair, including
+# tokenizer.ggml.bos_token_id when present, which is the EXACT key
+# src/cli_bench.c checks before honoring --bos, so this cannot disagree with
+# what surge-bench itself does.
 # ------------------------------------------------------------------
 TOK_MODEL="${SURGE_BENCH_TOK_MODEL:-}"
 if [ -n "$TOK_MODEL" ] && [ -e "$TOK_MODEL" ]; then
     ncase=$((ncase + 1))
+    # Built unconditionally, mirroring how `check` builds surge/surge-bench
+    # before running this script: make no-ops when already current.
+    make --no-print-directory surge-info
     # A below-threshold gate keeps this to a tokenize + VOID exit (no GPU load),
     # but n_prompt_tokens is logged to stderr first, which is all we need.
     bench_nprompt() {
@@ -174,16 +193,63 @@ if [ -n "$TOK_MODEL" ] && [ -e "$TOK_MODEL" ]; then
             "$1" --gemm-gate-tflops 10 --quiet 2>&1 >/dev/null \
             | sed -n 's/.*n_prompt_tokens=\([0-9][0-9]*\).*/\1/p' | head -1
     }
-    nb="$(bench_nprompt --no-bos)"
-    wb="$(bench_nprompt --bos)"
-    if [ -z "$nb" ] || [ -z "$wb" ]; then
-        echo "FAIL bos-toggle: could not read n_prompt_tokens (no-bos='$nb' bos='$wb')" >&2
-        fail=1
-    elif [ "$wb" -ne "$((nb + 1))" ]; then
-        echo "FAIL bos-toggle: --bos ($wb) != --no-bos ($nb) + 1" >&2
+
+    if [ ! -x "$INFO" ]; then
+        echo "FAIL bos-toggle: could not build $INFO to read GGUF metadata" >&2
         fail=1
     else
-        echo "  ok bos-toggle: no-bos=$nb bos=$wb (+1)" >&2
+        bos_id="$("$INFO" "$TOK_MODEL" | sed -n \
+            's/^    tokenizer\.ggml\.bos_token_id = \(-\{0,1\}[0-9][0-9]*\)$/\1/p')"
+        has_bos=0
+        if [ -n "$bos_id" ] && [ "$bos_id" -ge 0 ]; then has_bos=1; fi
+        nb="$(bench_nprompt --no-bos)"
+
+        if [ "$has_bos" -eq 1 ]; then
+            # model HAS a usable bos_token_id: --bos must add exactly one
+            # token over --no-bos (the original invariant).
+            wb="$(bench_nprompt --bos)"
+            if [ -z "$nb" ] || [ -z "$wb" ]; then
+                echo "FAIL bos-toggle: could not read n_prompt_tokens (no-bos='$nb' bos='$wb')" >&2
+                fail=1
+            elif [ "$wb" -ne "$((nb + 1))" ]; then
+                echo "FAIL bos-toggle: --bos ($wb) != --no-bos ($nb) + 1 (bos_token_id=$bos_id)" >&2
+                fail=1
+            else
+                echo "  ok bos-toggle: bos_token_id=$bos_id; no-bos=$nb bos=$wb (+1)" >&2
+            fi
+        else
+            # model has NO bos_token_id: --bos cannot add a token that does
+            # not exist. surge-bench's own contract (src/cli_bench.c) is to
+            # REFUSE the run outright (hard error, no n_prompt_tokens line)
+            # rather than silently proceeding as though --bos had no effect,
+            # so the honest assertion is a positive control on that refusal
+            # actually happening, not merely that two (never-produced)
+            # counts happen to match.
+            wb_out="$("$BENCH" "$TOK_MODEL" -p "The quick brown fox jumps over the lazy dog." \
+                --bos --gemm-gate-tflops 10 --quiet 2>&1 >/dev/null)"
+            wb_rc=$?
+            wb="$(printf '%s' "$wb_out" | sed -n 's/.*n_prompt_tokens=\([0-9][0-9]*\).*/\1/p' | head -1)"
+            if [ -z "$nb" ]; then
+                echo "FAIL bos-toggle: could not read n_prompt_tokens for --no-bos (got '$nb')" >&2
+                fail=1
+            elif [ "$wb_rc" -eq 0 ] || [ -n "$wb" ]; then
+                echo "FAIL bos-toggle: model has no bos_token_id, yet --bos did not refuse " \
+                     "(rc=$wb_rc, n_prompt_tokens='$wb'): $wb_out" >&2
+                fail=1
+            else
+                case "$wb_out" in
+                    *"--bos requested but this model has no tokenizer.ggml.bos_token_id"*)
+                        echo "  ok bos-toggle: no bos_token_id; --no-bos=$nb tokens, --bos " \
+                             "correctly refused (rc=$wb_rc)" >&2
+                        ;;
+                    *)
+                        echo "FAIL bos-toggle: --bos was refused (rc=$wb_rc) but without the " \
+                             "expected bos_token_id message: $wb_out" >&2
+                        fail=1
+                        ;;
+                esac
+            fi
+        fi
     fi
 else
     echo "  skip bos-toggle: set SURGE_BENCH_TOK_MODEL to a tokenizer GGUF to run it" >&2

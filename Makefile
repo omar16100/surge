@@ -34,13 +34,15 @@ surge-ref: src/cli_ref.c $(LIB_SRC)
 # -fno-fast-math is not optional. The default enables reassociation and the
 # fast transcendentals, and the kernels are checked against ref.c's double
 # accumulators to 1e-4 relative with precise::exp / precise::sqrt.
-# TWO OBJECTIVE-C SOURCES, ONE HOST LAYER (task R2). src/metal.m passed the
-# ~2000-line guideline, so the chunked-prefill half moved to
-# src/metal_prefill.m; they share src/metal_internal.h (struct sg_gpu, the KI_
-# enum, sg_enc, the helpers that cross the seam). Unlike the .metal sources
-# these are REAL translation units that link, so both must appear on every
-# link line that used to name src/metal.m and neither may be dropped -- the
-# link would fail loudly (undefined sg_gpu_prefill), which is the point.
+# THREE OBJECTIVE-C SOURCES, ONE HOST LAYER (tasks R2 and R3). src/metal.m
+# passed the ~2000-line guideline, so the chunked-prefill half moved to
+# src/metal_prefill.m and the per-dispatch validation trio to
+# src/metal_validate.m; all three share src/metal_internal.h (struct sg_gpu,
+# the KI_ and SG_K_ enums, sg_enc, the helpers that cross the seams). Unlike
+# the .metal sources these are REAL translation units that link, so all three
+# must appear on every link line that used to name src/metal.m and none may be
+# dropped -- the link would fail loudly (undefined sg_gpu_prefill, undefined
+# check_params), which is the point.
 #
 # metal_internal.h is listed as a prerequisite for the same reason
 # kernels_common.metal.h is below: make does not scan #include lines, so
@@ -48,7 +50,7 @@ surge-ref: src/cli_ref.c $(LIB_SRC)
 # binary stale while still passing every test. THAT LIST IS HAND-MAINTAINED
 # and is exhaustive today (metal_internal.h and surge.h; the system and
 # framework headers are not tracked, as everywhere else in this Makefile).
-METAL_M = src/metal.m src/metal_prefill.m
+METAL_M = src/metal.m src/metal_prefill.m src/metal_validate.m
 METAL_M_DEPS = $(METAL_M) src/metal_internal.h surge.h
 
 METALLIB = src/kernels.metallib

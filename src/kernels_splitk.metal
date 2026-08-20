@@ -125,9 +125,10 @@ static inline float attn_combine_weight(float mi, float M) {
 }
 
 /* One threadgroup per (query head, split), a 2D grid dispatched as
- * (x = split, y = head); metal.m's SG_K_HEADS2D class is what carries those
+ * (x = split, y = head); the host's SG_K_HEADS2D class is what carries those
  * two group dimensions, since SG_K_ATTN's single *groups count cannot (see
- * gpu_grid there, and the SG_K_TILES2D precedent it follows).
+ * gpu_grid in metal_validate.m, and the SG_K_TILES2D precedent it follows;
+ * both SG_K_ kinds are declared in metal_internal.h since task R3).
  *
  * Buffers: q f32 [n_heads, q_stride]; kc, vc f16 [seq, n_kv_heads, head_dim]
  * (the sg_kv layout); m, s f32 [n_heads, n_splits]; acc f32
@@ -1225,7 +1226,8 @@ kernel void k_attn_decode_splitk_partial_gqa_online(device const float *q [[buff
     if (n_kv == 0u || hd == 0u || hk >= n_kv || part >= n_splits) return;
 
     uint repeat = n_heads / n_kv;
-    /* UNREACHABLE through metal.m's entry points (check_params rejects
+    /* UNREACHABLE through metal.m's entry points (check_params, in
+     * metal_validate.m since task R3, rejects
      * n_kv_heads == 0 and n_heads % n_kv_heads != 0 first). Guarded as a no-op
      * for the reason the four-pass kernel states: with a group size that does
      * not tile n_heads, the group at hk*repeat would run off the end of the

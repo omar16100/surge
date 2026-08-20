@@ -213,7 +213,7 @@ yet ruled on. Consolidated write-up with every source:
 
 The missing term was OCCUPANCY. The incumbent kernel `k_attn_decode_f16`
 (`src/kernels.metal:455`) is dispatched one threadgroup per query head
-(`src/metal.m:1448`), which is what the decode path did at every depth before P2.3. On
+(`src/metal.m:1104`), which is what the decode path did at every depth before P2.3. On
 the 27B's 24-head shape that gave only 24 of this machine's 80 GPU cores work, with one
 threadgroup walking the entire KV sequence
 (`docs/18082026_decode_optimization_summary.md:13-15`). No amount of autotune, repack or
@@ -224,13 +224,13 @@ the M4 line above proposed it.
 |---|---|---|
 | P2.3 | split-K (flash decoding) wired into `enc_attn` | 9.8x on real 4B decode at 32825 tokens (1.74 to 17.12 tok/s) |
 | P2.4 | one threadgroup per GQA GROUP instead of per query head | a further 1.74x at the 27B 262144 shape |
-| P2.5 | GQA-specific split policy, `clamp(min(seq / SG_TG, 256), 4, 1024)` (`src/metal.m:1196`) | mean regret 0.43 percent against the per-point optimum, versus 3.1 percent for the inherited policy |
+| P2.5 | GQA-specific split policy, `clamp(min(seq / SG_TG, 256), 4, 1024)` (`src/metal.m:851`) | mean regret 0.43 percent against the per-point optimum, versus 3.1 percent for the inherited policy |
 | P2.6 | greedy-token gate where the two split policies diverge | closed the last correctness gap |
-| P2.7 | occupancy floor, `n_splits * n_kv_heads >= 128` (`src/metal.m:1010`) | removed a measured 0.822x regression at short context |
+| P2.7 | occupancy floor, `n_splits * n_kv_heads >= 128` (`src/metal.m:664`) | removed a measured 0.822x regression at short context |
 | P2.8 | online softmax, one streaming pass, no device score row | 27B 1.013x to 1.114x; 4B 0.690x to 0.984x, so shipped OFF |
 | P2.9 | key groups in the online V phase | 4B 262144 went 0.690x to 1.015x; 27B unmoved |
 | P3.0 | decode pacing with clamp detection (`src/sched.c`) | mechanism correct and gated; effect NOT demonstrated |
-| P4.0 | flip `attn_splitk_gqa` ON by default (`src/metal.m:3208`) | user-approved 2026-08-18 |
+| P4.0 | flip `attn_splitk_gqa` ON by default (`src/metal.m:2868`) | user-approved 2026-08-18 |
 
 Cumulative on the kernel that matters: 28.3x over the original decode attention at the
 27B `24h/4kv/256d` shape at 262144, and this SHIPS BY DEFAULT as of P4.0

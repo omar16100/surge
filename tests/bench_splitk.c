@@ -117,8 +117,9 @@
  * allocated ONCE per shape, sized for the LARGEST n_splits this file ever
  * tests (1024) and reused unchanged across every seq and every n_splits in
  * that shape's sweep: sg_gpu_run_attn_splitk_partial/_combine accept a buffer
- * that is bigger than params[] strictly requires (buf_big_enough in metal.m
- * is a >= check), so this is not a size rule violation, just fewer
+ * that is bigger than params[] strictly requires (buf_big_enough, in
+ * src/metal_internal.h since task R3, is a >= check), so this is not a size
+ * rule violation, just fewer
  * allocations. If even that shared setup allocation fails, the whole shape is
  * skipped with a clear message (see run_shape).
  *

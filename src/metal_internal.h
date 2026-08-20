@@ -1,12 +1,13 @@
 /* metal_internal.h - the definitions src/metal.m shares with the other
- * Objective-C translation units of the Metal host layer (task R2).
+ * Objective-C translation units of the Metal host layer (tasks R2 and R3).
  *
  * THIS IS NOT A PUBLIC HEADER. The public contract (buffer layouts, params[]
  * per kernel, aliasing rules) lives in surge.h; this file exists only because
- * src/metal.m passed the ~2000-line guideline and its chunked-prefill half
- * moved to src/metal_prefill.m, which needs to see the same sg_gpu, the same
- * kernel index enum and the same handful of helpers. Nothing outside
- * src/metal*.m may include it.
+ * src/metal.m passed the ~2000-line guideline and pieces of it moved out:
+ * its chunked-prefill half to src/metal_prefill.m (task R2) and its per-
+ * dispatch validation trio to src/metal_validate.m (task R3). Both need to
+ * see the same sg_gpu, the same kernel index enum and the same handful of
+ * helpers. Nothing outside src/metal*.m may include it.
  *
  * WHAT BELONGS HERE, AND WHAT DOES NOT. Only declarations that genuinely
  * CROSS the metal.m / metal_prefill.m seam. A helper with callers on one side
@@ -15,12 +16,13 @@
  *
  * TWO KINDS OF FUNCTION LIVE HERE, and the difference is deliberate:
  *
- *   - `static inline` DEFINITIONS, for the one-line accessors and bit casts
- *     (bufof, offof, fbits, mul_ck, add_ck). These were `static` in metal.m
- *     and are called from the innermost encode loops, so giving them external
- *     linkage would have turned every one into a real call. `static inline`
- *     in a shared header keeps them file-local and inlinable in BOTH
- *     translation units, which is the closest thing to "nothing changed".
+ *   - `static inline` DEFINITIONS, for the one-line accessors, bit casts and
+ *     predicates (bufof, offof, fbits, mul_ck, add_ck, buf_big_enough). These
+ *     were `static` in metal.m and are called from the innermost encode loops
+ *     or from dozens of size checks, so giving them external linkage would
+ *     have turned every one into a real call. `static inline` in a shared
+ *     header keeps them file-local and inlinable in EVERY translation unit,
+ *     which is the closest thing to "nothing changed".
  *   - PROTOTYPES ONLY, for the larger helpers (the encode primitives, the
  *     allocators, the error formatter). Those really do gain external linkage
  *     and lose cross-translation-unit inlining; they are per-dispatch or
@@ -43,6 +45,55 @@
  * kernel-table comment in src/metal.m for why `kind` is what guarantees the
  * reduction kernels are dispatched at exactly this width. */
 #define SG_TG 256u
+
+/* The GRID KIND of a kernel: how its grid is derived from params[]. Moved here
+ * from src/metal.m by task R3, because gpu_grid (the switch that reads it) is
+ * now in src/metal_validate.m while the SG_KERNELS table that assigns it and
+ * sg_gpu_init's threadgroup-width check that consults it both stayed in
+ * src/metal.m. An anonymous enum is a declaration with no storage and no
+ * linkage, so this move creates no symbol in any object, exactly like the KI_
+ * enum below.
+ *
+ * `kind` is how the grid is derived from params[], and it is also what
+ * guarantees the reduction kernels get exactly SG_TG threads per
+ * threadgroup: kernels.metal folds its trees over the compile-time constant
+ * SG_TG, so dispatching a different width would silently drop lanes. */
+enum {
+    SG_K_ELEM,    /* params[0] threads, non-uniform threadgroups */
+    SG_K_ROWS,    /* params[0] threadgroups of SG_TG (one per output row) */
+    SG_K_TG1,     /* exactly one threadgroup of SG_TG */
+    SG_K_ATTN,    /* params[0] threadgroups of SG_TG, plus a scores scratch */
+    SG_K_GATED,   /* params[1] threadgroups of SG_TG (one per value head) */
+    SG_K_ELEM01,  /* params[0] * params[1] threads */
+    SG_K_ELEM02,  /* params[0] * params[2] threads */
+    SG_K_GROUPS2, /* params[2] threadgroups of SG_TG */
+    /* M5.3: a 2D grid of ceil(params[1]/SG_GEMM_TN) x ceil(params[0]/SG_GEMM_TM)
+     * threadgroups of SG_TG, one per GEMM output tile. Computed by hand in
+     * sg_gpu_run_op (not by gpu_grid, which only returns a 1D count) because
+     * this is the only kind whose group count needs two dimensions. */
+    SG_K_TILES2D,
+    /* M5.4: k_rope_chunk, one thread per (token, head, element) of the chunk,
+     * params[0]*params[2]*params[4] = head_dim*heads*n_tok threads, non-uniform
+     * threadgroups. An elementwise kernel with no reduction, dispatched through
+     * gpu_grid's *elems path like SG_K_ELEM but with a 3-factor count. */
+    SG_K_ROPE_CHUNK,
+    /* P2.2: the split-K decode-attention partial kernel's grid, a 2D
+     * params[6] x params[0] (split, query head) block of threadgroups of
+     * SG_TG. The SECOND kind after SG_K_TILES2D that needs two group
+     * dimensions and for the same reason SG_K_ATTN cannot be reused: that
+     * class carries exactly one *groups count (see gpu_grid in
+     * src/metal_validate.m), so it can express "one threadgroup per head" and
+     * nothing wider. Computed by hand in sg_gpu_run_attn_splitk_partial, which
+     * is the only path that reaches the kernel at all (it takes six device
+     * buffers, so sg_gpu_run_op's (a, b, out) shape cannot).
+     *
+     * P2.4's k_attn_decode_splitk_partial_gqa shares this kind with a params[6]
+     * x params[1] (split, KV head) grid: one threadgroup per GQA GROUP rather
+     * than per query head. Same class because the dispatchers compute both
+     * extents by hand anyway; the `kind` column is only read by sg_gpu_init's
+     * threadgroup-width check. */
+    SG_K_HEADS2D
+};
 
 /* The byte counts below are products of up to three caller-supplied uint32
  * params, and (uint64)p[0] * p[1] * 4 genuinely wraps for large ones. A
@@ -93,6 +144,24 @@ typedef struct {
     uint64_t offset;
     uint64_t nbytes;
 } sg_gpu_buf;
+
+/* Every kernel reads its inputs from indices computed out of params[], so a
+ * params/buffer mismatch is an out-of-bounds DEVICE read: not a crash the
+ * process can catch, but a GPU fault that takes down the whole context (and
+ * on a bad day the display driver). Hence a size precondition per kernel,
+ * checked by check_sizes in src/metal_validate.m, before anything is encoded.
+ *
+ * `static inline` and in this header since task R3, for the same reason the
+ * other one-liners here are. check_sizes moved to src/metal_validate.m and
+ * needs it, but twenty-six of its twenty-nine call sites are the one-shot
+ * entry points that stayed in src/metal.m. A two-instruction predicate behind
+ * a real call at all twenty-nine would be pure loss, and it would add one more
+ * unprefixed global with a very generic name; `static inline` gives each
+ * translation unit its own inlinable copy and creates no symbol at all (nm
+ * shows none in any object, at this revision or at the parent). */
+static inline bool buf_big_enough(const sg_gpu_buf *b, uint64_t need) {
+    return b != NULL && b->nbytes >= need;
+}
 
 /* Per-layer weights and state for the full decode path (Task 10). Exactly
  * one of the two attention groups is populated, by the same tensor-presence
@@ -380,7 +449,7 @@ typedef struct {
 } sg_enc;
 
 /* --------------------------------------------------------------------
- * The helpers that cross the seam
+ * The helpers that cross the seam, DEFINED IN src/metal.m
  * --------------------------------------------------------------------
  *
  * Each of these was `static` in src/metal.m and is still DEFINED there,
@@ -421,5 +490,29 @@ void enc_kv_store(sg_enc *E, void *src, void *dst, uint64_t dst_off, uint32_t n)
 /* One tiled-GEMM dispatch, Y[n, m] = X[n, k] @ W[m, k]^T. */
 void enc_matmul(sg_enc *E, int ki, void *x, uint64_t xoff, void *w,
                 void *y, uint64_t yoff, uint32_t nn, uint32_t mm, uint32_t kk);
+
+/* --------------------------------------------------------------------
+ * The helpers that cross the seam, DEFINED IN src/metal_validate.m
+ * --------------------------------------------------------------------
+ *
+ * Task R3's direction of travel is the OPPOSITE of R2's. Nothing in
+ * src/metal_validate.m is called from there; all six call sites of the three
+ * below stayed in src/metal.m, so it is the MOVED code that had to lose
+ * `static`, not the code it calls. All three are per-DISPATCH (once per
+ * sg_gpu_run_op call, once per encoded dispatch for gpu_grid), never per
+ * element, so the cost is one call each. */
+
+/* Buffer-size preconditions per kernel name; see the definition. One caller,
+ * sg_gpu_run_op. */
+sg_err check_sizes(const char *kernel, const sg_gpu_buf *a, const sg_gpu_buf *b,
+                   const sg_gpu_buf *o, const uint32_t *p);
+
+/* Per-kernel preconditions that are not about buffer sizes. Three callers, all
+ * one-shot entry points in src/metal.m. */
+sg_err check_params(const char *kernel, const uint32_t *p);
+
+/* Grid geometry from the kernel's SG_K_* kind and its params. Two callers,
+ * sg_gpu_run_op and enc_op. */
+void gpu_grid(int kind, const uint32_t *p, uint64_t *groups, uint64_t *elems);
 
 #endif /* SURGE_METAL_INTERNAL_H */

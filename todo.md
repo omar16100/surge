@@ -3388,7 +3388,7 @@ edits to the spec:
 2. **M4 milestone line** marked AMENDED and pointed at the new section. The bar itself is
    left in place, unedited.
 3. **New section "M4 amendment (2026-08-18)"**: the occupancy diagnosis with code anchors
-   (`src/kernels.metal:455`, `src/metal.m:1448`), the P2.3-to-P4.0 task table with each
+   (`src/kernels.metal:455`, `src/metal.m:1104`), the P2.3-to-P4.0 task table with each
    task's measured effect, the cumulative 28.3x shipping by default, the two
    counter-intuitive results (the split policy is a CAP not a rescaling, worst candidate
    13.4 percent regret; the occupancy guard is a threadgroup count not a `seq` threshold,
@@ -3615,7 +3615,9 @@ block by block:
   (`splitk_scratch_ensure`), `882-1250` (the P2.3-P2.8 policy block plus the six public
   split-K diagnostics), `1581-1900` (the P2.2 one-shots: `splitk_need`, `splitk_sizes`,
   `splitk_partial_run` and the four public run entry points) and `2460-2624`
-  (`enc_attn_splitk` with its doc). Alone it lands `metal.m` at 2669.
+  (`enc_attn_splitk` with its doc). Alone it lands `metal.m` at 2669. (Those four spans
+  and every other `src/metal.m:N` in this R2 entry are AS OF R2's commit `66d6347`; task
+  R3 shrank the file, and the R3 entry below restates them against the current tree.)
 - cut three, the kernel table plus the dispatch validation, **494 lines**: `src/metal.m:64-216`
   (153) and `495-835` (341). Alone it lands `metal.m` at 3053. Its `SG_KERNELS` half cannot
   move at all, see the next paragraph.
@@ -3642,3 +3644,99 @@ globals on the per-dispatch path. The genuinely movable core is `check_sizes` +
 `check_params` + `gpu_grid`, `src/metal.m:531-835`, 305 lines.
 
 Full report: `.superpowers/sdd/2026-08-09-surge-m3-m5/task-R2-report.md`.
+
+## Task R3 Results: split the validation trio out of `src/metal.m` (2026-08-20)
+
+DONE, and the guideline is STILL NOT MET, which is the expected outcome and was expected
+before the task started. `src/metal.m` goes 3547 -> 3207. That is 1.6x the ~2000-line
+guideline. R2's entry above priced this cut and said so; nothing here closes it.
+
+This is R1's cut three, restricted to the part R2's fix round established can actually move:
+`check_sizes`, `check_params` and `gpu_grid`, `src/metal.m:531-835` at the parent, 305 lines,
+now `src/metal_validate.m`. The `SG_KERNELS` / `SG_N_KERNELS` half of cut three did NOT move
+and was never attempted: five functions that stay in `metal.m` read it (`sg_gpu_free`,
+`sg_gpu_init`, `sg_gpu_run_op`, `gpu_run_delta_common` and `enc_op`, the last of which
+`src/metal_prefill.m` calls). `bufs_overlap` (13 call sites, none in the moved code) was not
+touched either.
+
+THE SEAM RUNS THE OPPOSITE WAY FROM R2's, and that is the whole shape of the task. R2 moved
+code that CALLED things which had to be promoted. Here all six call sites of the three moved
+functions stayed in `metal.m` (`sg_gpu_run_op` calls all three, the three split-K one-shots
+call `check_params`, `enc_op` calls `gpu_grid`), so it is the MOVED code that lost `static`.
+Three symbols gained external linkage: `check_sizes`, `check_params`, `gpu_grid`. All three
+are per-DISPATCH, never per-element.
+
+Two things crossed the seam the other way and were deliberately NOT promoted:
+
+- `buf_big_enough` became `static inline` in `src/metal_internal.h`. `check_sizes` uses it
+  three times; the other 26 call sites stayed in `metal.m`. It is a two-instruction
+  predicate that the compiler inlines at every site today, so promoting it would have been
+  29 real calls plus one more unprefixed global with a very generic name. `nm -a` shows no
+  copy of it in any object at either revision, so the inlining survived.
+- the `SG_K_*` grid-kind enum moved to `src/metal_internal.h`, the declaration only, exactly
+  as R2 did with the `KI_` enum. An anonymous enum has no storage and no linkage, so this
+  creates no symbol anywhere; `metal.m` still sees every constant through the header, and
+  `SG_KERNELS`, `SG_N_KERNELS`, `sg_kernel_desc` and the `_Static_assert` stayed put. This
+  is a 40-line subset of the `64-216` block R2's re-scoping said cannot move; the reason it
+  cannot move is `SG_KERNELS`'s five consumers, and that reason does not apply to a
+  declaration.
+
+Gates, both exact and both from `make clean`: `make check` 87604 checks 0 failures rc 0 (19
+count blocks), `make debug` 83614 checks 0 failures rc 0 with zero sanitizer diagnostics (16
+blocks), per-block breakdowns identical to R2's. `clang -fsyntax-only -std=c11 -Wall -Wextra
+-Werror` clean on all three `.m` files in the Metal and the `SURGE_NO_METAL` configuration.
+
+What no check count can see was measured instead, to R2's standard. `nm -a` against the
+parent objects: exactly 3 new global symbols (`_check_sizes`, `_check_params`, `_gpu_grid`),
+0 removed, and no out-of-line copy of `buf_big_enough`, `bufof`, `offof`, `fbits`, `mul_ck`
+or `add_ck` in any object at either revision. Per-function disassembly after address
+normalisation: 55 of the 59 common functions are instruction-for-instruction identical,
+including `sg_gpu_forward` at 1408 instructions with `enc_attn`, `enc_gdn` and
+`enc_attn_splitk` inlined into it, so the hot decode path did not change by one instruction.
+The 4 that differ: `sg_gpu_run_op` (636 -> 303 instructions, 54 -> 31 calls, because all
+three used to be inlined into it and are now called; it is a one-shot that commits a command
+buffer and waits), `enc_op` (154 -> 118, 9 -> 10 calls, because `gpu_grid` is now a call),
+`check_params` (255 -> 253, same call count, one static-string return tail-merged into an
+existing block by the new translation unit's layout), and the `ltmp0` section label of the
+new object, which is not a function. The 209 error and kernel-name string literals are an
+identical set across the seam.
+
+`enc_op` IS ON THE PER-TOKEN DECODE PATH and it gained one call instruction. Named rather
+than buried: it is the direct and unavoidable consequence of moving `gpu_grid`, which the
+task specified. `enc_op` is 38 lines of Objective-C message sends per dispatch, R2 already
+promoted `enc_op` itself for the same per-dispatch reason, and `sg_gpu_forward` above it is
+bit-identical. No timing was measured and none is claimed.
+
+Comment anchors: five `src/metal.m:N` line anchors retargeted for the shrink
+(`1448 -> 1104` twice, `1196 -> 851`, `1010 -> 664`, `3208 -> 2868`), each verified by
+reading the line it now lands on rather than by arithmetic (the `1104` one was also checked
+for its enclosing function, since `dispatchThreadgroups:MTLSizeMake((NSUInteger)n_heads, 1,
+1)` now occurs twice in the file and only the one inside `sg_gpu_run_attn_decode_f16` is the
+one the sentence is about). Ten by-name cross-file references were qualified with the file
+the symbol now lives in: six inside `metal.m`, two in `src/kernels_splitk.metal`, one in
+`tests/bench_splitk.c` and one in `docs/16082026_splitk_decode_gate.md`. Four comment blocks
+inside the moved code were retargeted the same way. The `kernels_splitk.metal` edits are
+comments only and rebuild the metallib without changing it semantically.
+
+Cut two, re-measured against THIS tree because R2's spans have shifted: **882 lines** at
+`src/metal.m:511-534`, `536-905`, `1237-1558` and `2118-2283` (four more lines than R2's 878,
+all of them R3's comment retargets inside those spans). Taking it lands `metal.m` at about
+2325, so the two cuts together land at roughly 2325, NOT under 2000. Cut two still crosses
+`enc_attn` on the hot per-token decode path and is still the higher-risk cut; it was not
+attempted here and was explicitly not authorised.
+
+Line counts: `src/metal.m` 3547 -> 3207, `src/metal_validate.m` 360 (new: a 49-line
+header and include block plus a 311-line body, 282 lines of it byte-identical to the
+parent), `src/metal_internal.h` 425 -> 518, `Makefile` 199 -> 201. The three Metal host
+files plus their shared header sum 4798 -> 4911, +113, all of it the new file header, the
+three prototypes and the comment retargets.
+
+KNOWN RESIDUAL RISK, carried forward from R2's finding M6 and made worse by this task:
+`check_sizes` and `check_params` are now unprefixed globals with extremely generic names.
+No collision exists today (`grep -w` over `src`, `tests`, `tools`, `surge.h` and the
+`Makefile` finds only comment mentions, and every link succeeds), and a duplicate DEFINITION
+would fail the link loudly. The quiet risk is a future translation unit that DECLARES one of
+them with a different signature and calls it, which C binds silently. Renaming the twelve
+promoted helpers to `sg_` prefixes is the mitigation and is its own task, not a move.
+
+Full report: `.superpowers/sdd/2026-08-09-surge-m3-m5/task-R3-report.md`.

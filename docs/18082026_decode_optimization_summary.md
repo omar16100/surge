@@ -118,9 +118,17 @@ mutation-proved rather than merely green.
   same prompt, a 32x difference that no decode work touches. That is milestone M4 territory.
 - **`attn_splitk_online` stays OFF.** It is a 9 to 12 percent win on the 27B but still 1.9 to 5
   percent behind best-vs-best on the 4B.
-- **File size.** `src/kernels.metal` is 2548 lines and `src/metal.m` 4616, both over the ~2000
+- **File size.** `src/kernels.metal` is 2548 lines and `src/metal.m` 4641, both over the ~2000
   house guideline. The recommended cut is `src/kernels_splitk.metal` along the existing seam,
   after further split-K work and before the next task touching a non-split-K kernel there.
+  (Both recommended cuts have since been done: task R1 on 2026-08-18 split
+  `src/kernels_splitk.metal` out, leaving `src/kernels.metal` at 1295, and task R2 on
+  2026-08-20 split `src/metal_prefill.m` out, leaving `src/metal.m` at 3547, still over the
+  guideline. The `4616` figure this bullet originally carried was already wrong when written:
+  `src/metal.m` was 4641 at the time. Corrected in R2 fix round 1, 2026-08-20, because this
+  was the last place in the tree still repeating the stale 4616 that R2 removed from
+  `src/sched.c`. Dated summary docs are otherwise left as historical records; this one is
+  annotated rather than rewritten.)
 - **A real defect found in passing**: B5's `bos-toggle` case hard-fails when
   `SURGE_BENCH_TOK_MODEL` points at the 4B GGUF, which carries no `tokenizer.ggml.bos_token_id`.
   Deserves its own task.

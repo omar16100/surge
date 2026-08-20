@@ -3525,8 +3525,20 @@ gated-DeltaNet chunk encoder `enc_gdn_prefill` with their comment blocks, and ol
 4100-4641, the whole `Chunked prompt prefill (Task M5.6)` block (`sg_prefill_bufs`,
 `prefill_save` / `prefill_restore` / `prefill_free_chunk`, `pf_now_s`, `pf_sleep_ms`,
 `PF_EST_MARGIN`, `PF_ALLOC`, `sg_gpu_set_prefill_rest`, `sg_gpu_set_prefill_max_burst`,
-`sg_gpu_prefill_segments`, `sg_gpu_prefill_rest_ms`, `sg_gpu_prefill`). The 782 moved lines
-were diffed against `git show HEAD:src/metal.m` by script: rc 0, not one character changed.
+`sg_gpu_prefill_segments`, `sg_gpu_prefill_rest_ms`, `sg_gpu_prefill`).
+
+CORRECTION (fix round 1, 2026-08-20): the moved body is 785 lines, not 782, and the diff
+against the parent is NOT rc 0. Rerunning
+`diff <(git show f11637c:src/metal.m | sed -n '3076,3315p;4100,4641p') <(sed -n '42,826p' src/metal_prefill.m)`
+gives rc 1 with exactly two hunks: `107c107,109`, the documented "public one-shots above"
+comment retarget (`src/metal_prefill.m:148-150`), and `240a243`, one inserted blank line
+(`src/metal_prefill.m:284`) between the two moved regions, which was not documented anywhere
+until now. 782 of the 785 lines are byte-identical and in original order; no code line, no
+constant and no ordering changed. The commit message of `c8f7d4c` carries the original
+wording ("rc 0, not one character changed") and CANNOT be corrected without rewriting
+history, which was not done: this paragraph and the report are the correction of record. Root
+cause: the identity script ran before the section-13C comment retargets were applied.
+
 This seam was chosen because NOTHING IN DECODE CALLS ANY OF IT (`sg_gpu_forward`,
 `enc_attn`, `enc_gdn` stayed and reach nothing in the new file), so the traffic across it is
 one-way.
@@ -3544,6 +3556,20 @@ per-allocation, never per-element. `enc_attn_prefill` / `enc_gdn_prefill` were a
 non-static, so they cost nothing. `g_errbuf`, the one piece of translation-unit-local state
 in the file, did NOT move: `gpu_errf` stayed with it and is the only writer, so there is
 still exactly one error buffer.
+
+KNOWN RESIDUAL RISK, recorded rather than fixed (fix round 1, 2026-08-20): those nine names
+are globally visible and unprefixed, and `enc_op`, `scratch_ensure` and `gpu_alloc_f32` are
+generic. Zero collisions exist today, confirmed twice (`grep -w` for each of the nine plus
+`bufof` / `offof` / `fbits` / `mul_ck` / `add_ck` across `src`, `tests`, `tools`, `surge.h`,
+`Makefile` finds only comment mentions in `tests/test_metal_ops.c`, `src/kv.c`, `src/ref.c`;
+there is no `ar` in the Makefile, every link is a direct `cc` of objects, and macOS
+two-level namespace stops a system dylib interposing). A duplicate DEFINITION would fail the
+link loudly. The quiet failure that is NOT covered: a future translation unit that DECLARES
+one of these names with a DIFFERENT signature and calls it binds to `metal.m`'s definition
+silently, because C has no name mangling and no cross-TU prototype check. Low probability,
+unbounded consequence. Mitigation is `sg_` prefixing as its own rename task, deliberately not
+done inside a move task; `src/metal_internal.h:382-388` is where the reason they are bare is
+recorded.
 
 `src/metal_internal.h` (425 lines) also carries the types the new file dereferences, moved
 once and not copied: `SG_TG`, the `KI_` enum, `sg_gpu_buf`, `sg_gpu_layer`, `struct sg_gpu`,
@@ -3580,9 +3606,39 @@ above.
 
 Line counts: `src/metal.m` 4641 -> 3547, `src/metal_prefill.m` 826 (new),
 `src/metal_internal.h` 425 (new). NOT DONE, AND SAID PLAINLY: 3547 is still well over the
-~2000-line guideline. R1's proposed cuts two (the split-K host layer, ~800 lines) and three
-(the KI_ table + `check_sizes` / `check_params` / `gpu_grid`, ~1100 lines) remain, and
-either would bring `metal.m` under it. They were not bundled here: cut two crosses the hot
+~2000-line guideline, and NEITHER REMAINING CUT CLOSES IT (corrected in fix round 1
+2026-08-20; the sentence here previously said either one would, which is false on this
+task's own numbers). Measured against the committed file, both remaining cuts enumerated
+block by block:
+
+- cut two, the split-K host layer, **878 lines**: `src/metal.m:857-880`
+  (`splitk_scratch_ensure`), `882-1250` (the P2.3-P2.8 policy block plus the six public
+  split-K diagnostics), `1581-1900` (the P2.2 one-shots: `splitk_need`, `splitk_sizes`,
+  `splitk_partial_run` and the four public run entry points) and `2460-2624`
+  (`enc_attn_splitk` with its doc). Alone it lands `metal.m` at 2669.
+- cut three, the kernel table plus the dispatch validation, **494 lines**: `src/metal.m:64-216`
+  (153) and `495-835` (341). Alone it lands `metal.m` at 3053. Its `SG_KERNELS` half cannot
+  move at all, see the next paragraph.
+
+BOTH cuts together land `metal.m` at 2175 (cut three taken whole, which it cannot be) or
+2328 (cut three restricted to the part that can actually move), so the realistic landing
+point is roughly 2050 to 2330 depending on how much of cut three survives: at the guideline,
+not under it. Getting `metal.m` under 2000 needs a third cut or a differently drawn seam, and
+the next task should be planned on that. They were not bundled here: cut two crosses the hot
 decode encoder, which is a different risk class from a seam decode never touches.
+
+CUT THREE IS NOT THE "NARROW INTERFACE" CUT THIS ENTRY ORIGINALLY PRICED AT ~1100 LINES.
+`SG_KERNELS` / `SG_N_KERNELS` are read by five functions that all stay in `metal.m`:
+`sg_gpu_free` (`src/metal.m:262`), `sg_gpu_init` (`316-341`), `sg_gpu_run_op` (`1257-1281`),
+`gpu_run_delta_common` (`2120`) and `enc_op` (`2400`, itself one of the nine helpers R2
+promoted and one that `src/metal_prefill.m` calls). Moving the table means either exporting
+the array or dragging those five along, and the `_Static_assert(SG_N_KERNELS == KI_COUNT)`
+would have to follow the table. The validation block is cleaner but not clean either:
+`check_sizes` has one caller (`1265`), `check_params` three (`1263`, `1677`, `1845`) and
+`gpu_grid` two (`1284`, `2400`), all in `metal.m`, but `buf_big_enough` (`504-506`) and
+`bufs_overlap` (`519-529`) have 28 and 13 call sites spread across the one-shot entry points
+and the DeltaNet path that stay behind, so those two either stay or become two more promoted
+globals on the per-dispatch path. The genuinely movable core is `check_sizes` +
+`check_params` + `gpu_grid`, `src/metal.m:531-835`, 305 lines.
 
 Full report: `.superpowers/sdd/2026-08-09-surge-m3-m5/task-R2-report.md`.

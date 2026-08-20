@@ -44,9 +44,20 @@
 #include <metal_stdlib>
 using namespace metal;
 
-/* The one threadgroup width every reduction kernel is dispatched with. A
- * power of two, so the fold tree is exactly log2(SG_TG) levels. */
-constant uint SG_TG = 256u;
+/* SG_TG and the two fixed-shape fold trees it sizes (tg_sum, tg_max) are in
+ * kernels_common.metal.h, because src/kernels_splitk.metal calls them too and
+ * a second copy that drifts is exactly the failure the rule above exists to
+ * prevent. They are the ONLY things the two files share; every other helper
+ * below has callers in this file alone. */
+#include "kernels_common.metal.h"
+
+/* The tiled-GEMM output tile shape (Task M5.3): SG_GEMM_TM rows (tokens) by
+ * SG_GEMM_TN columns (weight rows) per threadgroup, one thread per tile
+ * element, so SG_GEMM_TM * SG_GEMM_TN must equal SG_TG. Mirrored in metal.m
+ * as compile-time #defines of the same value, exactly the way SG_TG itself
+ * is mirrored there; keep all three in sync. */
+constant uint SG_GEMM_TM = 16u;
+constant uint SG_GEMM_TN = 16u;
 
 /* bf16 -> f32: the bf16 bit pattern IS the top half of the f32 one, which
  * makes this exact and identical to ref.c's bf16_to_f32. */
@@ -63,37 +74,6 @@ static inline float sg_sigmoid(float x) {
 }
 
 static inline float sg_silu(float x) { return x * sg_sigmoid(x); }
-
-/* Fixed-shape tree sum over a threadgroup. Callable repeatedly: the leading
- * barrier makes sure every thread has finished READING the previous result
- * out of red[0] before this call overwrites red[lid]. */
-static inline float tg_sum(threadgroup float *red, uint lid, float v) {
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    red[lid] = v;
-    for (uint stride = SG_TG / 2u; stride > 0u; stride >>= 1u) {
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        if (lid < stride) red[lid] = red[lid] + red[lid + stride];
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    return red[0];
-}
-
-/* Same tree, maximum. A NaN on EITHER side wins, so a NaN anywhere in the
- * row survives the fold; fmax() would swallow it and hand back a plausible
- * maximum computed from poisoned data. */
-static inline float tg_max(threadgroup float *red, uint lid, float v) {
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    red[lid] = v;
-    for (uint stride = SG_TG / 2u; stride > 0u; stride >>= 1u) {
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        if (lid < stride) {
-            float a = red[lid], b = red[lid + stride];
-            red[lid] = (a != a) ? a : ((b != b) ? b : ((b > a) ? b : a));
-        }
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    return red[0];
-}
 
 /* =====================================================================
  * Normalization
@@ -219,6 +199,52 @@ kernel void k_matvec_f32(device const float *w [[buffer(0)]],
     device const float *wr = w + (size_t)row * cols;
     float acc = 0.0f;
     for (uint c = lid; c < cols; c += SG_TG) acc += wr[c] * x[c];
+    float s = tg_sum(red, lid, acc);
+    if (lid == 0u) y[row] = s;
+}
+
+/* Q8_0 dequant fused into the matvec. The weight buffer is the RAW Q8_0
+ * tensor bytes: row R begins at byte R * (cols/32) * 34, and each 34-byte
+ * block is an f16 scale (little-endian) followed by 32 int8, so the
+ * dequantized weight for column c is scale(block c/32) * int8[c mod 32].
+ * This is exactly ref.c's sg_ref_matvec_q8 layout.
+ *
+ * Same shape as k_matvec_bf16 -- one threadgroup per output row, thread `lid`
+ * strides c = lid, lid+256, ... into a private f32 accumulator, then the 256
+ * partials fold through the fixed tg_sum tree -- so its parity (~1e-7 vs the
+ * double-accumulating ref) and its determinism (no atomics, no simd_sum)
+ * carry over unchanged. The one addition is the dequant: the scale's two
+ * bytes are read individually (no alignment assumption on the buffer) and
+ * bit-cast through `half`, which is the same IEEE binary16->binary32 widening
+ * ref.c's f16_to_f32 performs, so the decoded scale is bit-identical on both
+ * sides; the int8 is read as a signed `char`.
+ *
+ * NOTE the accumulation is per-ELEMENT (scale*int8*x summed straight into
+ * acc), where ref.c sub-accumulates one block's int8*x before multiplying by
+ * the scale. The two differ only in f32-vs-f64 rounding order, the same
+ * ~n*2^-24 relative gap every reduction kernel in this file has against ref;
+ * it is far inside the Q8_0 matvec's 2e-2 tolerance. */
+kernel void k_matvec_q8(device const uchar *w  [[buffer(0)]],
+                        device const float *x  [[buffer(1)]],
+                        device float *y        [[buffer(2)]],
+                        constant uint *p       [[buffer(3)]],
+                        uint row [[threadgroup_position_in_grid]],
+                        uint lid [[thread_position_in_threadgroup]])
+{
+    uint rows = p[0], cols = p[1];
+    if (row >= rows) return;
+
+    threadgroup float red[SG_TG];
+    uint blocks = cols / 32u;
+    device const uchar *wr = w + (size_t)row * blocks * 34u;
+    float acc = 0.0f;
+    for (uint c = lid; c < cols; c += SG_TG) {
+        device const uchar *blk = wr + (size_t)(c >> 5) * 34u;   /* block c / 32 */
+        ushort sbits = (ushort)blk[0] | ((ushort)blk[1] << 8);   /* f16, little-endian */
+        float scale = float(as_type<half>(sbits));
+        char q = as_type<char>(blk[2u + (c & 31u)]);             /* signed int8 */
+        acc += scale * (float)q * x[c];
+    }
     float s = tg_sum(red, lid, acc);
     if (lid == 0u) y[row] = s;
 }
@@ -381,6 +407,102 @@ kernel void k_attn_decode(device const float *q  [[buffer(0)]],
         float acc = 0.0f;
         for (uint t = 0; t < seq; t++) {
             acc += sc[t] * kv[v_off + ((size_t)t * n_kv + hk) * hd + i];
+        }
+        oh[i] = acc;
+    }
+}
+
+/* =====================================================================
+ * fp16 KV cache (Task M5.2): a decode-step cast+store and the matching
+ * attention kernel, so the K/V cache can shrink to half the bytes without
+ * changing the decode arithmetic. Both mirror k_attn_decode above statement
+ * for statement -- same accumulation order, same fixed-tree reduction, no
+ * atomics, no simd_sum -- so feeding k_attn_decode f32 inputs that are
+ * ALREADY the f16-rounded values makes the two kernels bit-identical:
+ * widening half -> float is exact (binary16 embeds into binary32 with no
+ * rounding), so there is no second rounding on the f16 kernel's side that
+ * the f32 kernel does not also see.
+ * ===================================================================== */
+
+/* Casts src[0..n) to half and writes it into dst. One thread per element,
+ * trivially deterministic (each output is written by exactly one thread from
+ * one input it alone reads). Used to land a freshly computed K or V vector
+ * into the sg_kv cache at the current position; buffer(1) is unused and only
+ * bound because every kernel signature must bind index 1. */
+kernel void k_kv_store_f16(device const float *src   [[buffer(0)]],
+                           device const float *unused [[buffer(1)]],
+                           device half *dst           [[buffer(2)]],
+                           constant uint *p           [[buffer(3)]],
+                           uint i [[thread_position_in_grid]])
+{
+    (void)unused;
+    if (i >= p[0]) return;
+    dst[i] = (half)src[i];
+}
+
+/* Attention decode reading a fp16 KV cache held in SEPARATE per-layer K and V
+ * buffers (the sg_kv layout: [cap, n_kv_heads, head_dim], head-interleaved),
+ * rather than k_attn_decode's one combined [K;V] buffer with a v_cache
+ * offset. Buffer indices are therefore shifted by one from every other
+ * kernel in this file (q, k, v, out, params, scores) to make room for the
+ * extra input; metal.m dispatches this one by hand rather than through the
+ * generic (a, b, out) path the rest of the kernels share.
+ *
+ * Every accumulation is IDENTICAL to k_attn_decode's: same thread-to-key
+ * striding, same serial per-element dot product, same tg_max/tg_sum fold,
+ * same division (not reciprocal-multiply) in the softmax. The only
+ * difference is the half -> float widen on each K/V read, which is exact. */
+kernel void k_attn_decode_f16(device const float *q  [[buffer(0)]],
+                              device const half *kc   [[buffer(1)]],
+                              device const half *vc   [[buffer(2)]],
+                              device float *out       [[buffer(3)]],
+                              constant uint *p        [[buffer(4)]],
+                              device float *scores    [[buffer(5)]],
+                              uint h   [[threadgroup_position_in_grid]],
+                              uint lid [[thread_position_in_threadgroup]])
+{
+    uint n_heads = p[0], n_kv = p[1], hd = p[2], seq = p[3];
+    uint q_stride = p[4];
+    float scale = as_type<float>(p[5]);
+    /* h is uniform across the threadgroup, so this return is uniform and
+     * cannot strand a thread on a barrier below. */
+    if (h >= n_heads || n_kv == 0u || hd == 0u || seq == 0u) return;
+
+    uint repeat = n_heads / n_kv;         /* GQA: mlx repeats the kv-head axis */
+    uint hk = repeat ? (h / repeat) : 0u;
+    device const float *qh = q + (size_t)h * q_stride;
+    device float *sc = scores + (size_t)h * seq;   /* this head's private slice */
+    threadgroup float red[SG_TG];
+
+    /* 1. scores. Thread `lid` owns keys lid, lid+256, ...; the dot product
+     *    itself is a serial loop over head_dim, so no reduction is needed
+     *    here at all. */
+    for (uint t = lid; t < seq; t += SG_TG) {
+        device const half *kt = kc + ((size_t)t * n_kv + hk) * hd;
+        float dot = 0.0f;
+        for (uint i = 0; i < hd; i++) dot += qh[i] * (float)kt[i];
+        sc[t] = dot * scale;
+    }
+    threadgroup_barrier(mem_flags::mem_device | mem_flags::mem_threadgroup);
+
+    /* 2. softmax over 0..seq-1, same degenerate-branch-free shape as
+     *    k_attn_decode (see its comment: no mask value exists here either). */
+    float m = -INFINITY;
+    for (uint t = lid; t < seq; t += SG_TG) { float v = sc[t]; m = (v > m) ? v : m; }
+    m = tg_max(red, lid, m);
+
+    float s = 0.0f;
+    for (uint t = lid; t < seq; t += SG_TG) { float e = precise::exp(sc[t] - m); sc[t] = e; s += e; }
+    float sum = tg_sum(red, lid, s);
+    for (uint t = lid; t < seq; t += SG_TG) sc[t] = sc[t] / sum;
+    threadgroup_barrier(mem_flags::mem_device | mem_flags::mem_threadgroup);
+
+    /* 3. context = sum_t p[t] * v[t], same fixed order as k_attn_decode. */
+    device float *oh = out + (size_t)h * hd;
+    for (uint i = lid; i < hd; i += SG_TG) {
+        float acc = 0.0f;
+        for (uint t = 0; t < seq; t++) {
+            acc += sc[t] * (float)vc[((size_t)t * n_kv + hk) * hd + i];
         }
         oh[i] = acc;
     }
@@ -681,3 +803,493 @@ kernel void k_delta_multi(device float *S           [[buffer(0)]],
         oh[j] = y;
     }
 }
+
+/* =====================================================================
+ * Task M5.3: tiled GEMM, Y[N, M] = X[N, K] @ W[M, K]^T
+ * =====================================================================
+ *
+ * The decode-step kernels above process one token (one row) at a time; the
+ * M5 prefill tasks need to project a whole CHUNK of N tokens through the
+ * same weight matrix in one dispatch. These three kernels are that: one
+ * threadgroup per (SG_GEMM_TM x SG_GEMM_TN) tile of the output, one thread
+ * per output element, a full serial loop over K. There is no cross-thread
+ * reduction at all -- unlike k_matvec_*'s row-per-threadgroup fold, each
+ * output element here is owned by exactly one thread from the moment it
+ * starts accumulating to the moment it writes y[row][col], so there is
+ * nothing to fold and nothing that could race: no atomics, no simd_sum, no
+ * threadgroup memory, no barrier. "Blocked" refers to the OUTPUT space: it
+ * is cut into SG_GEMM_TM x SG_GEMM_TN tiles, one per threadgroup, visited in
+ * the fixed order metal.m's SG_K_TILES2D grid class dispatches threadgroups
+ * in, which is itself fixed and data-independent (it depends only on N, M,
+ * K, never on the tensor contents). A thread whose (row, col) falls past the
+ * requested N or M returns immediately; nothing after it in the function
+ * touches threadgroup state, so an uneven early return cannot strand a
+ * sibling thread the way it would next to a tg_sum barrier.
+ *
+ * SG_GEMM_TM * SG_GEMM_TN == SG_TG (256): one thread per tile element,
+ * dispatched as a 2D (SG_GEMM_TN, SG_GEMM_TM) threadgroup -- [[thread_position
+ * _in_threadgroup]] has to be the same vector width as [[threadgroup_position
+ * _in_grid]] (Metal rejects a mix of scalar and vector attributed
+ * parameters), and the grid position is inherently 2D here (one component
+ * per output axis), so the in-threadgroup position is uint2 too rather than
+ * a flat index the kernel would otherwise have to div/mod out of a scalar
+ * lid. Total threads per threadgroup is still SG_TG (256), so sg_gpu_init's
+ * "this pipeline supports >= SG_TG threads per threadgroup" assertion covers
+ * these kernels without a special case; only the SHAPE of the dispatch
+ * differs from the reduction kernels' flat one.
+ *
+ * PRECISION. A single thread's serial K-loop is a plain left-to-right f32
+ * sum, not a tree fold, so its rounding error grows with K rather than with
+ * log2(K) the way tg_sum's does. Measured against a host double-accumulating
+ * reference this stays comfortably under the task's 1e-5 relative gate
+ * through K = 5120 (the widest weight the task brief lists) on the random
+ * test data the per-op test drives it with; a shared-memory K-blocked design
+ * that trades some of that margin back for bandwidth is M4's autotuning
+ * pass, not this one (M5.3 is a correctness-and-determinism task).
+ *
+ * Dequant is bit-for-bit k_matvec_bf16 / k_matvec_q8's: bf16_to_f32 for
+ * bf16, and for Q8_0 the same per-element "read the f16 scale bytewise
+ * little-endian, bit-cast through half, multiply the signed int8" as
+ * k_matvec_q8 above -- see its comment for the full rationale.
+ *
+ * Buffer order is (X, W, Y), NOT (W, X, Y) like the matvec kernels: buffer 0
+ * is the N x K activation chunk, buffer 1 is the M x K weight (per-dtype
+ * layout, same row stride as the matching k_matvec_* kernel), buffer 2 is
+ * the N x M f32 output, row-major throughout. params: [0]=N [1]=M [2]=K. */
+kernel void k_matmul_bf16(device const float *x  [[buffer(0)]],
+                          device const ushort *w [[buffer(1)]],
+                          device float *y        [[buffer(2)]],
+                          constant uint *p       [[buffer(3)]],
+                          uint2 tile [[threadgroup_position_in_grid]],
+                          uint2 lid  [[thread_position_in_threadgroup]])
+{
+    uint n = p[0], m = p[1], k = p[2];
+    uint row = tile.y * SG_GEMM_TM + lid.y;   /* output row, wants row < n */
+    uint col = tile.x * SG_GEMM_TN + lid.x;   /* output col, wants col < m */
+    if (row >= n || col >= m) return;
+
+    device const float *xr = x + (size_t)row * k;
+    device const ushort *wr = w + (size_t)col * k;
+    float acc = 0.0f;
+    for (uint i = 0; i < k; i++) acc += xr[i] * bf16_to_f32(wr[i]);
+    y[(size_t)row * m + col] = acc;
+}
+
+kernel void k_matmul_f32(device const float *x [[buffer(0)]],
+                         device const float *w [[buffer(1)]],
+                         device float *y       [[buffer(2)]],
+                         constant uint *p      [[buffer(3)]],
+                         uint2 tile [[threadgroup_position_in_grid]],
+                         uint2 lid  [[thread_position_in_threadgroup]])
+{
+    uint n = p[0], m = p[1], k = p[2];
+    uint row = tile.y * SG_GEMM_TM + lid.y;
+    uint col = tile.x * SG_GEMM_TN + lid.x;
+    if (row >= n || col >= m) return;
+
+    device const float *xr = x + (size_t)row * k;
+    device const float *wr = w + (size_t)col * k;
+    float acc = 0.0f;
+    for (uint i = 0; i < k; i++) acc += xr[i] * wr[i];
+    y[(size_t)row * m + col] = acc;
+}
+
+/* Q8_0 dequant fused into the GEMM inner loop, mirroring k_matvec_q8's block
+ * decode bit-for-bit: row `col` of W begins at byte col*(k/32)*34, each
+ * 34-byte block is a little-endian f16 scale then 32 signed int8, and the
+ * dequantized weight for element i is scale(block i/32) * int8[i mod 32]. */
+kernel void k_matmul_q8(device const float *x  [[buffer(0)]],
+                        device const uchar *w  [[buffer(1)]],
+                        device float *y        [[buffer(2)]],
+                        constant uint *p       [[buffer(3)]],
+                        uint2 tile [[threadgroup_position_in_grid]],
+                        uint2 lid  [[thread_position_in_threadgroup]])
+{
+    uint n = p[0], m = p[1], k = p[2];
+    uint row = tile.y * SG_GEMM_TM + lid.y;
+    uint col = tile.x * SG_GEMM_TN + lid.x;
+    if (row >= n || col >= m) return;
+
+    uint blocks = k / 32u;
+    device const float *xr = x + (size_t)row * k;
+    device const uchar *wr = w + (size_t)col * blocks * 34u;
+    float acc = 0.0f;
+    for (uint i = 0; i < k; i++) {
+        device const uchar *blk = wr + (size_t)(i >> 5) * 34u;   /* block i / 32 */
+        ushort sbits = (ushort)blk[0] | ((ushort)blk[1] << 8);   /* f16, little-endian */
+        float scale = float(as_type<half>(sbits));
+        char q = as_type<char>(blk[2u + (i & 31u)]);             /* signed int8 */
+        acc += scale * (float)q * xr[i];
+    }
+    y[(size_t)row * m + col] = acc;
+}
+
+/* =====================================================================
+ * Task M5.4: full-attention TILED PREFILL
+ * =====================================================================
+ *
+ * The M5.2 decode kernels above process one query token per dispatch; prefill
+ * has to push a whole CHUNK of N tokens through one full-attention layer in a
+ * single command buffer. These two kernels are that chunked form of the
+ * already-gated decode path: k_rope_chunk generalizes k_rope_heads to N tokens
+ * (each at its own absolute position), and k_attn_prefill generalizes
+ * k_attn_decode_f16 to N causal queries against the fp16 KV cache. Both are
+ * written so the arithmetic is IDENTICAL, statement for statement, to the
+ * decode sibling applied per token, so the decode path's parity and
+ * determinism carry over unchanged (no atomics, no simd_sum, one fixed-tree
+ * fold per row).
+ */
+
+/* Partial RoPE for a CHUNK of N tokens, the exact rotation k_rope_heads does
+ * but for every (token, head) slice at once, each token rotated at its own
+ * absolute position. The chunk buffer is a run of `heads * n_tok` head slices
+ * at a fixed element stride, token-major then head (token t head h is slice
+ * t*heads + h), so a single grid of one thread per (slice, element) covers it.
+ *
+ * cos/sin still arrive precomputed in the `cs` buffer -- ref.c computes the
+ * angle and its sine/cosine in DOUBLE (an f32 angle is 8e-3 wrong at position
+ * 262143) and Metal has no double, so the host builds the table per absolute
+ * position exactly as k_rope_heads' caller does. Here cs holds N tokens'
+ * tables back to back, [n_tok, rope_dim] (cos[half] then sin[half] per token),
+ * and slice s reads the table for token s/heads. Because the pairing math, the
+ * half-split layout and the untouched [rope_dim, head_dim) tail are all
+ * k_rope_heads' verbatim, feeding a single token's slice(s) the same cs table
+ * makes this BIT-IDENTICAL to calling k_rope_heads once for that token.
+ *
+ * params: [0]=head_dim [1]=rope_dim [2]=heads (per token) [3]=stride
+ *         [4]=n_tok. `out` may alias `x`: thread (s, i) writes only elements
+ * (i, i+half) of its own slice, which no other thread reads. */
+kernel void k_rope_chunk(device const float *x  [[buffer(0)]],
+                         device const float *cs [[buffer(1)]],
+                         device float *out      [[buffer(2)]],
+                         constant uint *p       [[buffer(3)]],
+                         uint g [[thread_position_in_grid]])
+{
+    uint head_dim = p[0], rope_dim = p[1], heads = p[2], stride = p[3], n_tok = p[4];
+    if (head_dim == 0u || heads == 0u || n_tok == 0u) return;
+    uint slices = n_tok * heads;
+    if (g >= slices * head_dim) return;
+    uint slice = g / head_dim, i = g % head_dim;
+    uint tok = slice / heads;              /* absolute-position index within the chunk */
+    uint half_dim = rope_dim / 2u;
+
+    device const float *xh = x + (size_t)slice * stride;
+    device float *oh = out + (size_t)slice * stride;
+    device const float *cst = cs + (size_t)tok * rope_dim;   /* this token's table */
+
+    if (i < half_dim) {
+        float c = cst[i], s = cst[half_dim + i];
+        float lo = xh[i], hi = xh[i + half_dim];
+        oh[i] = lo * c - hi * s;
+        oh[i + half_dim] = lo * s + hi * c;
+    } else if (i >= rope_dim) {
+        oh[i] = xh[i];
+    }
+}
+
+/* Causal full attention for a CHUNK of N query tokens at absolute positions
+ * base .. base+n_tok-1, against a fp16 KV cache (the sg_kv layout: SEPARATE K
+ * and V buffers, [cap, n_kv_heads, head_dim] head-interleaved) that ALREADY
+ * holds base+n_tok positions -- the caller stores the chunk's own K/V into the
+ * cache before dispatching this, so positions 0..base-1 are the prior context
+ * and positions base..base+n_tok-1 are the chunk itself.
+ *
+ * One threadgroup per (query token, query head). Threadgroup tg owns token
+ * t = tg / n_heads and head h = tg % n_heads, and attends over key positions
+ * 0 .. base+t INCLUSIVE, i.e. the first seq = base+t+1 cache positions. THAT
+ * IS THE CAUSAL MASK, enforced structurally by the loop bound rather than by
+ * writing -inf into masked scores: token t's absolute position is base+t, and
+ * seq stops one past it, so a query never reads a key at a strictly-future
+ * position. Later chunk tokens see earlier chunk tokens (t' < t gives key
+ * position base+t' <= base+t, inside the bound) and no token ever sees a
+ * strictly-future key (base+t' with t' > t is >= base+t+1 = seq, excluded).
+ *
+ * Every accumulation is k_attn_decode_f16's verbatim -- same thread-to-key
+ * striding, same serial per-element dot, same tg_max/tg_sum fold, same divide
+ * (not reciprocal-multiply) softmax, same half->float widen on each K/V read.
+ * So this kernel's output for token t is BIT-IDENTICAL to k_attn_decode_f16
+ * run with seq = base+t+1 and that token's query; the only reassociation
+ * freedom the task allows is deliberately not taken, which is why run-to-run
+ * output is byte-identical and the decode-equivalence gap is 0, not just
+ * < 1e-4.
+ *
+ * Buffers: q f32 [n_tok, n_heads, q_stride], k/v f16 [base+n_tok, n_kv, hd],
+ * out f32 [n_tok, n_heads, hd], scores f32 scratch [n_tok*n_heads, base+n_tok]
+ * (one private row per threadgroup, laid out at tg*(base+n_tok)).
+ * params: [0]=n_heads [1]=n_kv_heads [2]=head_dim [3]=base [4]=n_tok
+ *         [5]=q_stride [6]=softmax scale bits (f32 bit pattern). */
+kernel void k_attn_prefill(device const float *q  [[buffer(0)]],
+                           device const half *kc   [[buffer(1)]],
+                           device const half *vc   [[buffer(2)]],
+                           device float *out       [[buffer(3)]],
+                           constant uint *p        [[buffer(4)]],
+                           device float *scores    [[buffer(5)]],
+                           uint tg  [[threadgroup_position_in_grid]],
+                           uint lid [[thread_position_in_threadgroup]])
+{
+    uint n_heads = p[0], n_kv = p[1], hd = p[2], base = p[3], n_tok = p[4];
+    uint q_stride = p[5];
+    float scale = as_type<float>(p[6]);
+    /* tg is uniform across the threadgroup, so this return is uniform and
+     * cannot strand a thread on a barrier below. */
+    if (n_heads == 0u || n_kv == 0u || hd == 0u || n_tok == 0u) return;
+    if (tg >= n_tok * n_heads) return;
+
+    uint t = tg / n_heads;                 /* token index within the chunk */
+    uint h = tg % n_heads;                 /* query head */
+    uint seq = base + t + 1u;              /* causal: keys 0 .. base+t inclusive */
+
+    uint repeat = n_heads / n_kv;          /* GQA: mlx repeats the kv-head axis */
+    uint hk = repeat ? (h / repeat) : 0u;
+    device const float *qh = q + ((size_t)t * n_heads + h) * q_stride;
+    uint row_stride = base + n_tok;        /* max seq over the chunk */
+    device float *sc = scores + (size_t)tg * row_stride;    /* this tg's private row */
+    threadgroup float red[SG_TG];
+
+    /* 1. scores over keys 0..seq-1. Thread `lid` owns keys lid, lid+256, ...;
+     *    the dot product is a serial loop over head_dim, so no reduction here. */
+    for (uint kk = lid; kk < seq; kk += SG_TG) {
+        device const half *kt = kc + ((size_t)kk * n_kv + hk) * hd;
+        float dot = 0.0f;
+        for (uint i = 0; i < hd; i++) dot += qh[i] * (float)kt[i];
+        sc[kk] = dot * scale;
+    }
+    threadgroup_barrier(mem_flags::mem_device | mem_flags::mem_threadgroup);
+
+    /* 2. softmax over 0..seq-1, same degenerate-branch-free shape as
+     *    k_attn_decode_f16: the causal bound is the only mask, and every score
+     *    is a finite dot product of finite activations. */
+    float m = -INFINITY;
+    for (uint kk = lid; kk < seq; kk += SG_TG) { float v = sc[kk]; m = (v > m) ? v : m; }
+    m = tg_max(red, lid, m);
+
+    float s = 0.0f;
+    for (uint kk = lid; kk < seq; kk += SG_TG) { float e = precise::exp(sc[kk] - m); sc[kk] = e; s += e; }
+    float sum = tg_sum(red, lid, s);
+    for (uint kk = lid; kk < seq; kk += SG_TG) sc[kk] = sc[kk] / sum;
+    threadgroup_barrier(mem_flags::mem_device | mem_flags::mem_threadgroup);
+
+    /* 3. context = sum_kk p[kk] * v[kk], same fixed order as k_attn_decode_f16. */
+    device float *oh = out + ((size_t)t * n_heads + h) * hd;
+    for (uint i = lid; i < hd; i += SG_TG) {
+        float acc = 0.0f;
+        for (uint kk = 0; kk < seq; kk++) {
+            acc += sc[kk] * (float)vc[((size_t)kk * n_kv + hk) * hd + i];
+        }
+        oh[i] = acc;
+    }
+}
+
+/* =====================================================================
+ * Task M5.5: gated-DeltaNet TILED PREFILL (state threaded across chunks)
+ * =====================================================================
+ *
+ * The four kernels below push a CHUNK of N tokens through the per-token
+ * DeltaNet ops above, threading the recurrent state (the conv tail and the S
+ * matrix) from token to token INSIDE the kernel. The within-chunk scan is
+ * SEQUENTIAL by design (a literal loop over the N tokens), so each is
+ * BIT-IDENTICAL to its per-token decode sibling looped over the chunk with the
+ * state threaded -- no reassociation, no atomics, no simd_sum, byte-identical
+ * run to run. The parallel WY/UT chunked form is an explicit M4 follow-up, not
+ * this task. The cross-chunk state carriers are sg_kv's per-layer conv tail and
+ * S buffers; at chunk 0 the caller has them zeroed (sg_kv_reset), and each chunk
+ * reads the incoming state and writes the outgoing state back in place.
+ */
+
+/* Causal depthwise 1D conv over `channels` for a chunk of `n_tok` tokens, one
+ * thread per channel, replaying k_conv1d_step per token with the conv tail
+ * threaded. The tail lives in a SEPARATE `state` buffer [ksize-1, channels]
+ * (the sg_kv conv carrier), read at entry and rewritten in place -- thread c
+ * touches only column c of x, out and state, so the per-token shift needs no
+ * synchronization and no barrier between tokens (a channel is a closed
+ * computation across the whole chunk). Statement for statement this is
+ * k_conv1d_step's body wrapped in a token loop, so looping k_conv1d_step over
+ * the N tokens with the tail carried produces byte-identical output and tail.
+ *
+ * params: [0]=channels [1]=ksize [2]=n_tok. Buffers: x [n_tok, channels] in,
+ * w [channels, ksize], out [n_tok, channels], state [ksize-1, channels] in+out. */
+kernel void k_conv1d_chunk(device const float *x     [[buffer(0)]],
+                           device const float *w     [[buffer(1)]],
+                           device float *out         [[buffer(2)]],
+                           constant uint *p          [[buffer(3)]],
+                           device float *state       [[buffer(4)]],
+                           uint c [[thread_position_in_grid]])
+{
+    uint channels = p[0], ksize = p[1], n_tok = p[2];
+    if (c >= channels || ksize == 0u || n_tok == 0u) return;
+    uint keep = ksize - 1u;
+
+    device const float *wc = w + (size_t)c * ksize;
+    for (uint t = 0u; t < n_tok; t++) {
+        float tok = x[(size_t)t * channels + c];
+
+        /* Taps 0..keep-1 read the carried tail oldest-first; tap `keep` is this
+         * token. */
+        float acc = 0.0f;
+        for (uint j = 0u; j < keep; j++) acc += wc[j] * state[(size_t)j * channels + c];
+        acc += wc[keep] * tok;
+
+        /* Shift the tail one step older and append this token; row j+1 read
+         * before row j is written, j increasing, so nothing is clobbered early. */
+        for (uint j = 0u; j + 1u < keep; j++) {
+            state[(size_t)j * channels + c] = state[(size_t)(j + 1u) * channels + c];
+        }
+        if (keep > 0u) state[(size_t)(keep - 1u) * channels + c] = tok;
+
+        out[(size_t)t * channels + c] = acc;
+    }
+}
+
+/* The two DeltaNet per-head gates for a chunk of `n_tok` tokens, one thread per
+ * (token, head), replaying k_delta_gates per token. a and b arrive as SEPARATE
+ * token-major chunks [n_tok, n] (the two in_proj GEMM outputs), ssm_a and
+ * dt_bias are per-head and shared across the chunk (adt = [ssm_a(n), dt_bias(n)],
+ * exactly k_delta_gates' second buffer). The output gates are token-major
+ * [n_tok, 2n], row t = [beta(n), decay(n)], the same per-token [beta;decay]
+ * layout k_delta_gates emits, stacked over tokens. Same sg_softplus /
+ * sg_sigmoid / precise::exp and the same A_log vs -exp form as k_delta_gates,
+ * so per token it is bit-identical to k_delta_gates over that token's [a;b].
+ *
+ * params: [0]=n [1]=neg_exp (1 = ssm_a already -exp(A_log)) [2]=n_tok. */
+kernel void k_delta_gates_chunk(device const float *a   [[buffer(0)]],
+                                device const float *b   [[buffer(1)]],
+                                device float *gates     [[buffer(2)]],
+                                constant uint *p        [[buffer(3)]],
+                                device const float *adt [[buffer(4)]],
+                                uint g [[thread_position_in_grid]])
+{
+    uint n = p[0];
+    bool neg_exp = p[1] != 0u;
+    uint n_tok = p[2];
+    if (n == 0u || n_tok == 0u || g >= n_tok * n) return;
+    uint t = g / n, h = g % n;
+
+    float sp = sg_softplus(a[(size_t)t * n + h] + adt[n + h]);
+    float av = adt[h];
+    gates[(size_t)t * 2u * n + h] = sg_sigmoid(b[(size_t)t * n + h]);
+    gates[(size_t)t * 2u * n + n + h] = neg_exp ? precise::exp(av * sp)
+                                                : precise::exp(-(precise::exp(av) * sp));
+}
+
+/* The gated delta rule for a chunk of `n_tok` tokens through EVERY value head,
+ * one threadgroup per value head, replaying k_delta_multi per token with the S
+ * matrix threaded. Thread `lid` owns rows lid, lid+256, ... of this head's S
+ * block for the WHOLE chunk: a row is a closed computation owned by exactly one
+ * thread and touched by no other, so threading it across tokens needs no
+ * barrier between tokens and no cross-thread reduction (there is none in
+ * k_delta_multi either). Per token the value-head to key-head map
+ * (sg_ssm_k_head, both checkpoint conventions) and the decay -> read -> delta
+ * -> write -> readout statement order are k_delta_multi's verbatim, so this is
+ * bit-identical to looping k_delta_multi over the N tokens with S carried.
+ *
+ * S [n_v, dv, dk] is read AND written in place (the sg_kv S carrier). qkv is
+ * token-major [n_tok, conv_dim] (conv_dim = 2*key_dim + value_dim, the per-token
+ * q|k|v working area, row stride passed as a param); out is token-major
+ * [n_tok, value_dim]; gates is token-major [n_tok, 2*n_v] ([beta;decay] per
+ * token). params: [0]=dk [1]=dv [2]=n_v [3]=n_k [4]=key_dim [5]=tiled
+ * [6]=n_tok [7]=conv_dim (qkv row stride). */
+kernel void k_delta_chunk(device float *S           [[buffer(0)]],
+                          device const float *qkv   [[buffer(1)]],
+                          device float *out         [[buffer(2)]],
+                          constant uint *p          [[buffer(3)]],
+                          device const float *gates [[buffer(4)]],
+                          uint h   [[threadgroup_position_in_grid]],
+                          uint lid [[thread_position_in_threadgroup]])
+{
+    uint dk = p[0], dv = p[1], n_v = p[2], n_k = p[3], key_dim = p[4];
+    bool tiled = p[5] != 0u;
+    uint n_tok = p[6], conv_dim = p[7];
+    if (h >= n_v || dk == 0u || dv == 0u || n_tok == 0u) return;
+
+    uint hk = 0u;
+    if (n_k != 0u && n_v >= n_k) hk = tiled ? (h % n_k) : (h / (n_v / n_k));
+    uint value_dim = n_v * dv;
+    device float *Sh = S + (size_t)h * dv * dk;
+
+    for (uint t = 0u; t < n_tok; t++) {
+        device const float *q = qkv + (size_t)t * conv_dim + (size_t)hk * dk;
+        device const float *k = qkv + (size_t)t * conv_dim + key_dim + (size_t)hk * dk;
+        device const float *v = qkv + (size_t)t * conv_dim + 2u * key_dim + (size_t)h * dv;
+        device float *oh = out + (size_t)t * value_dim + (size_t)h * dv;
+        float beta = gates[(size_t)t * 2u * n_v + h];
+        float decay = gates[(size_t)t * 2u * n_v + n_v + h];
+
+        for (uint j = lid; j < dv; j += SG_TG) {
+            device float *row = Sh + (size_t)j * dk;
+
+            float kv = 0.0f;
+            for (uint i = 0u; i < dk; i++) {
+                float s = row[i] * decay;
+                row[i] = s;
+                kv += s * k[i];
+            }
+            float delta = (v[j] - kv) * beta;
+            float y = 0.0f;
+            for (uint i = 0u; i < dk; i++) {
+                float s = row[i] + k[i] * delta;
+                row[i] = s;
+                y += s * q[i];
+            }
+            oh[j] = y;
+        }
+    }
+}
+
+/* RMSNormGated for a chunk of `n_tok` tokens through every value head, one
+ * threadgroup per (token, value head), replaying k_rmsnorm_gated per token: the
+ * readout y is RMS-normed with the layer's ssm_norm weight and gated by silu of
+ * the UNNORMALIZED z. Unlike k_rmsnorm_gated (which reads z and the norm weight
+ * from one packed `zw` buffer), the chunk kernel takes z as its own token-major
+ * buffer [n_tok, heads*dv] and the shared norm weight w [dv] separately -- the
+ * two chunk buffers come from different producers (a GEMM and a per-layer weight
+ * park), so packing them would force an awkward chunk layout. The values are
+ * identical, and the fixed-tree tg_sum, the silu and the scale are
+ * k_rmsnorm_gated's verbatim, so per token this is bit-identical to it.
+ *
+ * threadgroup `tg` owns slice tg == t*heads + h. params: [0]=dv [1]=heads
+ * [2]=eps bits [3]=n_tok. Buffers: y [n_tok, heads*dv], z [n_tok, heads*dv],
+ * out [n_tok, heads*dv], w [dv]. */
+kernel void k_rmsnorm_gated_chunk(device const float *y  [[buffer(0)]],
+                                  device const float *z  [[buffer(1)]],
+                                  device float *out      [[buffer(2)]],
+                                  constant uint *p       [[buffer(3)]],
+                                  device const float *w  [[buffer(4)]],
+                                  uint tg  [[threadgroup_position_in_grid]],
+                                  uint lid [[thread_position_in_threadgroup]])
+{
+    uint dv = p[0], heads = p[1];
+    float eps = as_type<float>(p[2]);
+    uint n_tok = p[3];
+    if (dv == 0u || heads == 0u || n_tok == 0u || tg >= n_tok * heads) return;
+
+    device const float *yh = y + (size_t)tg * dv;
+    device const float *zh = z + (size_t)tg * dv;
+    device float *oh = out + (size_t)tg * dv;
+
+    threadgroup float red[SG_TG];
+    float acc = 0.0f;
+    for (uint i = lid; i < dv; i += SG_TG) acc += yh[i] * yh[i];
+    float sumsq = tg_sum(red, lid, acc);
+    float scale = 1.0f / precise::sqrt(sumsq / (float)dv + eps);
+
+    for (uint i = lid; i < dv; i += SG_TG) {
+        oh[i] = sg_silu(zh[i]) * (yh[i] * scale * w[i]);
+    }
+}
+
+/* =====================================================================
+ * Split-K decode attention (P2.2 through P2.9) is in src/kernels_splitk.metal
+ * =====================================================================
+ *
+ * k_attn_decode_splitk_partial, k_attn_decode_splitk_combine,
+ * k_attn_decode_splitk_partial_gqa and k_attn_decode_splitk_partial_gqa_online,
+ * the splitk_partial_group<R> / splitk_partial_group_online<R> templates, the
+ * tg_max_group<R> / tg_sum_group<R> fold trees and attn_combine_weight moved
+ * there when this file passed the project's ~2000-line guideline. It is a
+ * SEPARATE translation unit, compiled to src/kernels_splitk.air and linked
+ * into the SAME src/kernels.metallib, so nothing on the host side changed:
+ * metal.m still finds every kernel by name in one library.
+ *
+ * The determinism mandate at the top of this file governs that file too, and
+ * the helpers both files share are in kernels_common.metal.h, defined once.
+ * A helper used by only one of the two belongs in that file, never in both. */

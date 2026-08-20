@@ -55,10 +55,22 @@ static sg_gpu *g_gpu;
 /* The plan's per-op bar. Relative to the reference vector's scale. */
 #define TOL_REL 1e-4
 
+/* Task M5.3's own GEMM gates (task-M5.3-brief.md): bf16/f32 vs a host f64
+ * reference, and the GEMM-vs-matvec row-consistency check for bf16/f32, must
+ * be under 1e-5 relative; anything touching Q8_0 (dequant is only 8 bits of
+ * mantissa to begin with) gets sg_ref_matvec_q8's own, looser 2e-2. */
+#define GEMM_TOL    1e-5
+#define GEMM_Q8_TOL 2e-2
+
 /* Worst error seen across every op, printed at the end so the task report
- * can quote one number without grepping. */
+ * can quote one number without grepping. Owned storage, not a `const char *`
+ * that just remembers the winning check_rel_tol call's `label` argument:
+ * several call sites (rope_case, attn_case, the M5.3 GEMM cases below) build
+ * that label in a stack buffer with snprintf and it does not outlive the
+ * function that built it, so latching the raw pointer would leave this
+ * dangling by the time main() prints it. */
 static double g_worst_rel = 0.0;
-static const char *g_worst_label = "(none)";
+static char g_worst_label[64] = "(none)";
 
 /* --------------------------------------------------------------------
  * GPU buffer helpers
@@ -94,7 +106,35 @@ static gbuf gb_from_u16(const uint16_t *src, uint64_t n) {
     return r;
 }
 
+/* Raw bytes (a Q8_0 tensor) into a device buffer. gbuf.n is a FLOAT count
+ * (gb_poison is its only reader), so round the byte count up to a float count,
+ * the same way gb_from_u16 does for uint16 weights. */
+static gbuf gb_from_u8(const void *src, uint64_t nbytes) {
+    gbuf r = {NULL, NULL, (nbytes + 3) / 4};
+    void *host = NULL;
+    sg_err e = sg_gpu_alloc(g_gpu, nbytes, &r.b, &host);
+    if (sg_failed(e)) { fprintf(stderr, "FATAL: %s\n", e.msg); exit(2); }
+    r.h = (float *)host;
+    memcpy(host, src, (size_t)nbytes);
+    return r;
+}
+
 static void gb_free(gbuf *b) { sg_gpu_buf_free(b->b); b->b = NULL; b->h = NULL; }
+
+/* Half-precision (2 bytes/element) device buffer, for the M5.2 fp16-KV
+ * kernels: k_kv_store_f16's output and k_attn_decode_f16's K/V inputs. */
+typedef struct { void *b; uint16_t *h; uint64_t n; } gbuf16;
+
+static gbuf16 gb16_new(uint64_t n) {
+    gbuf16 r = {NULL, NULL, n};
+    void *host = NULL;
+    sg_err e = sg_gpu_alloc(g_gpu, n * sizeof(uint16_t), &r.b, &host);
+    if (sg_failed(e)) { fprintf(stderr, "FATAL: %s\n", e.msg); exit(2); }
+    r.h = (uint16_t *)host;
+    return r;
+}
+
+static void gb16_free(gbuf16 *b) { sg_gpu_buf_free(b->b); b->b = NULL; b->h = NULL; }
 
 /* Fill an output buffer with a pattern no kernel would produce, so a
  * kernel that writes only part of its output fails loudly instead of
@@ -114,11 +154,14 @@ static uint32_t f32_bits(float f) { uint32_t u; memcpy(&u, &f, sizeof u); return
  * Comparison
  * -------------------------------------------------------------------- */
 
-/* max |got - want| divided by the reference vector's own scale. Absolute
- * error alone is meaningless across ops whose outputs span 1e-3 to 1e3, and
- * per-element relative error is meaningless wherever `want` crosses zero;
- * this is the measure the plan's "1e-4 relative" is checked in. */
-static double check_rel(const char *label, const float *got, const float *want, uint64_t n) {
+/* max |got - want| divided by the reference vector's own scale, checked
+ * against an explicit tolerance. Absolute error alone is meaningless across
+ * ops whose outputs span 1e-3 to 1e3, and per-element relative error is
+ * meaningless wherever `want` crosses zero; this is the measure the plan's
+ * "relative" bars (1e-4 for the per-op gate below, and M5.3's own 1e-5 /
+ * 2e-2 GEMM gates) are checked in. */
+static double check_rel_tol(const char *label, const float *got, const float *want,
+                            uint64_t n, double tol) {
     if (n == 0) { tt_assert(0, "%s: nothing to compare", label); return 0.0; }
 
     double scale = 0.0;
@@ -137,16 +180,51 @@ static double check_rel(const char *label, const float *got, const float *want, 
     }
     double rel = worst / scale;
 
-    tt_assert(rel < TOL_REL,
+    tt_assert(rel < tol,
               "%s: max |err| %.3e over scale %.3e = %.3e relative, tol %.0e "
               "(worst at %llu: got %.9g, want %.9g)",
-              label, worst, scale, rel, TOL_REL,
+              label, worst, scale, rel, tol,
               (unsigned long long)at, (double)got[at], (double)want[at]);
-    if (rel < TOL_REL) {
+    if (rel < tol) {
         fprintf(stderr, "   %-46s rel %.3e  abs %.3e\n", label, rel, worst);
-        if (rel > g_worst_rel) { g_worst_rel = rel; g_worst_label = label; }
+        if (rel > g_worst_rel) {
+            g_worst_rel = rel;
+            snprintf(g_worst_label, sizeof g_worst_label, "%s", label);
+        }
     }
     return rel;
+}
+
+static double check_rel(const char *label, const float *got, const float *want, uint64_t n) {
+    return check_rel_tol(label, got, want, n, TOL_REL);
+}
+
+/* Bit-exact equality, element by element (memcmp per float so a NaN compares by
+ * its bit pattern rather than as unequal-to-itself). The M5.5 chunk kernels are
+ * a literal sequential replay of the per-token decode ops, so their equivalence
+ * to those ops is BIT-IDENTICAL by construction, not merely within tolerance;
+ * assert exactly that. Also reports the worst abs difference on failure. */
+static void check_bit_identical(const char *label, const float *got, const float *want,
+                                uint64_t n) {
+    uint64_t mism = 0, at = 0;
+    double worst = 0.0;
+    for (uint64_t i = 0; i < n; i++) {
+        if (memcmp(&got[i], &want[i], sizeof(float)) != 0) {
+            if (mism == 0) at = i;
+            mism++;
+            double d = fabs((double)got[i] - (double)want[i]);
+            if (d > worst) worst = d;
+        }
+    }
+    tt_assert(mism == 0,
+              "%s: %llu/%llu elements differ (first at %llu: got %.9g want %.9g, worst abs %.3e)",
+              label, (unsigned long long)mism, (unsigned long long)n,
+              (unsigned long long)at, mism ? (double)got[at] : 0.0,
+              mism ? (double)want[at] : 0.0, worst);
+    if (mism == 0) {
+        fprintf(stderr, "   %-52s bit-identical (%llu elems)\n", label,
+                (unsigned long long)n);
+    }
 }
 
 /* --------------------------------------------------------------------
@@ -170,6 +248,35 @@ static uint16_t f32_to_bf16(float f) {
     uint32_t lsb = (b >> 16) & 1u;
     b += 0x7FFFu + lsb;
     return (uint16_t)(b >> 16);
+}
+
+/* Raw uint32 from the same LCG lcg_next draws from, for building byte
+ * patterns (Q8_0 blocks) directly. Shares g_lcg, so it advances the same
+ * stream. */
+static uint32_t lcg_u32(void) {
+    g_lcg = g_lcg * 1664525u + 1013904223u;
+    return g_lcg;
+}
+
+/* Build a synthetic Q8_0 tensor of rows x cols (cols a multiple of 32) into
+ * dst, which must hold rows*(cols/32)*34 bytes. Each block is a 2-byte f16
+ * scale (little-endian) then 32 int8. The scale bit-patterns are positive
+ * finite normals in ~[2^-4, 2^3] (exponent field 11..18, never inf/NaN); the
+ * int8 are any bit pattern. ref.c and the kernel decode these bytes
+ * identically (bytewise f16 -> f32, scale*int8), so this is a valid oracle
+ * for either side. The fixtures top out at 64 columns, so this is the only
+ * way to exercise the reduction tree past its 256-wide first stride. */
+static void build_q8(uint8_t *dst, uint32_t rows, uint32_t cols) {
+    uint32_t blocks = cols / 32u;
+    for (uint32_t r = 0; r < rows; r++) {
+        for (uint32_t b = 0; b < blocks; b++) {
+            uint8_t *blk = dst + ((size_t)r * blocks + b) * 34u;
+            uint16_t sbits = (uint16_t)(0x2C00u + (uint16_t)((lcg_u32() >> 11) & 0x1FFFu));
+            blk[0] = (uint8_t)(sbits & 0xFFu);
+            blk[1] = (uint8_t)(sbits >> 8);
+            for (uint32_t i = 0; i < 32u; i++) blk[2u + i] = (uint8_t)(lcg_u32() >> 24);
+        }
+    }
 }
 
 /* --------------------------------------------------------------------
@@ -365,6 +472,353 @@ static void metal_matvec_matches_ref(void) {
     if (gpu_run("k_matvec_f32", &a3, &b3, &o3, p3)) check_rel("matvec_f32 (q_proj 256x48)", o3.h, wantf, qrows);
     gb_free(&a3); gb_free(&b3); gb_free(&o3);
     free(wantf);
+}
+
+static void metal_matvec_q8_matches_ref(void) {
+    /* Q8_0 from ops.bin: the SAME 8x64 fixture test_ref_ops.c pins against
+     * numpy. 8 rows, 64 cols = 2 blocks per row, 34 bytes each. The oracle is
+     * sg_ref_matvec_q8 over the identical raw bytes, so any divergence is the
+     * GPU dequant/reduction, nothing else. */
+    uint64_t cols = 0, rows64 = 0;
+    const float *x = fx_f32(&g_ops, "matvec_q8.x", 0, &cols);
+    (void)fx_f32(&g_ops, "matvec_q8.out", 0, &rows64);   /* rows from the ref output */
+    uint32_t rows = (uint32_t)rows64;
+    tt_assert(rows == 8 && cols == 64, "matvec_q8 should be 8x64, got %ux%llu",
+              rows, (unsigned long long)cols);
+    uint64_t wbytes = (uint64_t)rows * (cols / 32) * 34;
+    const void *w = fx_u8(&g_ops, "matvec_q8.w", wbytes);
+
+    float *want = xmalloc(rows * sizeof *want);
+    sg_ref_matvec_q8(w, x, want, rows, (uint32_t)cols);
+
+    gbuf a = gb_from_u8(w, wbytes), b = gb_from(x, cols), o = gb_new(rows);
+    uint32_t p[8] = {rows, (uint32_t)cols, 0, 0, 0, 0, 0, 0};
+    gb_poison(&o);
+    if (gpu_run("k_matvec_q8", &a, &b, &o, p)) check_rel("matvec_q8 (8x64)", o.h, want, rows);
+    gb_free(&a); gb_free(&b); gb_free(&o);
+    free(want);
+
+    /* A larger Q8_0 case the fixture cannot reach: 40 x 1056, 33 blocks per
+     * row, a column count that is a multiple of 32 but not a power of two, so
+     * the strided partial, the ragged tail and the full tree fold all run.
+     * Synthetic blocks that ref.c and the kernel decode identically. */
+    const uint32_t br = 40, bc = 1056;
+    uint64_t bwbytes = (uint64_t)br * (bc / 32) * 34;
+    uint8_t *bw = xmalloc((size_t)bwbytes);
+    float *bx = xmalloc(bc * sizeof *bx);
+    lcg_seed(0x9E37u);
+    build_q8(bw, br, bc);
+    for (uint32_t i = 0; i < bc; i++) bx[i] = lcg_next() * 2.0f;
+
+    float *wantb = xmalloc(br * sizeof *wantb);
+    sg_ref_matvec_q8(bw, bx, wantb, br, bc);
+
+    gbuf a2 = gb_from_u8(bw, bwbytes), b2 = gb_from(bx, bc), o2 = gb_new(br);
+    uint32_t p2[8] = {br, bc, 0, 0, 0, 0, 0, 0};
+    gb_poison(&o2);
+    if (gpu_run("k_matvec_q8", &a2, &b2, &o2, p2)) check_rel("matvec_q8 (40x1056)", o2.h, wantb, br);
+    gb_free(&a2); gb_free(&b2); gb_free(&o2);
+    free(bw); free(bx); free(wantb);
+}
+
+/* ====================================================================
+ * Task M5.3: tiled GEMM, Y[N, M] = X[N, K] @ W[M, K]^T
+ * ==================================================================== */
+
+/* Host f64 GEMM reference, written fresh here rather than reusing
+ * sg_ref_matvec_bf16/f32 (Task 7's own already-gated CPU reference): gate 1
+ * asks whether the KERNEL agrees with plain double-precision math, and
+ * routing that through ref.c's own implementation would make the check
+ * "does the GPU agree with ref.c" twice over instead of once independently.
+ * bf16 -> f32 widening is exact (the bf16 bits ARE the top half of the f32
+ * ones), so doing it in float before promoting to double loses nothing. */
+static void host_gemm_bf16_f64(const uint16_t *w, const float *x, float *y,
+                               uint32_t n, uint32_t m, uint32_t k) {
+    for (uint32_t ni = 0; ni < n; ni++) {
+        const float *xr = x + (size_t)ni * k;
+        for (uint32_t mi = 0; mi < m; mi++) {
+            const uint16_t *wr = w + (size_t)mi * k;
+            double acc = 0.0;
+            for (uint32_t ki = 0; ki < k; ki++) {
+                uint32_t bits = (uint32_t)wr[ki] << 16;
+                float wf;
+                memcpy(&wf, &bits, sizeof wf);
+                acc += (double)wf * (double)xr[ki];
+            }
+            y[(size_t)ni * m + mi] = (float)acc;
+        }
+    }
+}
+
+static void host_gemm_f32_f64(const float *w, const float *x, float *y,
+                              uint32_t n, uint32_t m, uint32_t k) {
+    for (uint32_t ni = 0; ni < n; ni++) {
+        const float *xr = x + (size_t)ni * k;
+        for (uint32_t mi = 0; mi < m; mi++) {
+            const float *wr = w + (size_t)mi * k;
+            double acc = 0.0;
+            for (uint32_t ki = 0; ki < k; ki++) acc += (double)wr[ki] * (double)xr[ki];
+            y[(size_t)ni * m + mi] = (float)acc;
+        }
+    }
+}
+
+typedef struct { uint32_t n, m, k; } gemm_case;
+
+/* Covers every one of the brief's {1, 7, 32, 256, 5120} in each of N, M and
+ * K at least once (see the per-column comment), plus the explicitly
+ * requested all-large case. All-5120-cubed would be ~134 billion FMAs and is
+ * not what the brief asks for; the brief's own example of "all-large" is
+ * 32x256x5120, so that is the one large-K*large-M*large-N case run here. */
+static const gemm_case GEMM_CASES[] = {
+    {1,    1,   1},      /* every dim at its smallest */
+    {7,   32, 256},      /* N=7 */
+    {32, 256,   7},      /* K=7, M=256 x N=32 combo */
+    {256,  7,  32},      /* M=7, N=256 */
+    {5120, 1,   1},      /* N=5120, cheap M/K */
+    {1, 5120,   1},      /* M=5120, cheap N/K */
+    {1,    1,5120},      /* K=5120, cheap N/M */
+    {32, 256,5120},      /* the brief's "at least one all-large case" */
+};
+#define N_GEMM_CASES ((int)(sizeof GEMM_CASES / sizeof GEMM_CASES[0]))
+
+/* Gate 1: k_matmul_bf16 and k_matmul_f32 vs the host f64 reference above,
+ * across every (N, M, K) in GEMM_CASES. */
+static void metal_matmul_matches_host_f64(void) {
+    for (int c = 0; c < N_GEMM_CASES; c++) {
+        uint32_t n = GEMM_CASES[c].n, m = GEMM_CASES[c].m, k = GEMM_CASES[c].k;
+        char lbl[96];
+
+        {
+            uint16_t *w = xmalloc((size_t)m * k * sizeof *w);
+            float *x = xmalloc((size_t)n * k * sizeof *x);
+            lcg_seed(0xB160u + (uint32_t)c);
+            for (uint64_t i = 0; i < (uint64_t)m * k; i++) w[i] = f32_to_bf16(lcg_next());
+            for (uint64_t i = 0; i < (uint64_t)n * k; i++) x[i] = lcg_next() * 2.0f;
+
+            float *want = xmalloc((size_t)n * m * sizeof *want);
+            host_gemm_bf16_f64(w, x, want, n, m, k);
+
+            gbuf a = gb_from(x, (uint64_t)n * k);
+            gbuf b = gb_from_u16(w, (uint64_t)m * k);
+            gbuf o = gb_new((uint64_t)n * m);
+            uint32_t p[8] = {n, m, k, 0, 0, 0, 0, 0};
+            gb_poison(&o);
+            snprintf(lbl, sizeof lbl, "matmul_bf16 vs host f64 (n=%u m=%u k=%u)", n, m, k);
+            if (gpu_run("k_matmul_bf16", &a, &b, &o, p)) {
+                check_rel_tol(lbl, o.h, want, (uint64_t)n * m, GEMM_TOL);
+            }
+            gb_free(&a); gb_free(&b); gb_free(&o);
+            free(w); free(x); free(want);
+        }
+        {
+            float *w = xmalloc((size_t)m * k * sizeof *w);
+            float *x = xmalloc((size_t)n * k * sizeof *x);
+            lcg_seed(0xF320u + (uint32_t)c);
+            for (uint64_t i = 0; i < (uint64_t)m * k; i++) w[i] = lcg_next();
+            for (uint64_t i = 0; i < (uint64_t)n * k; i++) x[i] = lcg_next() * 2.0f;
+
+            float *want = xmalloc((size_t)n * m * sizeof *want);
+            host_gemm_f32_f64(w, x, want, n, m, k);
+
+            gbuf a = gb_from(x, (uint64_t)n * k);
+            gbuf b = gb_from(w, (uint64_t)m * k);
+            gbuf o = gb_new((uint64_t)n * m);
+            uint32_t p[8] = {n, m, k, 0, 0, 0, 0, 0};
+            gb_poison(&o);
+            snprintf(lbl, sizeof lbl, "matmul_f32 vs host f64 (n=%u m=%u k=%u)", n, m, k);
+            if (gpu_run("k_matmul_f32", &a, &b, &o, p)) {
+                check_rel_tol(lbl, o.h, want, (uint64_t)n * m, GEMM_TOL);
+            }
+            gb_free(&a); gb_free(&b); gb_free(&o);
+            free(w); free(x); free(want);
+        }
+    }
+}
+
+/* Gate 2: row n of k_matmul_* == k_matvec_* applied to X[n], same W. Proves
+ * the GEMM agrees with the kernel Task 9's own gate already pins down,
+ * independent of whether the GEMM's tile geometry is right (a tiling bug
+ * that still summed the correct K terms per element would slip past gate 1
+ * only by coincidence; comparing every row against the row kernel is the
+ * check that would catch a tile/row indexing mistake specifically). */
+static void gemm_row_consistency_bf16(uint32_t n, uint32_t m, uint32_t k, uint32_t seed) {
+    uint16_t *w = xmalloc((size_t)m * k * sizeof *w);
+    float *x = xmalloc((size_t)n * k * sizeof *x);
+    lcg_seed(seed);
+    for (uint64_t i = 0; i < (uint64_t)m * k; i++) w[i] = f32_to_bf16(lcg_next());
+    for (uint64_t i = 0; i < (uint64_t)n * k; i++) x[i] = lcg_next() * 2.0f;
+
+    gbuf a = gb_from(x, (uint64_t)n * k);
+    gbuf b = gb_from_u16(w, (uint64_t)m * k);
+    gbuf o = gb_new((uint64_t)n * m);
+    uint32_t p[8] = {n, m, k, 0, 0, 0, 0, 0};
+    gb_poison(&o);
+    if (gpu_run("k_matmul_bf16", &a, &b, &o, p)) {
+        gbuf xb = gb_new(k), yb = gb_new(m);
+        uint32_t pv[8] = {m, k, 0, 0, 0, 0, 0, 0};
+        for (uint32_t r = 0; r < n; r++) {
+            memcpy(xb.h, x + (size_t)r * k, k * sizeof(float));
+            gb_poison(&yb);
+            if (!gpu_run("k_matvec_bf16", &b, &xb, &yb, pv)) break;
+            char lbl[96];
+            snprintf(lbl, sizeof lbl, "matmul_bf16 row %u == matvec_bf16 (n=%u m=%u k=%u)",
+                     r, n, m, k);
+            check_rel_tol(lbl, o.h + (size_t)r * m, yb.h, m, GEMM_TOL);
+        }
+        gb_free(&xb); gb_free(&yb);
+    }
+    gb_free(&a); gb_free(&b); gb_free(&o);
+    free(w); free(x);
+}
+
+static void gemm_row_consistency_f32(uint32_t n, uint32_t m, uint32_t k, uint32_t seed) {
+    float *w = xmalloc((size_t)m * k * sizeof *w);
+    float *x = xmalloc((size_t)n * k * sizeof *x);
+    lcg_seed(seed);
+    for (uint64_t i = 0; i < (uint64_t)m * k; i++) w[i] = lcg_next();
+    for (uint64_t i = 0; i < (uint64_t)n * k; i++) x[i] = lcg_next() * 2.0f;
+
+    gbuf a = gb_from(x, (uint64_t)n * k);
+    gbuf b = gb_from(w, (uint64_t)m * k);
+    gbuf o = gb_new((uint64_t)n * m);
+    uint32_t p[8] = {n, m, k, 0, 0, 0, 0, 0};
+    gb_poison(&o);
+    if (gpu_run("k_matmul_f32", &a, &b, &o, p)) {
+        gbuf xb = gb_new(k), yb = gb_new(m);
+        uint32_t pv[8] = {m, k, 0, 0, 0, 0, 0, 0};
+        for (uint32_t r = 0; r < n; r++) {
+            memcpy(xb.h, x + (size_t)r * k, k * sizeof(float));
+            gb_poison(&yb);
+            if (!gpu_run("k_matvec_f32", &b, &xb, &yb, pv)) break;
+            char lbl[96];
+            snprintf(lbl, sizeof lbl, "matmul_f32 row %u == matvec_f32 (n=%u m=%u k=%u)",
+                     r, n, m, k);
+            check_rel_tol(lbl, o.h + (size_t)r * m, yb.h, m, GEMM_TOL);
+        }
+        gb_free(&xb); gb_free(&yb);
+    }
+    gb_free(&a); gb_free(&b); gb_free(&o);
+    free(w); free(x);
+}
+
+static void gemm_row_consistency_q8(uint32_t n, uint32_t m, uint32_t k, uint32_t seed) {
+    uint64_t wbytes = (uint64_t)m * (k / 32) * 34;
+    uint8_t *w = xmalloc((size_t)wbytes);
+    float *x = xmalloc((size_t)n * k * sizeof *x);
+    lcg_seed(seed);
+    build_q8(w, m, k);
+    for (uint64_t i = 0; i < (uint64_t)n * k; i++) x[i] = lcg_next() * 2.0f;
+
+    gbuf a = gb_from(x, (uint64_t)n * k);
+    gbuf b = gb_from_u8(w, wbytes);
+    gbuf o = gb_new((uint64_t)n * m);
+    uint32_t p[8] = {n, m, k, 0, 0, 0, 0, 0};
+    gb_poison(&o);
+    if (gpu_run("k_matmul_q8", &a, &b, &o, p)) {
+        gbuf xb = gb_new(k), yb = gb_new(m);
+        uint32_t pv[8] = {m, k, 0, 0, 0, 0, 0, 0};
+        for (uint32_t r = 0; r < n; r++) {
+            memcpy(xb.h, x + (size_t)r * k, k * sizeof(float));
+            gb_poison(&yb);
+            if (!gpu_run("k_matvec_q8", &b, &xb, &yb, pv)) break;
+            char lbl[96];
+            snprintf(lbl, sizeof lbl, "matmul_q8 row %u == matvec_q8 (n=%u m=%u k=%u)",
+                     r, n, m, k);
+            check_rel_tol(lbl, o.h + (size_t)r * m, yb.h, m, GEMM_Q8_TOL);
+        }
+        gb_free(&xb); gb_free(&yb);
+    }
+    gb_free(&a); gb_free(&b); gb_free(&o);
+    free(w); free(x);
+}
+
+static void metal_matmul_row_consistency(void) {
+    /* Non-tile-aligned N and M (SG_GEMM_TM/TN are 16x16), so the tile edge
+     * guard (`if (row >= n || col >= m) return`) is exercised, not just the
+     * happy path where N and M are exact multiples of the tile shape. */
+    gemm_row_consistency_bf16(11, 67, 512, 0xB16Cu);
+    gemm_row_consistency_f32(11, 67, 512, 0xF32Cu);
+    gemm_row_consistency_q8(11, 67, 512, 0xA8C0u);
+
+    /* And a second, smaller shape entirely inside one tile. */
+    gemm_row_consistency_bf16(3, 5, 64, 0xB16Du);
+    gemm_row_consistency_f32(3, 5, 64, 0xF32Du);
+    gemm_row_consistency_q8(3, 5, 64, 0xA8C1u);
+}
+
+/* Gate 3: k_matmul_q8 vs sg_ref_matvec_q8 (Task 7's double-accumulating CPU
+ * reference) looped over the N rows, within sg_ref_matvec_q8's own 2e-2
+ * tolerance -- the Q8_0 analog of gate 1, which only covers bf16/f32. */
+static void metal_matmul_q8_matches_ref_looped(void) {
+    const uint32_t n = 6, m = 97, k = 1056;   /* K a multiple of 32; N, M not tile-aligned */
+    uint64_t wbytes = (uint64_t)m * (k / 32) * 34;
+    uint8_t *w = xmalloc((size_t)wbytes);
+    float *x = xmalloc((size_t)n * k * sizeof *x);
+    lcg_seed(0xA80Bu);
+    build_q8(w, m, k);
+    for (uint64_t i = 0; i < (uint64_t)n * k; i++) x[i] = lcg_next() * 2.0f;
+
+    float *want = xmalloc((size_t)n * m * sizeof *want);
+    for (uint32_t r = 0; r < n; r++) {
+        sg_ref_matvec_q8(w, x + (size_t)r * k, want + (size_t)r * m, m, k);
+    }
+
+    gbuf a = gb_from(x, (uint64_t)n * k);
+    gbuf b = gb_from_u8(w, wbytes);
+    gbuf o = gb_new((uint64_t)n * m);
+    uint32_t p[8] = {n, m, k, 0, 0, 0, 0, 0};
+    gb_poison(&o);
+    if (gpu_run("k_matmul_q8", &a, &b, &o, p)) {
+        check_rel_tol("matmul_q8 vs sg_ref_matvec_q8 (looped over N rows)",
+                      o.h, want, (uint64_t)n * m, GEMM_Q8_TOL);
+    }
+    gb_free(&a); gb_free(&b); gb_free(&o);
+    free(w); free(x); free(want);
+}
+
+/* check_params/check_sizes argument checking for the three new kernels,
+ * mirroring metal_rejects_bad_arguments's style below for the existing
+ * kernels. */
+static void metal_matmul_rejects_bad_params(void) {
+    gbuf a = gb_new(4096), b = gb_new(4096), o = gb_new(4096);
+
+    uint32_t zero_n[8] = {0, 4, 8, 0, 0, 0, 0, 0};
+    sg_err e = sg_gpu_run_op(g_gpu, "k_matmul_f32", a.b, b.b, o.b, zero_n);
+    tt_assert(sg_failed(e), "k_matmul_f32 N=0 should be rejected");
+
+    uint32_t zero_m[8] = {4, 0, 8, 0, 0, 0, 0, 0};
+    e = sg_gpu_run_op(g_gpu, "k_matmul_f32", a.b, b.b, o.b, zero_m);
+    tt_assert(sg_failed(e), "k_matmul_f32 M=0 should be rejected");
+
+    uint32_t zero_k[8] = {4, 4, 0, 0, 0, 0, 0, 0};
+    e = sg_gpu_run_op(g_gpu, "k_matmul_bf16", a.b, b.b, o.b, zero_k);
+    tt_assert(sg_failed(e), "k_matmul_bf16 K=0 should be rejected");
+
+    /* Q8_0 rows are whole 32-element blocks; K not a multiple of 32 must be
+     * rejected before check_sizes truncates the block count (the same
+     * ordering k_matvec_q8 relies on, tested above for that kernel). */
+    uint32_t q8_odd_k[8] = {2, 2, 40, 0, 0, 0, 0, 0};
+    e = sg_gpu_run_op(g_gpu, "k_matmul_q8", a.b, b.b, o.b, q8_odd_k);
+    tt_assert(sg_failed(e), "k_matmul_q8 K not a multiple of 32 should be rejected");
+
+    uint32_t zero_k8[8] = {2, 2, 0, 0, 0, 0, 0, 0};
+    e = sg_gpu_run_op(g_gpu, "k_matmul_q8", a.b, b.b, o.b, zero_k8);
+    tt_assert(sg_failed(e), "k_matmul_q8 K=0 should be rejected");
+
+    /* Undersized buffers: N, M, K describe a Y larger than o actually is. */
+    uint32_t too_big[8] = {100, 100, 8, 0, 0, 0, 0, 0};
+    e = sg_gpu_run_op(g_gpu, "k_matmul_f32", a.b, b.b, o.b, too_big);
+    tt_assert(sg_failed(e), "k_matmul_f32 output smaller than N*M should be rejected");
+
+    /* Output overlapping an input: a GEMM tile writing an input another
+     * tile has not read yet would be wrong and nondeterministic, same rule
+     * as every other kernel. */
+    uint32_t alias_p[8] = {4, 4, 4, 0, 0, 0, 0, 0};
+    e = sg_gpu_run_op(g_gpu, "k_matmul_f32", a.b, b.b, a.b, alias_p);
+    tt_assert(sg_failed(e), "k_matmul_f32 out aliasing input a should be rejected");
+
+    gb_free(&a); gb_free(&b); gb_free(&o);
 }
 
 static void metal_softmax_matches_ref(void) {
@@ -814,6 +1268,911 @@ static void metal_attn_decode_matches_ref(void) {
 }
 
 /* --------------------------------------------------------------------
+ * M5.2: fp16 KV cache
+ * -------------------------------------------------------------------- */
+
+/* Gate 1: k_kv_store_f16 round-trips exact f16 -- store an f32 value, read
+ * back the SAME bits sg_f32_to_f16 (src/kv.c's pure-C reference, already
+ * pinned to match Metal's `half` cast bit-for-bit) would produce. n = 777 is
+ * not a multiple of SG_TG, so the ragged tail of the elementwise dispatch is
+ * exercised too. */
+static void metal_kv_store_f16_roundtrips(void) {
+    const uint32_t n = 777;
+    float *src = xmalloc(n * sizeof *src);
+    lcg_seed(0xF16Du);
+    for (uint32_t i = 0; i < n; i++) {
+        /* A spread of magnitudes -- tiny (near f16 subnormal), huge (near f16
+         * overflow) and ordinary -- so round-to-nearest-even edge cases in
+         * sg_f32_to_f16 are exercised, not just well-behaved values. */
+        float scale = (i % 7 == 0) ? 1e-6f : (i % 5 == 0) ? 6.0e4f : 3.0f;
+        src[i] = lcg_next() * scale;
+    }
+
+    gbuf a = gb_from(src, n);
+    gbuf16 o = gb16_new(n);
+    memset(o.h, 0xA5, n * sizeof(uint16_t));
+    uint32_t p[8] = {n, 0, 0, 0, 0, 0, 0, 0};
+
+    sg_err e = sg_gpu_run_op(g_gpu, "k_kv_store_f16", a.b, NULL, o.b, p);
+    tt_assert(!sg_failed(e), "k_kv_store_f16: %s", e.msg ? e.msg : "ok");
+    if (!sg_failed(e)) {
+        uint64_t mismatches = 0;
+        uint32_t at = 0;
+        for (uint32_t i = 0; i < n; i++) {
+            uint16_t want = sg_f32_to_f16(src[i]);
+            if (o.h[i] != want) { if (mismatches == 0) at = i; mismatches++; }
+        }
+        tt_assert(mismatches == 0,
+                  "k_kv_store_f16 round-trip: %llu/%u mismatches (first at %u: "
+                  "got 0x%04x, want 0x%04x)",
+                  (unsigned long long)mismatches, n, at,
+                  mismatches ? o.h[at] : 0, mismatches ? sg_f32_to_f16(src[at]) : 0);
+        if (mismatches == 0) {
+            fprintf(stderr, "   k_kv_store_f16 round-trip: %u/%u values bit-exact\n", n, n);
+        }
+    }
+    gb_free(&a); gb16_free(&o);
+
+    /* Also store at a NONZERO destination offset, into the middle of a
+     * larger buffer, poisoning the surrounding halves first: the batched
+     * decode path (enc_kv_store) always stores at pos*kv_width, never at
+     * offset 0 past the very first position, and *2-vs-*4 byte-offset
+     * mistakes are exactly the kind of bug that would only show up once the
+     * offset is nonzero. */
+    const uint32_t total = 512, off = 200, n2 = 64;
+    gbuf a2 = gb_from(src, n2);   /* reuse the first n2 rounded values */
+
+    /* sg_gpu_run_op has no offset concept of its own (it always binds a
+     * handle at ITS OWN base); drive the nonzero offset the way enc_kv_store
+     * does, by binding a handle whose contents start `off` halves into a
+     * larger buffer. sg_gpu_wrap gives that (page-aligned base, arbitrary
+     * byte offset from there), which also cross-checks the offset math
+     * against a second, independent code path. */
+    gbuf16 dst = gb16_new(total);
+    memset(dst.h, 0xA5, total * sizeof(uint16_t));
+    void *wrapped = NULL;
+    sg_err ew = sg_gpu_wrap(g_gpu, dst.h + off, (uint64_t)n2 * sizeof(uint16_t), &wrapped);
+    tt_assert(!sg_failed(ew), "sg_gpu_wrap (kv store offset test): %s", ew.msg ? ew.msg : "ok");
+    if (!sg_failed(ew)) {
+        uint32_t p3[8] = {n2, 0, 0, 0, 0, 0, 0, 0};
+        sg_err e3 = sg_gpu_run_op(g_gpu, "k_kv_store_f16", a2.b, NULL, wrapped, p3);
+        tt_assert(!sg_failed(e3), "k_kv_store_f16 (nonzero offset): %s", e3.msg ? e3.msg : "ok");
+        if (!sg_failed(e3)) {
+            uint64_t mism_before = 0, mism_in = 0, mism_after = 0;
+            for (uint32_t i = 0; i < off; i++) if (dst.h[i] != (uint16_t)0xA5A5u) mism_before++;
+            for (uint32_t i = 0; i < n2; i++) {
+                if (dst.h[off + i] != sg_f32_to_f16(src[i])) mism_in++;
+            }
+            for (uint32_t i = off + n2; i < total; i++) {
+                if (dst.h[i] != (uint16_t)0xA5A5u) mism_after++;
+            }
+            tt_assert(mism_before == 0 && mism_in == 0 && mism_after == 0,
+                      "k_kv_store_f16 nonzero-offset store: %llu before / %llu wrong / "
+                      "%llu after the target region",
+                      (unsigned long long)mism_before, (unsigned long long)mism_in,
+                      (unsigned long long)mism_after);
+            if (mism_before == 0 && mism_in == 0 && mism_after == 0) {
+                fprintf(stderr, "   k_kv_store_f16 nonzero-offset store: exact, "
+                                "neighbors untouched\n");
+            }
+        }
+        sg_gpu_buf_free(wrapped);
+    }
+    gb_free(&a2); gb16_free(&dst);
+    free(src);
+}
+
+/* Gate 2: k_attn_decode_f16 == k_attn_decode fed the SAME inputs pre-rounded
+ * to f16, bit-identical, over 100 reruns. K and V are rounded to their f16
+ * value (still stored as f32) before either kernel sees them, so the f32
+ * oracle commits no rounding the f16 kernel's half storage did not already
+ * commit; widening half -> float back is exact, so the two must match bit
+ * for bit. Rerunning the f16 kernel 100 times against one fixed f32-oracle
+ * run proves determinism (all 100 runs equal) and equivalence (all 100 equal
+ * the oracle) in one pass. */
+static void metal_attn_decode_f16_matches_f32(void) {
+    const uint32_t n_heads = 8, n_kv = 2, hd = 128, seq = 300, q_stride = 2 * hd;
+    lcg_seed(0xA771Fu);
+
+    float *qg = xmalloc((size_t)n_heads * q_stride * sizeof *qg);
+    for (uint32_t i = 0; i < n_heads * q_stride; i++) qg[i] = lcg_next();
+
+    uint64_t kvn = (uint64_t)seq * n_kv * hd;
+    float *k32 = xmalloc(kvn * sizeof *k32), *v32 = xmalloc(kvn * sizeof *v32);
+    uint16_t *k16 = xmalloc(kvn * sizeof *k16), *v16 = xmalloc(kvn * sizeof *v16);
+    for (uint64_t i = 0; i < kvn; i++) {
+        k16[i] = sg_f32_to_f16(lcg_next() * 2.0f);
+        v16[i] = sg_f32_to_f16(lcg_next() * 2.0f);
+        k32[i] = sg_f16_to_f32(k16[i]);   /* the f16 rounding, widened back exactly */
+        v32[i] = sg_f16_to_f32(v16[i]);
+    }
+
+    float *kv32 = xmalloc(2 * kvn * sizeof *kv32);
+    memcpy(kv32, k32, kvn * sizeof *kv32);
+    memcpy(kv32 + kvn, v32, kvn * sizeof *kv32);
+
+    uint32_t out_n = n_heads * hd;
+    float scale = (float)(1.0 / sqrt((double)hd));
+
+    /* f32 oracle: the EXISTING k_attn_decode kernel, unmodified, over the
+     * old combined [K;V] buffer layout, fed the f16-rounded values. */
+    gbuf qb = gb_from(qg, (uint64_t)n_heads * q_stride);
+    gbuf kvb = gb_from(kv32, 2 * kvn);
+    gbuf ref = gb_new(out_n);
+    uint32_t pf32[8] = {n_heads, n_kv, hd, seq, q_stride, (uint32_t)kvn, f32_bits(scale), 0};
+    gb_poison(&ref);
+    bool ok = gpu_run("k_attn_decode", &qb, &kvb, &ref, pf32);
+    tt_assert(ok, "k_attn_decode (f32 oracle) failed");
+
+    /* f16 kernel: the SAME q, k, v values, but K/V in separate half buffers. */
+    gbuf qb2 = gb_from(qg, (uint64_t)n_heads * q_stride);
+    gbuf16 kb16 = gb16_new(kvn), vb16 = gb16_new(kvn);
+    memcpy(kb16.h, k16, kvn * sizeof(uint16_t));
+    memcpy(vb16.h, v16, kvn * sizeof(uint16_t));
+    gbuf o16 = gb_new(out_n);
+    uint32_t pf16[8] = {n_heads, n_kv, hd, seq, q_stride, f32_bits(scale), 0, 0};
+
+    float *first_run = xmalloc(out_n * sizeof *first_run);
+    uint64_t total_mismatch = 0;
+    if (ok) {
+        for (int rep = 0; rep < 100; rep++) {
+            gb_poison(&o16);
+            sg_err e = sg_gpu_run_attn_decode_f16(g_gpu, qb2.b, kb16.b, vb16.b, o16.b, pf16);
+            tt_assert(!sg_failed(e), "k_attn_decode_f16 rep %d: %s", rep, e.msg ? e.msg : "ok");
+            if (sg_failed(e)) break;
+            if (rep == 0) {
+                memcpy(first_run, o16.h, out_n * sizeof(float));
+                for (uint32_t i = 0; i < out_n; i++) if (o16.h[i] != ref.h[i]) total_mismatch++;
+            } else {
+                for (uint32_t i = 0; i < out_n; i++) if (o16.h[i] != first_run[i]) total_mismatch++;
+            }
+        }
+    }
+    tt_assert(total_mismatch == 0,
+              "k_attn_decode_f16: %llu bit-exact mismatches over 100 reruns "
+              "(vs the f32 oracle and vs itself)", (unsigned long long)total_mismatch);
+    if (total_mismatch == 0) {
+        fprintf(stderr, "   k_attn_decode_f16 vs k_attn_decode (f16-rounded inputs): "
+                        "bit-identical over 100 reruns\n");
+    }
+
+    free(first_run);
+    gb_free(&qb); gb_free(&kvb); gb_free(&ref);
+    gb_free(&qb2); gb16_free(&kb16); gb16_free(&vb16); gb_free(&o16);
+    free(qg); free(k32); free(v32); free(k16); free(v16); free(kv32);
+}
+
+/* --------------------------------------------------------------------
+ * M5.4: full-attention tiled prefill
+ * -------------------------------------------------------------------- */
+
+/* Gate 1: k_rope_chunk applied to a whole chunk of N tokens == k_rope_heads
+ * applied once per token at that token's absolute position, BIT-IDENTICAL.
+ * Both are GPU kernels reading the same input bytes and the same f32 cos/sin
+ * values (the host builds each token's table in double, exactly as the decode
+ * path does), and k_rope_chunk's rotation math is k_rope_heads' verbatim, so
+ * the two must agree to the byte. Both output buffers are poisoned first, so
+ * the untouched non-rotated regions (the [rope_dim, head_dim) tail is copied,
+ * but the [head_dim, stride) gate half neither kernel writes) also match:
+ * identical 0xA5 on both sides. */
+static void rope_chunk_case(uint32_t head_dim, uint32_t rope_dim, uint32_t heads,
+                            uint32_t stride, uint32_t n_tok, uint32_t base, float theta) {
+    uint64_t slice_floats = (uint64_t)heads * stride;
+    uint64_t xn = (uint64_t)n_tok * slice_floats;
+    float *x = xmalloc(xn * sizeof *x);
+    for (uint64_t i = 0; i < xn; i++) x[i] = lcg_next();
+
+    /* Per-token cos/sin table [n_tok, rope_dim], each token at absolute pos base+t. */
+    float *cs = xmalloc((uint64_t)n_tok * rope_dim * sizeof *cs);
+    for (uint32_t t = 0; t < n_tok; t++) {
+        rope_table(cs + (uint64_t)t * rope_dim, rope_dim, base + t, theta);
+    }
+
+    gbuf a = gb_from(x, xn), b = gb_from(cs, (uint64_t)n_tok * rope_dim), o = gb_new(xn);
+    uint32_t p[8] = {head_dim, rope_dim, heads, stride, n_tok, 0, 0, 0};
+    gb_poison(&o);
+    bool ok = gpu_run("k_rope_chunk", &a, &b, &o, p);
+
+    uint64_t mism = 0;
+    uint32_t at_tok = 0;
+    if (ok) {
+        gbuf xr = gb_new(slice_floats), csr = gb_new(rope_dim), ores = gb_new(slice_floats);
+        uint32_t pv[8] = {head_dim, rope_dim, heads, stride, 0, 0, 0, 0};
+        for (uint32_t t = 0; t < n_tok; t++) {
+            memcpy(xr.h, x + (uint64_t)t * slice_floats, (size_t)slice_floats * sizeof(float));
+            rope_table(csr.h, rope_dim, base + t, theta);
+            gb_poison(&ores);
+            if (!gpu_run("k_rope_heads", &xr, &csr, &ores, pv)) { ok = false; break; }
+            if (memcmp(ores.h, o.h + (uint64_t)t * slice_floats,
+                       (size_t)slice_floats * sizeof(float)) != 0) {
+                if (mism == 0) at_tok = t;
+                mism++;
+            }
+        }
+        gb_free(&xr); gb_free(&csr); gb_free(&ores);
+    }
+
+    char lbl[96];
+    snprintf(lbl, sizeof lbl, "k_rope_chunk==k_rope_heads N=%u base=%u heads=%u stride=%u",
+             n_tok, base, heads, stride);
+    tt_assert(ok && mism == 0, "%s: %llu of %u tokens differed (first at token %u)",
+              lbl, (unsigned long long)mism, n_tok, at_tok);
+    if (ok && mism == 0) {
+        fprintf(stderr, "   %-58s %u/%u tokens bit-identical\n", lbl, n_tok, n_tok);
+    }
+    gb_free(&a); gb_free(&b); gb_free(&o);
+    free(x); free(cs);
+}
+
+static void metal_rope_chunk_matches_rope_heads(void) {
+    /* The real checkpoint's RoPE parameters: head_dim 256, rope_dim 64 partial,
+     * theta 1e7. base 1000 puts every token past the f32-angle danger zone the
+     * double-precision host table exists for. */
+    const uint32_t hd = 256, rope_dim = 64;
+    const float theta = 1e7f;
+    const uint32_t ns[4] = {1, 2, 17, 512};
+    const uint32_t bases[2] = {0, 1000};
+    lcg_seed(0x50BEC0DEu);
+    for (int bi = 0; bi < 2; bi++) {
+        for (int ni = 0; ni < 4; ni++) {
+            /* Q layout: heads slices at stride 2*head_dim (the query interleaved
+             * with the untouched attention-gate half). */
+            rope_chunk_case(hd, rope_dim, 4, 2 * hd, ns[ni], bases[bi], theta);
+        }
+    }
+    /* K layout: stride == head_dim (no interleaved gate), one representative
+     * (N, base) since the kernel treats it as just a different heads/stride. */
+    rope_chunk_case(hd, rope_dim, 2, hd, 17, 1000, theta);
+
+    /* Gate 3 (determinism): 100 reruns byte-identical, output poisoned before
+     * each run. (Inlined rather than via det_check, which is defined later in
+     * this file.) */
+    {
+        const uint32_t n_tok = 17, heads = 4, stride = 2 * hd, base = 1000;
+        uint64_t xn = (uint64_t)n_tok * heads * stride;
+        float *x = xmalloc(xn * sizeof *x);
+        for (uint64_t i = 0; i < xn; i++) x[i] = lcg_next();
+        float *cs = xmalloc((uint64_t)n_tok * rope_dim * sizeof *cs);
+        for (uint32_t t = 0; t < n_tok; t++) {
+            rope_table(cs + (uint64_t)t * rope_dim, rope_dim, base + t, theta);
+        }
+        gbuf a = gb_from(x, xn), b = gb_from(cs, (uint64_t)n_tok * rope_dim), o = gb_new(xn);
+        uint32_t p[8] = {hd, rope_dim, heads, stride, n_tok, 0, 0, 0};
+        /* Byte compare, not float compare: the untouched [head_dim, stride)
+         * gate half stays 0xA5 poison (a NaN), and NaN != NaN would be a false
+         * mismatch. The poison is re-applied identically each run, so a correct
+         * kernel is byte-identical over the whole buffer. */
+        uint8_t *first = xmalloc((size_t)xn * sizeof(float));
+        uint64_t mism = 0;
+        for (int rep = 0; rep < 100; rep++) {
+            gb_poison(&o);
+            if (!gpu_run("k_rope_chunk", &a, &b, &o, p)) break;
+            if (rep == 0) memcpy(first, o.h, (size_t)xn * sizeof(float));
+            else if (memcmp(first, o.h, (size_t)xn * sizeof(float)) != 0) mism++;
+        }
+        tt_assert(mism == 0, "k_rope_chunk: %llu of 99 reruns differed byte-wise",
+                  (unsigned long long)mism);
+        if (mism == 0) {
+            fprintf(stderr, "   k_rope_chunk (17 tok, base 1000): "
+                            "byte-identical over 100 reruns\n");
+        }
+        free(first);
+        gb_free(&a); gb_free(&b); gb_free(&o);
+        free(x); free(cs);
+    }
+}
+
+/* Gate 2: k_attn_prefill over a chunk == k_attn_decode_f16 run once per token
+ * at seq = base+t+1 (the KV built up to and including that token), within the
+ * per-op 1e-4 relative bar. The two share one fp16 KV fixture (base prior
+ * positions plus the n-token chunk), and k_attn_prefill's per-(token, head)
+ * threadgroup mirrors k_attn_decode_f16 statement for statement, so the
+ * agreement is in fact bit-exact; the case asserts the 1e-4 gate and also
+ * reports the exact-byte token count. Returns the worst relative error. */
+static double attn_prefill_case(uint32_t n_heads, uint32_t n_kv, uint32_t hd,
+                                uint32_t n_tok, uint32_t base) {
+    uint32_t q_stride = 2 * hd;
+    float scale = (float)(1.0 / sqrt((double)hd));
+    uint64_t seq_max = (uint64_t)base + n_tok;
+    uint64_t qn = (uint64_t)n_tok * n_heads * q_stride;
+    uint64_t kvn = seq_max * n_kv * hd;
+    uint64_t out_n = (uint64_t)n_tok * n_heads * hd;
+
+    float *q = xmalloc(qn * sizeof *q);
+    for (uint64_t i = 0; i < qn; i++) q[i] = lcg_next();
+    uint16_t *k16 = xmalloc(kvn * sizeof *k16), *v16 = xmalloc(kvn * sizeof *v16);
+    for (uint64_t i = 0; i < kvn; i++) {
+        k16[i] = sg_f32_to_f16(lcg_next() * 2.0f);
+        v16[i] = sg_f32_to_f16(lcg_next() * 2.0f);
+    }
+
+    gbuf qb = gb_from(q, qn);
+    gbuf16 kb = gb16_new(kvn), vb = gb16_new(kvn);
+    memcpy(kb.h, k16, kvn * sizeof(uint16_t));
+    memcpy(vb.h, v16, kvn * sizeof(uint16_t));
+    gbuf ob = gb_new(out_n);
+    gb_poison(&ob);
+    uint32_t pp[8] = {n_heads, n_kv, hd, base, n_tok, q_stride, f32_bits(scale), 0};
+    sg_err e = sg_gpu_run_attn_prefill(g_gpu, qb.b, kb.b, vb.b, ob.b, pp);
+    tt_assert(!sg_failed(e), "k_attn_prefill (N=%u base=%u): %s", n_tok, base,
+              e.msg ? e.msg : "ok");
+
+    double worst = 0.0;
+    uint64_t exact = 0;
+    if (!sg_failed(e)) {
+        gbuf qtok = gb_new((uint64_t)n_heads * q_stride);
+        gbuf dec = gb_new((uint64_t)n_heads * hd);
+        bool ok = true;
+        for (uint32_t t = 0; t < n_tok && ok; t++) {
+            memcpy(qtok.h, q + (uint64_t)t * n_heads * q_stride,
+                   (size_t)n_heads * q_stride * sizeof(float));
+            uint32_t seq = base + t + 1u;
+            uint32_t pd[8] = {n_heads, n_kv, hd, seq, q_stride, f32_bits(scale), 0, 0};
+            gb_poison(&dec);
+            sg_err ed = sg_gpu_run_attn_decode_f16(g_gpu, qtok.b, kb.b, vb.b, dec.b, pd);
+            if (sg_failed(ed)) { tt_assert(0, "decode ref t=%u: %s", t, ed.msg); ok = false; break; }
+
+            const float *got = ob.h + (uint64_t)t * n_heads * hd;
+            const float *want = dec.h;
+            uint32_t hn = n_heads * hd;
+            double sc = 0.0;
+            for (uint32_t i = 0; i < hn; i++) { double m = fabs((double)want[i]); if (m > sc) sc = m; }
+            if (sc == 0.0) sc = 1.0;
+            for (uint32_t i = 0; i < hn; i++) {
+                double d = fabs((double)got[i] - (double)want[i]) / sc;
+                if (d > worst) worst = d;
+            }
+            if (memcmp(got, want, (size_t)hn * sizeof(float)) == 0) exact++;
+        }
+        gb_free(&qtok); gb_free(&dec);
+    }
+
+    char lbl[96];
+    snprintf(lbl, sizeof lbl, "k_attn_prefill vs decode looped N=%u base=%u", n_tok, base);
+    tt_assert(worst < TOL_REL, "%s: worst rel %.3e >= tol %.0e", lbl, worst, TOL_REL);
+    fprintf(stderr, "   %-52s rel %.3e  (%llu/%u tokens bit-exact)\n",
+            lbl, worst, (unsigned long long)exact, n_tok);
+    if (worst > g_worst_rel) {
+        g_worst_rel = worst;
+        snprintf(g_worst_label, sizeof g_worst_label, "%s", lbl);
+    }
+
+    gb_free(&qb); gb16_free(&kb); gb16_free(&vb); gb_free(&ob);
+    free(q); free(k16); free(v16);
+    return worst;
+}
+
+static void metal_attn_prefill_matches_decode(void) {
+    /* GQA (8 query heads over 2 kv heads, repeat 4), head_dim 64 for a fast
+     * but representative shape. N in {1,2,17,512}, base in {0,1000}. */
+    const uint32_t n_heads = 8, n_kv = 2, hd = 64;
+    const uint32_t ns[4] = {1, 2, 17, 512};
+    const uint32_t bases[2] = {0, 1000};
+    lcg_seed(0x9EF11Eu);
+    for (int bi = 0; bi < 2; bi++) {
+        for (int ni = 0; ni < 4; ni++) {
+            attn_prefill_case(n_heads, n_kv, hd, ns[ni], bases[bi]);
+        }
+    }
+
+    /* Gate 3 (determinism): 100 reruns of k_attn_prefill byte-identical, output
+     * poisoned before each run, at one representative (N=17, base=1000). */
+    {
+        const uint32_t n_tok = 17, base = 1000, q_stride = 2 * hd;
+        float scale = (float)(1.0 / sqrt((double)hd));
+        uint64_t seq_max = (uint64_t)base + n_tok;
+        uint64_t qn = (uint64_t)n_tok * n_heads * q_stride, kvn = seq_max * n_kv * hd;
+        uint64_t out_n = (uint64_t)n_tok * n_heads * hd;
+        float *q = xmalloc(qn * sizeof *q);
+        for (uint64_t i = 0; i < qn; i++) q[i] = lcg_next();
+        uint16_t *k16 = xmalloc(kvn * sizeof *k16), *v16 = xmalloc(kvn * sizeof *v16);
+        for (uint64_t i = 0; i < kvn; i++) {
+            k16[i] = sg_f32_to_f16(lcg_next() * 2.0f);
+            v16[i] = sg_f32_to_f16(lcg_next() * 2.0f);
+        }
+        gbuf qb = gb_from(q, qn);
+        gbuf16 kb = gb16_new(kvn), vb = gb16_new(kvn);
+        memcpy(kb.h, k16, kvn * sizeof(uint16_t));
+        memcpy(vb.h, v16, kvn * sizeof(uint16_t));
+        gbuf ob = gb_new(out_n);
+        uint32_t pp[8] = {n_heads, n_kv, hd, base, n_tok, q_stride, f32_bits(scale), 0};
+
+        float *first = xmalloc(out_n * sizeof *first);
+        uint64_t mism = 0;
+        for (int rep = 0; rep < 100; rep++) {
+            gb_poison(&ob);
+            sg_err e = sg_gpu_run_attn_prefill(g_gpu, qb.b, kb.b, vb.b, ob.b, pp);
+            tt_assert(!sg_failed(e), "k_attn_prefill det rep %d: %s", rep, e.msg ? e.msg : "ok");
+            if (sg_failed(e)) break;
+            if (rep == 0) memcpy(first, ob.h, out_n * sizeof *first);
+            else for (uint64_t i = 0; i < out_n; i++) if (ob.h[i] != first[i]) mism++;
+        }
+        tt_assert(mism == 0, "k_attn_prefill: %llu bit mismatches over 100 reruns",
+                  (unsigned long long)mism);
+        if (mism == 0) {
+            fprintf(stderr, "   k_attn_prefill (17 tok, base 1000): "
+                            "byte-identical over 100 reruns\n");
+        }
+        free(first);
+        gb_free(&qb); gb16_free(&kb); gb16_free(&vb); gb_free(&ob);
+        free(q); free(k16); free(v16);
+    }
+}
+
+/* --------------------------------------------------------------------
+ * M5.5: gated-DeltaNet chunked-scan prefill kernels
+ *
+ * Each chunk kernel is a sequential replay of a per-token decode op with the
+ * recurrent state threaded, so its output is BIT-IDENTICAL to that op looped
+ * over the chunk. The oracle is therefore the GPU decode kernel itself (run
+ * per token), not the CPU reference: comparing GPU-to-GPU makes the gap exactly
+ * zero, which is what these tests assert (check_bit_identical, not check_rel).
+ * -------------------------------------------------------------------- */
+
+/* Gate 1 + gate 2 (conv) + gate 5 (conv): k_conv1d_chunk == k_conv1d_step
+ * looped with the conv tail threaded, split-chunk == whole-chunk for both output
+ * and tail, and 100-rerun byte determinism. conv width 384 (> 256, so the
+ * per-channel grid runs past one threadgroup) and ksize 4 (tail 3, the 27B
+ * conv_kernel). */
+static void metal_conv1d_chunk_matches_step(void) {
+    const uint32_t channels = 384, ksize = 4, keep = ksize - 1;
+    const uint32_t ns[4] = {1, 2, 7, 64};
+    lcg_seed(0x5C0FFEEu);
+    float *w = xmalloc((size_t)channels * ksize * sizeof *w);
+    for (uint32_t i = 0; i < channels * ksize; i++) w[i] = lcg_next();
+    gbuf wb = gb_from(w, (uint64_t)channels * ksize);
+
+    /* Gate 1: chunk == step looped, N in {1,2,7,64}. */
+    for (int ni = 0; ni < 4; ni++) {
+        uint32_t N = ns[ni];
+        float *x = xmalloc((size_t)N * channels * sizeof *x);
+        for (uint32_t i = 0; i < N * channels; i++) x[i] = lcg_next() * 2.0f;
+
+        /* Oracle: k_conv1d_step over the N tokens, tail carried in stepbuf's
+         * state half (out[channels..]), which gb_new left zeroed. */
+        gbuf stepbuf = gb_new((uint64_t)ksize * channels);
+        float *ref = xmalloc((size_t)N * channels * sizeof *ref);
+        uint32_t ps[8] = {channels, ksize, 0, 0, 0, 0, 0, 0};
+        bool ok = true;
+        for (uint32_t t = 0; t < N && ok; t++) {
+            gbuf xt = gb_from(x + (size_t)t * channels, channels);
+            memset(stepbuf.h, 0xA5, channels * sizeof(float));   /* poison out half only */
+            ok = gpu_run("k_conv1d_step", &xt, &wb, &stepbuf, ps);
+            if (ok) memcpy(ref + (size_t)t * channels, stepbuf.h, channels * sizeof(float));
+            gb_free(&xt);
+        }
+
+        gbuf xall = gb_from(x, (uint64_t)N * channels);
+        gbuf outc = gb_new((uint64_t)N * channels);
+        gbuf statec = gb_new((uint64_t)keep * channels);   /* zeroed initial tail */
+        gb_poison(&outc);
+        uint32_t pc[8] = {channels, ksize, N, 0, 0, 0, 0, 0};
+        sg_err e = sg_gpu_run_conv1d_chunk(g_gpu, xall.b, wb.b, outc.b, statec.b, pc);
+        tt_assert(!sg_failed(e), "conv1d_chunk N=%u: %s", N, e.msg ? e.msg : "ok");
+        if (ok && !sg_failed(e)) {
+            char lbl[80];
+            snprintf(lbl, sizeof lbl, "k_conv1d_chunk==step looped N=%u", N);
+            check_bit_identical(lbl, outc.h, ref, (uint64_t)N * channels);
+            snprintf(lbl, sizeof lbl, "k_conv1d_chunk tail N=%u", N);
+            check_bit_identical(lbl, statec.h, stepbuf.h + channels, (uint64_t)keep * channels);
+        }
+        gb_free(&stepbuf); gb_free(&xall); gb_free(&outc); gb_free(&statec);
+        free(x); free(ref);
+    }
+
+    /* Gate 2 (conv): chunk(N) then chunk(M) sharing one tail == chunk(N+M). */
+    {
+        const uint32_t N = 7, M = 13, T = N + M;
+        float *x = xmalloc((size_t)T * channels * sizeof *x);
+        for (uint32_t i = 0; i < T * channels; i++) x[i] = lcg_next() * 2.0f;
+
+        gbuf xw = gb_from(x, (uint64_t)T * channels);
+        gbuf outw = gb_new((uint64_t)T * channels), statew = gb_new((uint64_t)keep * channels);
+        gb_poison(&outw);
+        uint32_t pw[8] = {channels, ksize, T, 0, 0, 0, 0, 0};
+        sg_err e = sg_gpu_run_conv1d_chunk(g_gpu, xw.b, wb.b, outw.b, statew.b, pw);
+
+        gbuf x1 = gb_from(x, (uint64_t)N * channels);
+        gbuf x2 = gb_from(x + (size_t)N * channels, (uint64_t)M * channels);
+        gbuf o1 = gb_new((uint64_t)N * channels), o2 = gb_new((uint64_t)M * channels);
+        gbuf st = gb_new((uint64_t)keep * channels);   /* shared, threaded */
+        gb_poison(&o1); gb_poison(&o2);
+        uint32_t p1[8] = {channels, ksize, N, 0, 0, 0, 0, 0};
+        uint32_t p2[8] = {channels, ksize, M, 0, 0, 0, 0, 0};
+        sg_err e1 = sg_gpu_run_conv1d_chunk(g_gpu, x1.b, wb.b, o1.b, st.b, p1);
+        sg_err e2 = sg_gpu_run_conv1d_chunk(g_gpu, x2.b, wb.b, o2.b, st.b, p2);
+        tt_assert(!sg_failed(e) && !sg_failed(e1) && !sg_failed(e2),
+                  "conv1d_chunk split/whole dispatch failed");
+        if (!sg_failed(e) && !sg_failed(e1) && !sg_failed(e2)) {
+            check_bit_identical("k_conv1d_chunk split==whole out[0:N]", o1.h, outw.h,
+                                (uint64_t)N * channels);
+            check_bit_identical("k_conv1d_chunk split==whole out[N:N+M]", o2.h,
+                                outw.h + (size_t)N * channels, (uint64_t)M * channels);
+            check_bit_identical("k_conv1d_chunk split==whole tail", st.h, statew.h,
+                                (uint64_t)keep * channels);
+        }
+        gb_free(&xw); gb_free(&outw); gb_free(&statew);
+        gb_free(&x1); gb_free(&x2); gb_free(&o1); gb_free(&o2); gb_free(&st);
+        free(x);
+    }
+
+    /* Gate 5 (conv): 100 reruns byte-identical, output poisoned and the initial
+     * tail restored to zero before each. */
+    {
+        const uint32_t N = 17;
+        float *x = xmalloc((size_t)N * channels * sizeof *x);
+        for (uint32_t i = 0; i < N * channels; i++) x[i] = lcg_next() * 2.0f;
+        gbuf xall = gb_from(x, (uint64_t)N * channels);
+        gbuf outc = gb_new((uint64_t)N * channels), statec = gb_new((uint64_t)keep * channels);
+        uint32_t pc[8] = {channels, ksize, N, 0, 0, 0, 0, 0};
+        float *first = xmalloc((size_t)N * channels * sizeof *first);
+        float *stf = xmalloc((size_t)keep * channels * sizeof *stf);
+        uint64_t mism = 0;
+        for (int rep = 0; rep < 100; rep++) {
+            memset(statec.h, 0, (size_t)keep * channels * sizeof(float));
+            gb_poison(&outc);
+            sg_err e = sg_gpu_run_conv1d_chunk(g_gpu, xall.b, wb.b, outc.b, statec.b, pc);
+            tt_assert(!sg_failed(e), "conv1d_chunk det rep %d: %s", rep, e.msg ? e.msg : "ok");
+            if (sg_failed(e)) break;
+            if (rep == 0) {
+                memcpy(first, outc.h, (size_t)N * channels * sizeof(float));
+                memcpy(stf, statec.h, (size_t)keep * channels * sizeof(float));
+            } else {
+                if (memcmp(first, outc.h, (size_t)N * channels * sizeof(float)) != 0) mism++;
+                if (memcmp(stf, statec.h, (size_t)keep * channels * sizeof(float)) != 0) mism++;
+            }
+        }
+        tt_assert(mism == 0, "k_conv1d_chunk: %llu byte mismatches over 100 reruns",
+                  (unsigned long long)mism);
+        if (mism == 0) fprintf(stderr, "   k_conv1d_chunk (17 tok): byte-identical over 100 reruns\n");
+        gb_free(&xall); gb_free(&outc); gb_free(&statec);
+        free(x); free(first); free(stf);
+    }
+    gb_free(&wb); free(w);
+}
+
+/* k_delta_gates_chunk == k_delta_gates looped, N in {1,2,7,64}, both ssm_a
+ * forms (A_log and -exp), plus 100-rerun determinism. */
+static void metal_delta_gates_chunk_matches(void) {
+    const uint32_t n = 40;
+    const uint32_t ns[4] = {1, 2, 7, 64};
+    lcg_seed(0xDEADBEEFu);
+    float *adt = xmalloc((size_t)2 * n * sizeof *adt);   /* ssm_a[n] then dt_bias[n] */
+    for (uint32_t i = 0; i < 2 * n; i++) adt[i] = lcg_next();
+    gbuf adtb = gb_from(adt, 2ull * n);
+
+    for (int ne = 0; ne < 2; ne++) {
+        uint32_t neg_exp = (uint32_t)ne;
+        for (int ni = 0; ni < 4; ni++) {
+            uint32_t N = ns[ni];
+            float *a = xmalloc((size_t)N * n * sizeof *a), *b = xmalloc((size_t)N * n * sizeof *b);
+            for (uint32_t i = 0; i < N * n; i++) { a[i] = lcg_next() * 2.0f; b[i] = lcg_next() * 2.0f; }
+            gbuf ab = gb_from(a, (uint64_t)N * n), bb = gb_from(b, (uint64_t)N * n);
+            gbuf gc = gb_new(2ull * N * n);
+            gb_poison(&gc);
+            uint32_t pg[8] = {n, neg_exp, N, 0, 0, 0, 0, 0};
+            sg_err e = sg_gpu_run_delta_gates_chunk(g_gpu, ab.b, bb.b, gc.b, adtb.b, pg);
+            tt_assert(!sg_failed(e), "delta_gates_chunk N=%u ne=%u: %s", N, neg_exp,
+                      e.msg ? e.msg : "ok");
+
+            /* Oracle: k_delta_gates per token over ab_t = [a_t(n), b_t(n)]. */
+            float *ref = xmalloc((size_t)2 * N * n * sizeof *ref);
+            gbuf abt = gb_new(2ull * n), gt = gb_new(2ull * n);
+            bool ok = true;
+            for (uint32_t t = 0; t < N && ok; t++) {
+                memcpy(abt.h, a + (size_t)t * n, n * sizeof(float));
+                memcpy(abt.h + n, b + (size_t)t * n, n * sizeof(float));
+                gb_poison(&gt);
+                uint32_t pd[8] = {n, neg_exp, 0, 0, 0, 0, 0, 0};
+                ok = gpu_run("k_delta_gates", &abt, &adtb, &gt, pd);
+                if (ok) memcpy(ref + (size_t)t * 2 * n, gt.h, 2 * n * sizeof(float));
+            }
+            if (ok && !sg_failed(e)) {
+                char lbl[80];
+                snprintf(lbl, sizeof lbl, "k_delta_gates_chunk==gates N=%u ne=%u", N, neg_exp);
+                check_bit_identical(lbl, gc.h, ref, 2ull * N * n);
+            }
+            gb_free(&ab); gb_free(&bb); gb_free(&gc); gb_free(&abt); gb_free(&gt);
+            free(a); free(b); free(ref);
+        }
+    }
+
+    /* Gate 5: 100 reruns byte-identical (N=17, -exp form). */
+    {
+        const uint32_t N = 17, neg_exp = 1;
+        float *a = xmalloc((size_t)N * n * sizeof *a), *b = xmalloc((size_t)N * n * sizeof *b);
+        for (uint32_t i = 0; i < N * n; i++) { a[i] = lcg_next() * 2.0f; b[i] = lcg_next() * 2.0f; }
+        gbuf ab = gb_from(a, (uint64_t)N * n), bb = gb_from(b, (uint64_t)N * n), gc = gb_new(2ull * N * n);
+        uint32_t pg[8] = {n, neg_exp, N, 0, 0, 0, 0, 0};
+        float *first = xmalloc((size_t)2 * N * n * sizeof *first);
+        uint64_t mism = 0;
+        for (int rep = 0; rep < 100; rep++) {
+            gb_poison(&gc);
+            sg_err e = sg_gpu_run_delta_gates_chunk(g_gpu, ab.b, bb.b, gc.b, adtb.b, pg);
+            tt_assert(!sg_failed(e), "delta_gates_chunk det rep %d: %s", rep, e.msg ? e.msg : "ok");
+            if (sg_failed(e)) break;
+            if (rep == 0) memcpy(first, gc.h, (size_t)2 * N * n * sizeof(float));
+            else if (memcmp(first, gc.h, (size_t)2 * N * n * sizeof(float)) != 0) mism++;
+        }
+        tt_assert(mism == 0, "k_delta_gates_chunk: %llu mismatches over 100 reruns",
+                  (unsigned long long)mism);
+        if (mism == 0) fprintf(stderr, "   k_delta_gates_chunk (17 tok): byte-identical over 100 reruns\n");
+        gb_free(&ab); gb_free(&bb); gb_free(&gc); free(a); free(b); free(first);
+    }
+    gb_free(&adtb); free(adt);
+}
+
+/* Gate 3: k_delta_chunk == k_delta_multi looped over the chunk with S threaded,
+ * for one head-map (`tiled`) and chunk length N. dk=dv=64, n_k=4, n_v=12 so each
+ * k-head maps to 3 v-heads (the 27B's 48/16 ratio), exercising both the tiled
+ * (h % n_k) and grouped (h / (n_v/n_k)) maps. */
+static void delta_chunk_case(uint32_t dk, uint32_t dv, uint32_t n_v, uint32_t n_k,
+                             uint32_t tiled, uint32_t N, uint32_t seed) {
+    uint32_t key_dim = n_k * dk, value_dim = n_v * dv, conv_dim = 2 * key_dim + value_dim;
+    lcg_seed(seed);
+    float *qkv = xmalloc((size_t)N * conv_dim * sizeof *qkv);
+    for (uint32_t i = 0; i < N * conv_dim; i++) qkv[i] = lcg_next();
+    float *gates = xmalloc((size_t)N * 2 * n_v * sizeof *gates);
+    for (uint32_t t = 0; t < N; t++) {
+        for (uint32_t h = 0; h < n_v; h++) {
+            gates[(size_t)t * 2 * n_v + h]         = 0.5f + 0.4f * lcg_next();   /* beta  */
+            gates[(size_t)t * 2 * n_v + n_v + h]   = 0.9f + 0.05f * lcg_next();  /* decay */
+        }
+    }
+    float *S0 = xmalloc((size_t)n_v * dv * dk * sizeof *S0);
+    for (uint32_t i = 0; i < n_v * dv * dk; i++) S0[i] = lcg_next() * 0.1f;
+
+    /* Oracle: k_delta_multi per token, S carried in place. */
+    gbuf Sm = gb_from(S0, (uint64_t)n_v * dv * dk);
+    gbuf qt = gb_new(conv_dim), gt = gb_new(2ull * n_v), ot = gb_new(value_dim);
+    float *ref = xmalloc((size_t)N * value_dim * sizeof *ref);
+    bool ok = true;
+    uint32_t pm[8] = {dk, dv, n_v, n_k, key_dim, tiled, 0, 0};
+    for (uint32_t t = 0; t < N && ok; t++) {
+        memcpy(qt.h, qkv + (size_t)t * conv_dim, conv_dim * sizeof(float));
+        memcpy(gt.h, gates + (size_t)t * 2 * n_v, 2 * n_v * sizeof(float));
+        gb_poison(&ot);
+        sg_err e = sg_gpu_run_delta_multi(g_gpu, Sm.b, qt.b, ot.b, gt.b, pm);
+        if (sg_failed(e)) { tt_assert(0, "delta_multi t=%u: %s", t, e.msg); ok = false; break; }
+        memcpy(ref + (size_t)t * value_dim, ot.h, value_dim * sizeof(float));
+    }
+
+    gbuf Sc = gb_from(S0, (uint64_t)n_v * dv * dk);
+    gbuf qkvb = gb_from(qkv, (uint64_t)N * conv_dim), gatesb = gb_from(gates, (uint64_t)N * 2 * n_v);
+    gbuf oc = gb_new((uint64_t)N * value_dim);
+    gb_poison(&oc);
+    uint32_t pc[8] = {dk, dv, n_v, n_k, key_dim, tiled, N, conv_dim};
+    sg_err e = sg_gpu_run_delta_chunk(g_gpu, Sc.b, qkvb.b, oc.b, gatesb.b, pc);
+    tt_assert(!sg_failed(e), "delta_chunk N=%u tiled=%u: %s", N, tiled, e.msg ? e.msg : "ok");
+    if (ok && !sg_failed(e)) {
+        char lbl[96];
+        snprintf(lbl, sizeof lbl, "k_delta_chunk==multi looped N=%u tiled=%u", N, tiled);
+        check_bit_identical(lbl, oc.h, ref, (uint64_t)N * value_dim);
+        snprintf(lbl, sizeof lbl, "k_delta_chunk S N=%u tiled=%u", N, tiled);
+        check_bit_identical(lbl, Sc.h, Sm.h, (uint64_t)n_v * dv * dk);
+    }
+    gb_free(&Sm); gb_free(&qt); gb_free(&gt); gb_free(&ot);
+    gb_free(&Sc); gb_free(&qkvb); gb_free(&gatesb); gb_free(&oc);
+    free(qkv); free(gates); free(S0); free(ref);
+}
+
+static void metal_delta_chunk_matches_multi(void) {
+    const uint32_t dk = 64, dv = 64, n_k = 4, n_v = 12;   /* 3 v-heads per k-head */
+    const uint32_t key_dim = n_k * dk, value_dim = n_v * dv, conv_dim = 2 * key_dim + value_dim;
+    const uint32_t ns[4] = {1, 2, 7, 64};
+
+    /* Gate 3: both head maps, all N. */
+    for (int ti = 0; ti < 2; ti++) {
+        for (int ni = 0; ni < 4; ni++) {
+            delta_chunk_case(dk, dv, n_v, n_k, (uint32_t)ti, ns[ni],
+                             0x1234u + (uint32_t)ti * 97u + (uint32_t)ni * 13u);
+        }
+    }
+
+    /* Gate 2 (S): chunk(N) then chunk(M) sharing one S == chunk(N+M), for both
+     * the output and the final S. */
+    {
+        const uint32_t N = 7, M = 13, T = N + M, tiled = 1;
+        lcg_seed(0xB0BAB0Bu);
+        float *qkv = xmalloc((size_t)T * conv_dim * sizeof *qkv);
+        for (uint32_t i = 0; i < T * conv_dim; i++) qkv[i] = lcg_next();
+        float *gates = xmalloc((size_t)T * 2 * n_v * sizeof *gates);
+        for (uint32_t t = 0; t < T; t++) for (uint32_t h = 0; h < n_v; h++) {
+            gates[(size_t)t * 2 * n_v + h] = 0.5f + 0.4f * lcg_next();
+            gates[(size_t)t * 2 * n_v + n_v + h] = 0.9f + 0.05f * lcg_next();
+        }
+        float *S0 = xmalloc((size_t)n_v * dv * dk * sizeof *S0);
+        for (uint32_t i = 0; i < n_v * dv * dk; i++) S0[i] = lcg_next() * 0.1f;
+
+        gbuf Sw = gb_from(S0, (uint64_t)n_v * dv * dk);
+        gbuf qw = gb_from(qkv, (uint64_t)T * conv_dim), gw = gb_from(gates, (uint64_t)T * 2 * n_v);
+        gbuf ow = gb_new((uint64_t)T * value_dim);
+        gb_poison(&ow);
+        uint32_t pwh[8] = {dk, dv, n_v, n_k, key_dim, tiled, T, conv_dim};
+        sg_err e = sg_gpu_run_delta_chunk(g_gpu, Sw.b, qw.b, ow.b, gw.b, pwh);
+
+        gbuf Ss = gb_from(S0, (uint64_t)n_v * dv * dk);   /* shared, threaded */
+        gbuf q1 = gb_from(qkv, (uint64_t)N * conv_dim);
+        gbuf q2 = gb_from(qkv + (size_t)N * conv_dim, (uint64_t)M * conv_dim);
+        gbuf g1 = gb_from(gates, (uint64_t)N * 2 * n_v);
+        gbuf g2 = gb_from(gates + (size_t)N * 2 * n_v, (uint64_t)M * 2 * n_v);
+        gbuf o1 = gb_new((uint64_t)N * value_dim), o2 = gb_new((uint64_t)M * value_dim);
+        gb_poison(&o1); gb_poison(&o2);
+        uint32_t p1[8] = {dk, dv, n_v, n_k, key_dim, tiled, N, conv_dim};
+        uint32_t p2[8] = {dk, dv, n_v, n_k, key_dim, tiled, M, conv_dim};
+        sg_err e1 = sg_gpu_run_delta_chunk(g_gpu, Ss.b, q1.b, o1.b, g1.b, p1);
+        sg_err e2 = sg_gpu_run_delta_chunk(g_gpu, Ss.b, q2.b, o2.b, g2.b, p2);
+        tt_assert(!sg_failed(e) && !sg_failed(e1) && !sg_failed(e2),
+                  "delta_chunk split/whole dispatch failed");
+        if (!sg_failed(e) && !sg_failed(e1) && !sg_failed(e2)) {
+            check_bit_identical("k_delta_chunk split==whole out[0:N]", o1.h, ow.h,
+                                (uint64_t)N * value_dim);
+            check_bit_identical("k_delta_chunk split==whole out[N:N+M]", o2.h,
+                                ow.h + (size_t)N * value_dim, (uint64_t)M * value_dim);
+            check_bit_identical("k_delta_chunk split==whole S", Ss.h, Sw.h,
+                                (uint64_t)n_v * dv * dk);
+        }
+        gb_free(&Sw); gb_free(&qw); gb_free(&gw); gb_free(&ow);
+        gb_free(&Ss); gb_free(&q1); gb_free(&q2); gb_free(&g1); gb_free(&g2);
+        gb_free(&o1); gb_free(&o2);
+        free(qkv); free(gates); free(S0);
+    }
+
+    /* Gate 5 (delta): 100 reruns byte-identical, S restored before each. */
+    {
+        const uint32_t N = 17, tiled = 1;
+        lcg_seed(0xF00D5EEDu);
+        float *qkv = xmalloc((size_t)N * conv_dim * sizeof *qkv);
+        for (uint32_t i = 0; i < N * conv_dim; i++) qkv[i] = lcg_next();
+        float *gates = xmalloc((size_t)N * 2 * n_v * sizeof *gates);
+        for (uint32_t t = 0; t < N; t++) for (uint32_t h = 0; h < n_v; h++) {
+            gates[(size_t)t * 2 * n_v + h] = 0.5f + 0.4f * lcg_next();
+            gates[(size_t)t * 2 * n_v + n_v + h] = 0.9f + 0.05f * lcg_next();
+        }
+        float *S0 = xmalloc((size_t)n_v * dv * dk * sizeof *S0);
+        for (uint32_t i = 0; i < n_v * dv * dk; i++) S0[i] = lcg_next() * 0.1f;
+
+        gbuf Sc = gb_from(S0, (uint64_t)n_v * dv * dk);
+        gbuf qkvb = gb_from(qkv, (uint64_t)N * conv_dim), gatesb = gb_from(gates, (uint64_t)N * 2 * n_v);
+        gbuf oc = gb_new((uint64_t)N * value_dim);
+        uint32_t pc[8] = {dk, dv, n_v, n_k, key_dim, tiled, N, conv_dim};
+        float *first = xmalloc((size_t)N * value_dim * sizeof *first);
+        float *sfirst = xmalloc((size_t)n_v * dv * dk * sizeof *sfirst);
+        uint64_t mism = 0;
+        for (int rep = 0; rep < 100; rep++) {
+            memcpy(Sc.h, S0, (size_t)n_v * dv * dk * sizeof(float));   /* restore S */
+            gb_poison(&oc);
+            sg_err e = sg_gpu_run_delta_chunk(g_gpu, Sc.b, qkvb.b, oc.b, gatesb.b, pc);
+            tt_assert(!sg_failed(e), "delta_chunk det rep %d: %s", rep, e.msg ? e.msg : "ok");
+            if (sg_failed(e)) break;
+            if (rep == 0) {
+                memcpy(first, oc.h, (size_t)N * value_dim * sizeof(float));
+                memcpy(sfirst, Sc.h, (size_t)n_v * dv * dk * sizeof(float));
+            } else {
+                if (memcmp(first, oc.h, (size_t)N * value_dim * sizeof(float)) != 0) mism++;
+                if (memcmp(sfirst, Sc.h, (size_t)n_v * dv * dk * sizeof(float)) != 0) mism++;
+            }
+        }
+        tt_assert(mism == 0, "k_delta_chunk: %llu byte mismatches over 100 reruns",
+                  (unsigned long long)mism);
+        if (mism == 0) fprintf(stderr, "   k_delta_chunk (17 tok): byte-identical over 100 reruns\n");
+        gb_free(&Sc); gb_free(&qkvb); gb_free(&gatesb); gb_free(&oc);
+        free(qkv); free(gates); free(S0); free(first); free(sfirst);
+    }
+}
+
+/* Gate 4: k_rmsnorm_gated_chunk == k_rmsnorm_gated looped, N in {1,2,7,64},
+ * plus 100-rerun determinism. dv 512 runs the fold tree past its 256 stride. */
+static void metal_rmsnorm_gated_chunk_matches(void) {
+    const uint32_t dv = 512, heads = 8, vd = heads * dv;
+    const uint32_t ns[4] = {1, 2, 7, 64};
+    const float eps = 1e-6f;
+    lcg_seed(0xA11CE5u);
+    float *w = xmalloc((size_t)dv * sizeof *w);
+    for (uint32_t i = 0; i < dv; i++) w[i] = lcg_next();
+    gbuf wb = gb_from(w, dv);
+
+    for (int ni = 0; ni < 4; ni++) {
+        uint32_t N = ns[ni];
+        float *y = xmalloc((size_t)N * vd * sizeof *y), *z = xmalloc((size_t)N * vd * sizeof *z);
+        for (uint32_t i = 0; i < N * vd; i++) { y[i] = lcg_next(); z[i] = lcg_next(); }
+        gbuf yb = gb_from(y, (uint64_t)N * vd), zb = gb_from(z, (uint64_t)N * vd);
+        gbuf ob = gb_new((uint64_t)N * vd);
+        gb_poison(&ob);
+        uint32_t pc[8] = {dv, heads, f32_bits(eps), N, 0, 0, 0, 0};
+        sg_err e = sg_gpu_run_rmsnorm_gated_chunk(g_gpu, yb.b, zb.b, ob.b, wb.b, pc);
+        tt_assert(!sg_failed(e), "rmsnorm_gated_chunk N=%u: %s", N, e.msg ? e.msg : "ok");
+
+        /* Oracle: k_rmsnorm_gated per token, zw_t = [z_t(vd), w(dv)]. */
+        float *ref = xmalloc((size_t)N * vd * sizeof *ref);
+        gbuf yt = gb_new(vd), zwt = gb_new((uint64_t)vd + dv), ot = gb_new(vd);
+        bool ok = true;
+        uint32_t pd[8] = {dv, heads, f32_bits(eps), 0, 0, 0, 0, 0};
+        for (uint32_t t = 0; t < N && ok; t++) {
+            memcpy(yt.h, y + (size_t)t * vd, vd * sizeof(float));
+            memcpy(zwt.h, z + (size_t)t * vd, vd * sizeof(float));
+            memcpy(zwt.h + vd, w, dv * sizeof(float));
+            gb_poison(&ot);
+            ok = gpu_run("k_rmsnorm_gated", &yt, &zwt, &ot, pd);
+            if (ok) memcpy(ref + (size_t)t * vd, ot.h, vd * sizeof(float));
+        }
+        if (ok && !sg_failed(e)) {
+            char lbl[80];
+            snprintf(lbl, sizeof lbl, "k_rmsnorm_gated_chunk==gated N=%u", N);
+            check_bit_identical(lbl, ob.h, ref, (uint64_t)N * vd);
+        }
+        gb_free(&yb); gb_free(&zb); gb_free(&ob); gb_free(&yt); gb_free(&zwt); gb_free(&ot);
+        free(y); free(z); free(ref);
+    }
+
+    /* Gate 5: 100 reruns byte-identical (N=17). */
+    {
+        const uint32_t N = 17;
+        float *y = xmalloc((size_t)N * vd * sizeof *y), *z = xmalloc((size_t)N * vd * sizeof *z);
+        for (uint32_t i = 0; i < N * vd; i++) { y[i] = lcg_next(); z[i] = lcg_next(); }
+        gbuf yb = gb_from(y, (uint64_t)N * vd), zb = gb_from(z, (uint64_t)N * vd), ob = gb_new((uint64_t)N * vd);
+        uint32_t pc[8] = {dv, heads, f32_bits(eps), N, 0, 0, 0, 0};
+        float *first = xmalloc((size_t)N * vd * sizeof *first);
+        uint64_t mism = 0;
+        for (int rep = 0; rep < 100; rep++) {
+            gb_poison(&ob);
+            sg_err e = sg_gpu_run_rmsnorm_gated_chunk(g_gpu, yb.b, zb.b, ob.b, wb.b, pc);
+            tt_assert(!sg_failed(e), "rmsnorm_gated_chunk det rep %d: %s", rep, e.msg ? e.msg : "ok");
+            if (sg_failed(e)) break;
+            if (rep == 0) memcpy(first, ob.h, (size_t)N * vd * sizeof(float));
+            else if (memcmp(first, ob.h, (size_t)N * vd * sizeof(float)) != 0) mism++;
+        }
+        tt_assert(mism == 0, "k_rmsnorm_gated_chunk: %llu mismatches over 100 reruns",
+                  (unsigned long long)mism);
+        if (mism == 0) fprintf(stderr, "   k_rmsnorm_gated_chunk (17 tok): byte-identical over 100 reruns\n");
+        gb_free(&yb); gb_free(&zb); gb_free(&ob); free(y); free(z); free(first);
+    }
+    gb_free(&wb); free(w);
+}
+
+/* The chunk one-shots' argument guards: an inconsistent or aliasing call must be
+ * an error return, not a device-side out-of-bounds read. Buffers are sized so the
+ * size checks pass and the specific guard under test (key_dim, or a destructive
+ * state carrier overlapping a read-only input) is what fires. */
+static void metal_chunk_rejects_bad_arguments(void) {
+    const uint32_t dk = 8, dv = 8, n_k = 2, n_v = 4, key_dim = n_k * dk;
+    const uint32_t value_dim = n_v * dv, conv_dim = 2 * key_dim + value_dim, N = 2;
+    /* S is the largest region (n_v*dv*dk = 256 floats), big enough to double as
+     * qkv/out for the aliasing cases below. */
+    gbuf S = gb_new((uint64_t)n_v * dv * dk);
+    gbuf qkv = gb_new((uint64_t)N * conv_dim), out = gb_new((uint64_t)N * value_dim);
+    gbuf gates = gb_new((uint64_t)N * 2 * n_v);
+
+    uint32_t pv[8] = {dk, dv, n_v, n_k, key_dim, 1, N, conv_dim};
+    sg_err e = sg_gpu_run_delta_chunk(g_gpu, S.b, qkv.b, out.b, gates.b, pv);
+    tt_assert(!sg_failed(e), "delta_chunk valid baseline: %s", e.msg ? e.msg : "ok");
+
+    uint32_t pk[8] = {dk, dv, n_v, n_k, key_dim - 1u, 1, N, conv_dim};
+    e = sg_gpu_run_delta_chunk(g_gpu, S.b, qkv.b, out.b, gates.b, pk);
+    tt_assert(sg_failed(e), "delta_chunk key_dim < n_k*dk should be rejected");
+
+    e = sg_gpu_run_delta_chunk(g_gpu, S.b, S.b, out.b, gates.b, pv);   /* S aliases qkv */
+    tt_assert(sg_failed(e), "delta_chunk S aliasing qkv should be rejected");
+    e = sg_gpu_run_delta_chunk(g_gpu, S.b, qkv.b, S.b, gates.b, pv);   /* out aliases S */
+    tt_assert(sg_failed(e), "delta_chunk out aliasing S should be rejected");
+
+    uint32_t pz[8] = {dk, dv, 0, n_k, key_dim, 1, N, conv_dim};
+    e = sg_gpu_run_delta_chunk(g_gpu, S.b, qkv.b, out.b, gates.b, pz);
+    tt_assert(sg_failed(e), "delta_chunk zero n_v should be rejected");
+    gb_free(&S); gb_free(&qkv); gb_free(&out); gb_free(&gates);
+
+    const uint32_t ch = 32, ks = 4;
+    gbuf w = gb_new((uint64_t)ch * ks), oc = gb_new((uint64_t)N * ch);
+    gbuf st = gb_new((uint64_t)(ks - 1) * ch);   /* 96 floats, big enough to double as x */
+    uint32_t pc[8] = {ch, ks, N, 0, 0, 0, 0, 0};
+    e = sg_gpu_run_conv1d_chunk(g_gpu, st.b, w.b, oc.b, st.b, pc);   /* state aliases x */
+    tt_assert(sg_failed(e), "conv1d_chunk state aliasing x should be rejected");
+    e = sg_gpu_run_conv1d_chunk(g_gpu, oc.b, w.b, oc.b, st.b, pc);   /* out aliases x */
+    tt_assert(sg_failed(e), "conv1d_chunk out aliasing x should be rejected");
+    gb_free(&w); gb_free(&oc); gb_free(&st);
+}
+
+/* --------------------------------------------------------------------
  * sg_gpu_wrap: the no-copy path a checkpoint mmap goes through
  * -------------------------------------------------------------------- */
 
@@ -903,6 +2262,56 @@ static void det_check(const char *label, const char *kernel, gbuf *a, gbuf *b, g
     free(state_first);
 }
 
+/* Gate 4 (Task M5.3): 100 reruns of each k_matmul_* kernel, byte-identical,
+ * output poisoned before every run (det_check above, already used for the
+ * reduction kernels below, does exactly that). Shapes span several tiles in
+ * both N and M and are deliberately not tile-aligned. */
+static void metal_matmul_deterministic(void) {
+    {
+        const uint32_t n = 37, m = 91, k = 320;
+        uint16_t *w = xmalloc((size_t)m * k * sizeof *w);
+        float *x = xmalloc((size_t)n * k * sizeof *x);
+        lcg_seed(0xDE70u);
+        for (uint64_t i = 0; i < (uint64_t)m * k; i++) w[i] = f32_to_bf16(lcg_next());
+        for (uint64_t i = 0; i < (uint64_t)n * k; i++) x[i] = lcg_next() * 3.0f;
+        gbuf a = gb_from(x, (uint64_t)n * k), b = gb_from_u16(w, (uint64_t)m * k);
+        gbuf o = gb_new((uint64_t)n * m);
+        uint32_t p[8] = {n, m, k, 0, 0, 0, 0, 0};
+        det_check("k_matmul_bf16 (37x91x320)", "k_matmul_bf16", &a, &b, &o, p, NULL, 0);
+        gb_free(&a); gb_free(&b); gb_free(&o);
+        free(w); free(x);
+    }
+    {
+        const uint32_t n = 20, m = 48, k = 513;
+        float *w = xmalloc((size_t)m * k * sizeof *w);
+        float *x = xmalloc((size_t)n * k * sizeof *x);
+        lcg_seed(0xF32Du);
+        for (uint64_t i = 0; i < (uint64_t)m * k; i++) w[i] = lcg_next();
+        for (uint64_t i = 0; i < (uint64_t)n * k; i++) x[i] = lcg_next() * 2.0f;
+        gbuf a = gb_from(x, (uint64_t)n * k), b = gb_from(w, (uint64_t)m * k);
+        gbuf o = gb_new((uint64_t)n * m);
+        uint32_t p[8] = {n, m, k, 0, 0, 0, 0, 0};
+        det_check("k_matmul_f32 (20x48x513)", "k_matmul_f32", &a, &b, &o, p, NULL, 0);
+        gb_free(&a); gb_free(&b); gb_free(&o);
+        free(w); free(x);
+    }
+    {
+        const uint32_t n = 9, m = 33, k = 1024;
+        uint64_t wbytes = (uint64_t)m * (k / 32) * 34;
+        uint8_t *w = xmalloc((size_t)wbytes);
+        float *x = xmalloc((size_t)n * k * sizeof *x);
+        lcg_seed(0xA8C2u);
+        build_q8(w, m, k);
+        for (uint64_t i = 0; i < (uint64_t)n * k; i++) x[i] = lcg_next() * 2.0f;
+        gbuf a = gb_from(x, (uint64_t)n * k), b = gb_from_u8(w, wbytes);
+        gbuf o = gb_new((uint64_t)n * m);
+        uint32_t p[8] = {n, m, k, 0, 0, 0, 0, 0};
+        det_check("k_matmul_q8 (9x33x1024)", "k_matmul_q8", &a, &b, &o, p, NULL, 0);
+        gb_free(&a); gb_free(&b); gb_free(&o);
+        free(w); free(x);
+    }
+}
+
 static void metal_reductions_are_deterministic(void) {
     /* matvec_bf16, at a width where the fold tree runs all 8 levels. */
     const uint32_t rows = 64, cols = 1024;
@@ -918,6 +2327,23 @@ static void metal_reductions_are_deterministic(void) {
         gb_free(&a); gb_free(&b); gb_free(&o);
     }
     free(w); free(x);
+
+    /* matvec_q8, same width. The fused dequant does not change the reduction
+     * shape, but it is a distinct kernel and reads a distinct buffer type, so
+     * pin its determinism directly. */
+    {
+        const uint32_t rows = 64, cols = 1024;
+        uint64_t wbytes = (uint64_t)rows * (cols / 32) * 34;
+        uint8_t *qw = xmalloc((size_t)wbytes);
+        float *qx = xmalloc(cols * sizeof *qx);
+        build_q8(qw, rows, cols);
+        for (uint32_t i = 0; i < cols; i++) qx[i] = lcg_next() * 4.0f;
+        gbuf a = gb_from_u8(qw, wbytes), b = gb_from(qx, cols), o = gb_new(rows);
+        uint32_t p[8] = {rows, cols, 0, 0, 0, 0, 0, 0};
+        det_check("k_matvec_q8 (64x1024)", "k_matvec_q8", &a, &b, &o, p, NULL, 0);
+        gb_free(&a); gb_free(&b); gb_free(&o);
+        free(qw); free(qx);
+    }
 
     /* matvec_f32 and rmsnorm fold the same tree, so their determinism is not
      * a separate mechanism, but it is a separate kernel and cheap to pin. */
@@ -1059,6 +2485,13 @@ static void metal_rejects_bad_arguments(void) {
     e = sg_gpu_run_op(g_gpu, "k_attn_decode", a.b, b.b, o.b, bad_voff);
     tt_assert(sg_failed(e), "a v_cache offset past the end of b should be rejected");
 
+    /* Q8_0 rows are whole 32-element blocks, so a cols that is not a multiple
+     * of 32 has no valid byte layout; it must be rejected before the size
+     * rule truncates the block count. */
+    uint32_t q8_odd[8] = {8, 40, 0, 0, 0, 0, 0, 0};
+    e = sg_gpu_run_op(g_gpu, "k_matvec_q8", a.b, b.b, o.b, q8_odd);
+    tt_assert(sg_failed(e), "k_matvec_q8 cols not a multiple of 32 should be rejected");
+
     gb_free(&a); gb_free(&b); gb_free(&o);
 
     /* sg_gpu_wrap must refuse a pointer it cannot bind: setBuffer:offset:
@@ -1110,6 +2543,1088 @@ static void metal_rejects_bad_arguments(void) {
     free(shared);
 }
 
+/* --------------------------------------------------------------------
+ * P2.2: split-K decode attention (k_attn_decode_splitk_partial +
+ * k_attn_decode_splitk_combine) vs the P2.0/P2.1 CPU oracles
+ * --------------------------------------------------------------------
+ *
+ * THESE KERNELS WERE WRITTEN AND COMPILED WITH THE GPU HELD BY A 28-HOUR
+ * BENCHMARK, so this subtest had never been executed when it was committed.
+ * It is the gate, written to be run the moment the GPU frees; nothing in it
+ * had been observed to pass at that point. Everything it asserts is
+ * therefore a CLAIM ABOUT INTENT until it runs green.
+ *
+ * Two oracles, on identical inputs, for every case:
+ *   TIGHT   vs sg_ref_attn_decode_splitk at the SAME n_splits. This is the
+ *           twin comparison: the Metal pair and that function partition
+ *           [0, seq) by the same rule, build the same per-split (m, s, acc)
+ *           triple, and fold it with the same log-sum-exp rescaling, so they
+ *           must agree partition boundary for partition boundary.
+ *   DIRECT  vs sg_ref_attn_decode (one pass over every key, no splitting at
+ *           all). This is what proves split-K did not change the ANSWER, not
+ *           merely that two split-K implementations agree with each other --
+ *           the K-invariance trap the P2.1 review called out.
+ *
+ * K and V are rounded to f16 before either side sees them, and the CPU
+ * oracles get the exactly-widened f32 values, so the only remaining gap is
+ * ref.c's double accumulation against the kernel's f32 (the ~1e-7 the rest of
+ * this file measures), not a rounding the oracle never committed. */
+
+/* Assert the partial buffers themselves encode the partition the CPU oracle
+ * defines: empty splits (which n_splits > seq forces) must carry EXACTLY the
+ * documented m = -INFINITY, s = 0, acc = 0, and non-empty splits must carry a
+ * finite m with s >= 1.0 (the key achieving that split's own max contributes
+ * exp(0) == 1.0, so the sum cannot be smaller). Checked directly rather than
+ * only through the combined output, because the combine maps an
+ * empty-encoded split and an all-zero-weight split to the same answer and
+ * would hide a partition rule that is off by one. */
+static void splitk_check_partials(const char *label, const float *m, const float *s,
+                                  const float *acc, uint32_t n_heads, uint32_t hd,
+                                  uint32_t seq, uint32_t n_splits) {
+    uint64_t bad_empty = 0, bad_full = 0, bad_acc = 0;
+    for (uint32_t h = 0; h < n_heads; h++) {
+        for (uint32_t i = 0; i < n_splits; i++) {
+            uint32_t t0 = (uint32_t)((uint64_t)i * seq / n_splits);
+            uint32_t t1 = (uint32_t)((uint64_t)(i + 1) * seq / n_splits);
+            size_t at = (size_t)h * n_splits + i;
+            if (t0 >= t1) {
+                if (!(m[at] == -INFINITY) || s[at] != 0.0f) bad_empty++;
+                for (uint32_t d = 0; d < hd; d++) {
+                    if (acc[at * hd + d] != 0.0f) bad_acc++;
+                }
+            } else {
+                if (!isfinite(m[at]) || !(s[at] >= 1.0f)) bad_full++;
+            }
+        }
+    }
+    tt_assert(bad_empty == 0 && bad_acc == 0 && bad_full == 0,
+              "%s: %llu empty splits not encoded as (-inf, 0), %llu with a nonzero acc, "
+              "%llu non-empty splits with a non-finite m or s < 1",
+              label, (unsigned long long)bad_empty, (unsigned long long)bad_acc,
+              (unsigned long long)bad_full);
+}
+
+/* One (shape, q_stride) sweep over every n_splits in the gate's list. */
+static void splitk_shape(const char *what, uint32_t n_heads, uint32_t n_kv, uint32_t hd,
+                         uint32_t seq, uint32_t q_stride, uint32_t seed) {
+    const uint32_t splits[] = {1, 2, 3, 7, 64, 257};
+    uint32_t out_n = n_heads * hd;
+    uint64_t kvn = (uint64_t)seq * n_kv * hd;
+    float scale = (float)(1.0 / sqrt((double)hd));
+
+    lcg_seed(seed);
+    float *q = xmalloc((size_t)n_heads * q_stride * sizeof *q);
+    for (uint32_t h = 0; h < n_heads; h++) {
+        float *qh = q + (size_t)h * q_stride;
+        for (uint32_t i = 0; i < hd; i++) qh[i] = lcg_next();
+        /* The hybrid layout's attention-gate half is NOT query data and must
+         * never be read. Poison it with NaN: if the kernel's q_stride
+         * handling were wrong by so much as one element, every comparison
+         * below would come back NaN rather than merely inaccurate. */
+        for (uint32_t i = hd; i < q_stride; i++) qh[i] = (float)NAN;
+    }
+
+    uint16_t *k16 = xmalloc((size_t)kvn * sizeof *k16);
+    uint16_t *v16 = xmalloc((size_t)kvn * sizeof *v16);
+    float *k32 = xmalloc((size_t)kvn * sizeof *k32);
+    float *v32 = xmalloc((size_t)kvn * sizeof *v32);
+    for (uint64_t i = 0; i < kvn; i++) {
+        k16[i] = sg_f32_to_f16(lcg_next() * 2.0f);
+        v16[i] = sg_f32_to_f16(lcg_next() * 2.0f);
+        k32[i] = sg_f16_to_f32(k16[i]);   /* the f16 rounding, widened back exactly */
+        v32[i] = sg_f16_to_f32(v16[i]);
+    }
+
+    /* Oracle 2 (direct, no splitting) is the same for every n_splits. */
+    float *want_direct = xmalloc(out_n * sizeof *want_direct);
+    sg_ref_attn_decode(q, k32, v32, n_heads, n_kv, hd, seq, q_stride, scale, want_direct);
+
+    gbuf qb = gb_from(q, (uint64_t)n_heads * q_stride);
+    gbuf16 kb = gb16_new(kvn), vb = gb16_new(kvn);
+    memcpy(kb.h, k16, (size_t)kvn * sizeof(uint16_t));
+    memcpy(vb.h, v16, (size_t)kvn * sizeof(uint16_t));
+
+    float *want_split = xmalloc(out_n * sizeof *want_split);
+    for (size_t si = 0; si < sizeof splits / sizeof splits[0]; si++) {
+        uint32_t ns = splits[si];
+        uint32_t p[8] = {n_heads, n_kv, hd, seq, q_stride, f32_bits(scale), ns, 0};
+        gbuf mb = gb_new((uint64_t)n_heads * ns);
+        gbuf sb = gb_new((uint64_t)n_heads * ns);
+        gbuf ab = gb_new((uint64_t)n_heads * ns * hd);
+        gbuf ob = gb_new(out_n);
+        gb_poison(&mb); gb_poison(&sb); gb_poison(&ab); gb_poison(&ob);
+
+        sg_err e = sg_gpu_run_attn_splitk_partial(g_gpu, qb.b, kb.b, vb.b,
+                                                  mb.b, sb.b, ab.b, p);
+        tt_assert(!sg_failed(e), "splitk partial (%s, n_splits %u): %s", what, ns,
+                  e.msg ? e.msg : "ok");
+        if (!sg_failed(e)) {
+            char lbl[96];
+            snprintf(lbl, sizeof lbl, "splitk partials (%s, K=%u)", what, ns);
+            splitk_check_partials(lbl, mb.h, sb.h, ab.h, n_heads, hd, seq, ns);
+
+            e = sg_gpu_run_attn_splitk_combine(g_gpu, mb.b, sb.b, ab.b, ob.b, p);
+            tt_assert(!sg_failed(e), "splitk combine (%s, n_splits %u): %s", what, ns,
+                      e.msg ? e.msg : "ok");
+            if (!sg_failed(e)) {
+                sg_ref_attn_decode_splitk(q, k32, v32, n_heads, n_kv, hd, seq,
+                                          q_stride, scale, ns, want_split);
+                snprintf(lbl, sizeof lbl, "splitk %s K=%-3u vs ref_splitk", what, ns);
+                check_rel(lbl, ob.h, want_split, out_n);
+                snprintf(lbl, sizeof lbl, "splitk %s K=%-3u vs ref_decode", what, ns);
+                check_rel(lbl, ob.h, want_direct, out_n);
+            }
+        }
+        gb_free(&mb); gb_free(&sb); gb_free(&ab); gb_free(&ob);
+    }
+
+    gb_free(&qb); gb16_free(&kb); gb16_free(&vb);
+    free(q); free(k16); free(v16); free(k32); free(v32);
+    free(want_direct); free(want_split);
+}
+
+/* 100 reruns of the same dispatch pair on identical inputs must be
+ * BYTE-IDENTICAL, with every output buffer poisoned before each run so a
+ * partially-written result cannot pass by inheriting the previous run's
+ * bytes. This is the property the fixed-tree folds and the fixed partition
+ * rule exist to provide; a stray atomic or a simd_sum would show up here. */
+static void splitk_determinism(void) {
+    const uint32_t n_heads = 32, n_kv = 8, hd = 128, seq = 1000, q_stride = 2 * hd;
+    const uint32_t ns = 7;
+    uint32_t out_n = n_heads * hd;
+    uint64_t kvn = (uint64_t)seq * n_kv * hd;
+    float scale = (float)(1.0 / sqrt((double)hd));
+
+    lcg_seed(0x5D17Fu);
+    float *q = xmalloc((size_t)n_heads * q_stride * sizeof *q);
+    for (uint32_t i = 0; i < n_heads * q_stride; i++) q[i] = lcg_next();
+    uint16_t *k16 = xmalloc((size_t)kvn * sizeof *k16);
+    uint16_t *v16 = xmalloc((size_t)kvn * sizeof *v16);
+    for (uint64_t i = 0; i < kvn; i++) {
+        k16[i] = sg_f32_to_f16(lcg_next() * 2.0f);
+        v16[i] = sg_f32_to_f16(lcg_next() * 2.0f);
+    }
+
+    gbuf qb = gb_from(q, (uint64_t)n_heads * q_stride);
+    gbuf16 kb = gb16_new(kvn), vb = gb16_new(kvn);
+    memcpy(kb.h, k16, (size_t)kvn * sizeof(uint16_t));
+    memcpy(vb.h, v16, (size_t)kvn * sizeof(uint16_t));
+    gbuf mb = gb_new((uint64_t)n_heads * ns);
+    gbuf sb = gb_new((uint64_t)n_heads * ns);
+    gbuf ab = gb_new((uint64_t)n_heads * ns * hd);
+    gbuf ob = gb_new(out_n);
+    uint32_t p[8] = {n_heads, n_kv, hd, seq, q_stride, f32_bits(scale), ns, 0};
+
+    /* Compare ALL FOUR buffers, and BYTE-WISE (P2.2 review finding 3).
+     * Comparing only the combine's `out` would miss a partial that is
+     * nondeterministic in a way the final num/S division cancels: scale every
+     * split's m by a jitter and s and acc move with it, leaving out[] exactly
+     * where it was. And memcmp rather than float `!=` for the same reason
+     * check_bit_identical above uses it: a stably-NaN output would compare
+     * unequal to itself and report 99 phantom mismatch runs, while a +0.0 to
+     * -0.0 flip (a genuine nondeterminism signal) compares EQUAL and would be
+     * missed entirely. Counted per RUN, not per element, matching det_check's
+     * convention. */
+    size_t ms_bytes = (size_t)n_heads * ns * sizeof(float);
+    size_t acc_bytes = (size_t)n_heads * ns * hd * sizeof(float);
+    size_t out_bytes = (size_t)out_n * sizeof(float);
+    uint8_t *first_m = xmalloc(ms_bytes), *first_s = xmalloc(ms_bytes);
+    uint8_t *first_acc = xmalloc(acc_bytes), *first_out = xmalloc(out_bytes);
+    uint32_t mism_m = 0, mism_s = 0, mism_acc = 0, mism_out = 0;
+
+    for (int rep = 0; rep < 100; rep++) {
+        gb_poison(&mb); gb_poison(&sb); gb_poison(&ab); gb_poison(&ob);
+        sg_err e = sg_gpu_run_attn_splitk_partial(g_gpu, qb.b, kb.b, vb.b,
+                                                  mb.b, sb.b, ab.b, p);
+        if (!sg_failed(e)) e = sg_gpu_run_attn_splitk_combine(g_gpu, mb.b, sb.b, ab.b, ob.b, p);
+        tt_assert(!sg_failed(e), "splitk determinism rep %d: %s", rep, e.msg ? e.msg : "ok");
+        if (sg_failed(e)) break;
+        if (rep == 0) {
+            memcpy(first_m, mb.h, ms_bytes);
+            memcpy(first_s, sb.h, ms_bytes);
+            memcpy(first_acc, ab.h, acc_bytes);
+            memcpy(first_out, ob.h, out_bytes);
+        } else {
+            if (memcmp(first_m, mb.h, ms_bytes) != 0) mism_m++;
+            if (memcmp(first_s, sb.h, ms_bytes) != 0) mism_s++;
+            if (memcmp(first_acc, ab.h, acc_bytes) != 0) mism_acc++;
+            if (memcmp(first_out, ob.h, out_bytes) != 0) mism_out++;
+        }
+    }
+    tt_assert(mism_m == 0 && mism_s == 0 && mism_acc == 0 && mism_out == 0,
+              "split-K decode attention over 99 reruns: m differed on %u, s on %u, "
+              "acc on %u, out on %u", mism_m, mism_s, mism_acc, mism_out);
+    if (mism_m == 0 && mism_s == 0 && mism_acc == 0 && mism_out == 0) {
+        fprintf(stderr, "   split-K decode attention: m/s/acc/out byte-identical "
+                        "over 100 reruns\n");
+    }
+
+    free(first_m); free(first_s); free(first_acc); free(first_out);
+    free(q); free(k16); free(v16);
+    gb_free(&qb); gb16_free(&kb); gb16_free(&vb);
+    gb_free(&mb); gb_free(&sb); gb_free(&ab); gb_free(&ob);
+}
+
+/* The host-side contract: every documented rejection actually rejects. These
+ * need no correct kernel at all (check_params and the size rules run before
+ * anything is encoded), so they are the one part of this subtest that does
+ * not depend on the deferred numeric gates. */
+static void splitk_rejects_bad_arguments(void) {
+    const uint32_t n_heads = 4, n_kv = 2, hd = 8, seq = 16, ns = 3;
+    uint32_t good[8] = {n_heads, n_kv, hd, seq, hd, f32_bits(0.35f), ns, 0};
+    gbuf qb = gb_new((uint64_t)n_heads * hd);
+    gbuf16 kb = gb16_new((uint64_t)seq * n_kv * hd), vb = gb16_new((uint64_t)seq * n_kv * hd);
+    gbuf mb = gb_new((uint64_t)n_heads * ns), sb = gb_new((uint64_t)n_heads * ns);
+    gbuf ab = gb_new((uint64_t)n_heads * ns * hd), ob = gb_new((uint64_t)n_heads * hd);
+    sg_err e;
+
+    e = sg_gpu_run_attn_splitk_partial(g_gpu, NULL, kb.b, vb.b, mb.b, sb.b, ab.b, good);
+    tt_assert(sg_failed(e), "splitk partial should reject a NULL q");
+    e = sg_gpu_run_attn_splitk_combine(g_gpu, mb.b, sb.b, ab.b, NULL, good);
+    tt_assert(sg_failed(e), "splitk combine should reject a NULL out");
+
+    uint32_t zero_k[8]; memcpy(zero_k, good, sizeof good); zero_k[6] = 0;
+    e = sg_gpu_run_attn_splitk_partial(g_gpu, qb.b, kb.b, vb.b, mb.b, sb.b, ab.b, zero_k);
+    tt_assert(sg_failed(e), "splitk partial should reject n_splits == 0");
+    e = sg_gpu_run_attn_splitk_combine(g_gpu, mb.b, sb.b, ab.b, ob.b, zero_k);
+    tt_assert(sg_failed(e), "splitk combine should reject n_splits == 0");
+
+    uint32_t bad_gqa[8]; memcpy(bad_gqa, good, sizeof good); bad_gqa[1] = 3;
+    e = sg_gpu_run_attn_splitk_partial(g_gpu, qb.b, kb.b, vb.b, mb.b, sb.b, ab.b, bad_gqa);
+    tt_assert(sg_failed(e), "splitk partial should reject n_heads not a multiple of n_kv");
+
+    uint32_t bad_stride[8]; memcpy(bad_stride, good, sizeof good); bad_stride[4] = hd - 1;
+    e = sg_gpu_run_attn_splitk_partial(g_gpu, qb.b, kb.b, vb.b, mb.b, sb.b, ab.b, bad_stride);
+    tt_assert(sg_failed(e), "splitk partial should reject q_stride < head_dim");
+
+    /* An undersized partial buffer: n_splits raised without growing m/s/acc.
+     * This is the mistake that would have the kernel write past the end. */
+    uint32_t big_k[8]; memcpy(big_k, good, sizeof good); big_k[6] = ns + 1;
+    e = sg_gpu_run_attn_splitk_partial(g_gpu, qb.b, kb.b, vb.b, mb.b, sb.b, ab.b, big_k);
+    tt_assert(sg_failed(e), "splitk partial should reject partial buffers sized for fewer splits");
+
+    /* Aliasing: an output over an input, and two outputs over each other. */
+    e = sg_gpu_run_attn_splitk_partial(g_gpu, qb.b, kb.b, vb.b, mb.b, mb.b, ab.b, good);
+    tt_assert(sg_failed(e), "splitk partial should reject m and s being the same buffer");
+    e = sg_gpu_run_attn_splitk_combine(g_gpu, mb.b, sb.b, ab.b, mb.b, good);
+    tt_assert(sg_failed(e), "splitk combine should reject out aliasing an input");
+
+    /* And sg_gpu_run_op must refuse both by name rather than dispatch them
+     * with two of their seven bindings missing. */
+    e = sg_gpu_run_op(g_gpu, "k_attn_decode_splitk_partial", qb.b, kb.b, ob.b, good);
+    tt_assert(sg_failed(e), "sg_gpu_run_op should refuse k_attn_decode_splitk_partial");
+    e = sg_gpu_run_op(g_gpu, "k_attn_decode_splitk_combine", mb.b, sb.b, ob.b, good);
+    tt_assert(sg_failed(e), "sg_gpu_run_op should refuse k_attn_decode_splitk_combine");
+
+    gb_free(&qb); gb16_free(&kb); gb16_free(&vb);
+    gb_free(&mb); gb_free(&sb); gb_free(&ab); gb_free(&ob);
+}
+
+/* --------------------------------------------------------------------
+ * P2.4: k_attn_decode_splitk_partial_gqa vs k_attn_decode_splitk_partial
+ * --------------------------------------------------------------------
+ *
+ * THIS SUBTEST WAS ALSO WRITTEN WITH THE GPU HELD BY A BENCHMARK and had never
+ * been executed when it was committed, exactly like the P2.2 block above.
+ *
+ * THE BAR IS BYTE-IDENTICAL, NOT close, and that is the point of the task
+ * rather than an aspiration. The GQA kernel is a pure data-reuse
+ * reorganization of the per-head one: one threadgroup serves a whole GQA
+ * group, so each K/V element is read once instead of once per query head that
+ * shares it, but every dot product still accumulates the same operands in
+ * increasing i, every m and s still comes off the same fixed-shape tg_max /
+ * tg_sum tree over the same per-lane partials, and every acc still sums over
+ * increasing t. Nothing in the arithmetic moves, so nothing in the output may.
+ * A 1e-7 difference here would mean the reorganization changed an accumulation
+ * order somewhere, which is a bug in the kernel, not a rounding budget.
+ *
+ * All four buffers are compared (m, s, acc AND the combined out), memcmp-wise,
+ * for the two reasons the P2.2 determinism check states: a partial that is
+ * wrong in a way the combine's num/S division cancels would pass an out-only
+ * check, and float != is wrong in both directions (a stable NaN compares
+ * unequal to itself, a +0.0/-0.0 flip compares equal). Both sides' outputs are
+ * poisoned before every dispatch so an UNWRITTEN buffer cannot pass by
+ * inheriting bytes; if the GQA kernel ever silently skipped a head, its m/s/acc
+ * would still hold 0xA5 and the comparison would fail rather than pass. */
+static void gqa_same_bytes(const char *label, const float *a, const float *b, size_t n) {
+    size_t first = n, ndiff = 0;
+    for (size_t i = 0; i < n; i++) {
+        if (memcmp(&a[i], &b[i], sizeof(float)) != 0) {
+            if (first == n) first = i;
+            ndiff++;
+        }
+    }
+    double fa = (first < n) ? (double)a[first] : 0.0;
+    double fb = (first < n) ? (double)b[first] : 0.0;
+    tt_assert(ndiff == 0,
+              "%s: %llu of %llu floats differ, first at index %llu "
+              "(per-head %.9g, gqa %.9g)", label,
+              (unsigned long long)ndiff, (unsigned long long)n,
+              (unsigned long long)first, fa, fb);
+}
+
+/* A comparison of two poison buffers passes, so at least one slot of each
+ * compared buffer has to be shown to have been WRITTEN (fix round 1, review
+ * finding M1). Without this, a pair of dispatches that silently did nothing at
+ * all would leave both sides holding 0xA5A5A5A5 and every memcmp above would
+ * report a perfect match.
+ *
+ * `strict` asks that NO element still holds the poison word, which is the real
+ * statement ("every slot was written") and is safe for m and s: m is either
+ * finite or -INFINITY and s is either 0.0 or >= 1.0, so neither can coincide
+ * with the poison word's value (a tiny negative ~-2.9e-16). For acc and out,
+ * whose elements are unbounded sums, the weaker "at least one slot moved" avoids
+ * a one-in-4-billion false failure on an exact bit coincidence. */
+static void gqa_not_poison(const char *label, const float *p, size_t n, bool strict) {
+    const uint32_t poison = 0xA5A5A5A5u;
+    size_t still = 0;
+    for (size_t i = 0; i < n; i++) {
+        uint32_t bits;
+        memcpy(&bits, &p[i], sizeof bits);
+        if (bits == poison) still++;
+    }
+    if (strict) {
+        tt_assert(still == 0, "%s: %llu of %llu floats still hold the 0xA5 poison, "
+                              "so those slots were never written", label,
+                  (unsigned long long)still, (unsigned long long)n);
+    } else {
+        tt_assert(still < n, "%s: all %llu floats still hold the 0xA5 poison, so the "
+                             "dispatch wrote nothing and every byte comparison of it "
+                             "is vacuous", label, (unsigned long long)n);
+    }
+}
+
+/* One (shape, q_stride) sweep: for every n_splits, run BOTH partials plus the
+ * shared combine on identical inputs and compare all four outputs bit for bit.
+ *
+ * THE SPLIT LIST. The first six are P2.2's, and the low counts push a split past
+ * 256 keys so the score loop strides. The seventh is computed per shape and is
+ * the empty-split case (fix round 1, review finding I3): it is > seq BY
+ * CONSTRUCTION, so the high-index splits are genuinely empty and the
+ * -INFINITY/0/0 encoding is exercised AT EVERY SHAPE. The fixed 257 only
+ * exceeded seq for the one 200-token shape, which left the encoding untested at
+ * repeat 6 and in the kernel's one-head-at-a-time arm; an earlier version of
+ * this comment claimed otherwise and was wrong. */
+static void splitk_gqa_shape(const char *what, uint32_t n_heads, uint32_t n_kv, uint32_t hd,
+                             uint32_t seq, uint32_t q_stride, uint32_t seed) {
+    const uint32_t splits[] = {1, 2, 3, 7, 64, 257, seq + seq / 4 + 1};
+    uint32_t out_n = n_heads * hd;
+    uint64_t kvn = (uint64_t)seq * n_kv * hd;
+    float scale = (float)(1.0 / sqrt((double)hd));
+
+    lcg_seed(seed);
+    float *q = xmalloc((size_t)n_heads * q_stride * sizeof *q);
+    for (uint32_t h = 0; h < n_heads; h++) {
+        float *qh = q + (size_t)h * q_stride;
+        for (uint32_t i = 0; i < hd; i++) qh[i] = lcg_next();
+        /* The gate half is not query data. NaN-poisoned exactly as in the P2.2
+         * sweep: the GQA kernel reaches head h0+j through a j*q_stride stride
+         * rather than its own base pointer, so an off-by-one there would read
+         * this and every comparison would come back NaN. */
+        for (uint32_t i = hd; i < q_stride; i++) qh[i] = (float)NAN;
+    }
+
+    uint16_t *k16 = xmalloc((size_t)kvn * sizeof *k16);
+    uint16_t *v16 = xmalloc((size_t)kvn * sizeof *v16);
+    for (uint64_t i = 0; i < kvn; i++) {
+        k16[i] = sg_f32_to_f16(lcg_next() * 2.0f);
+        v16[i] = sg_f32_to_f16(lcg_next() * 2.0f);
+    }
+
+    gbuf qb = gb_from(q, (uint64_t)n_heads * q_stride);
+    gbuf16 kb = gb16_new(kvn), vb = gb16_new(kvn);
+    memcpy(kb.h, k16, (size_t)kvn * sizeof(uint16_t));
+    memcpy(vb.h, v16, (size_t)kvn * sizeof(uint16_t));
+
+    for (size_t si = 0; si < sizeof splits / sizeof splits[0]; si++) {
+        uint32_t ns = splits[si];
+        uint32_t p[8] = {n_heads, n_kv, hd, seq, q_stride, f32_bits(scale), ns, 0};
+        uint64_t parts = (uint64_t)n_heads * ns;
+        gbuf m1 = gb_new(parts), s1 = gb_new(parts), a1 = gb_new(parts * hd);
+        gbuf m2 = gb_new(parts), s2 = gb_new(parts), a2 = gb_new(parts * hd);
+        gbuf o1 = gb_new(out_n), o2 = gb_new(out_n);
+        gb_poison(&m1); gb_poison(&s1); gb_poison(&a1); gb_poison(&o1);
+        gb_poison(&m2); gb_poison(&s2); gb_poison(&a2); gb_poison(&o2);
+
+        /* THE GQA PARTIAL RUNS FIRST (fix round 1, review finding M2). Both
+         * kernels share the one grown-not-partitioned splitk_scratch, so
+         * whichever runs second could in principle read exponentials the first
+         * one left in a score row instead of its own. Neither kernel does (each
+         * writes every element of [0, len) before the barrier that precedes any
+         * read of it), but the ordering makes the KERNEL UNDER TEST the one that
+         * cannot inherit the reference kernel's bytes: if the GQA kernel ever
+         * skipped a score write, it would read the previous ITERATION's leftovers
+         * for a different shape or split count, not a correct-looking value. */
+        sg_err e = sg_gpu_run_attn_splitk_partial_gqa(g_gpu, qb.b, kb.b, vb.b,
+                                                     m2.b, s2.b, a2.b, p);
+        tt_assert(!sg_failed(e), "splitk gqa partial (%s, n_splits %u): %s",
+                  what, ns, e.msg ? e.msg : "ok");
+        if (!sg_failed(e)) {
+            e = sg_gpu_run_attn_splitk_combine(g_gpu, m2.b, s2.b, a2.b, o2.b, p);
+            tt_assert(!sg_failed(e), "splitk combine after gqa (%s, n_splits %u): %s",
+                      what, ns, e.msg ? e.msg : "ok");
+        }
+        if (!sg_failed(e)) {
+            e = sg_gpu_run_attn_splitk_partial(g_gpu, qb.b, kb.b, vb.b,
+                                               m1.b, s1.b, a1.b, p);
+            tt_assert(!sg_failed(e), "splitk per-head partial (%s, n_splits %u): %s",
+                      what, ns, e.msg ? e.msg : "ok");
+        }
+        if (!sg_failed(e)) {
+            e = sg_gpu_run_attn_splitk_combine(g_gpu, m1.b, s1.b, a1.b, o1.b, p);
+            tt_assert(!sg_failed(e), "splitk combine after per-head (%s, n_splits %u): %s",
+                      what, ns, e.msg ? e.msg : "ok");
+        }
+        if (!sg_failed(e)) {
+            char lbl[128];
+            /* Both sides must have actually written, or the four comparisons
+             * below are two poison buffers agreeing (finding M1). */
+            snprintf(lbl, sizeof lbl, "gqa %s K=%-3u m (gqa side)", what, ns);
+            gqa_not_poison(lbl, m2.h, (size_t)parts, true);
+            snprintf(lbl, sizeof lbl, "gqa %s K=%-3u m (per-head side)", what, ns);
+            gqa_not_poison(lbl, m1.h, (size_t)parts, true);
+            snprintf(lbl, sizeof lbl, "gqa %s K=%-3u s (gqa side)", what, ns);
+            gqa_not_poison(lbl, s2.h, (size_t)parts, true);
+            snprintf(lbl, sizeof lbl, "gqa %s K=%-3u acc (gqa side)", what, ns);
+            gqa_not_poison(lbl, a2.h, (size_t)(parts * hd), false);
+            snprintf(lbl, sizeof lbl, "gqa %s K=%-3u out (gqa side)", what, ns);
+            gqa_not_poison(lbl, o2.h, (size_t)out_n, false);
+
+            snprintf(lbl, sizeof lbl, "gqa %s K=%-3u m", what, ns);
+            gqa_same_bytes(lbl, m1.h, m2.h, (size_t)parts);
+            snprintf(lbl, sizeof lbl, "gqa %s K=%-3u s", what, ns);
+            gqa_same_bytes(lbl, s1.h, s2.h, (size_t)parts);
+            snprintf(lbl, sizeof lbl, "gqa %s K=%-3u acc", what, ns);
+            gqa_same_bytes(lbl, a1.h, a2.h, (size_t)(parts * hd));
+            snprintf(lbl, sizeof lbl, "gqa %s K=%-3u out", what, ns);
+            gqa_same_bytes(lbl, o1.h, o2.h, (size_t)out_n);
+        }
+
+        gb_free(&m1); gb_free(&s1); gb_free(&a1); gb_free(&o1);
+        gb_free(&m2); gb_free(&s2); gb_free(&a2); gb_free(&o2);
+    }
+
+    gb_free(&qb); gb16_free(&kb); gb16_free(&vb);
+    free(q); free(k16); free(v16);
+}
+
+/* 100 reruns of the GQA partial + combine on identical inputs must be
+ * byte-identical to each other, the same property (and the same method)
+ * splitk_determinism checks for the per-head kernel. Holding `repeat`
+ * accumulators per thread is exactly the kind of change that could reach for
+ * an atomic or a simd_sum; this is what would catch it. */
+static void splitk_gqa_determinism(void) {
+    const uint32_t n_heads = 32, n_kv = 8, hd = 128, seq = 1000, q_stride = 2 * hd;
+    const uint32_t ns = 7;
+    uint32_t out_n = n_heads * hd;
+    uint64_t kvn = (uint64_t)seq * n_kv * hd;
+    float scale = (float)(1.0 / sqrt((double)hd));
+
+    lcg_seed(0x6A1Fu);
+    float *q = xmalloc((size_t)n_heads * q_stride * sizeof *q);
+    for (uint32_t i = 0; i < n_heads * q_stride; i++) q[i] = lcg_next();
+    uint16_t *k16 = xmalloc((size_t)kvn * sizeof *k16);
+    uint16_t *v16 = xmalloc((size_t)kvn * sizeof *v16);
+    for (uint64_t i = 0; i < kvn; i++) {
+        k16[i] = sg_f32_to_f16(lcg_next() * 2.0f);
+        v16[i] = sg_f32_to_f16(lcg_next() * 2.0f);
+    }
+
+    gbuf qb = gb_from(q, (uint64_t)n_heads * q_stride);
+    gbuf16 kb = gb16_new(kvn), vb = gb16_new(kvn);
+    memcpy(kb.h, k16, (size_t)kvn * sizeof(uint16_t));
+    memcpy(vb.h, v16, (size_t)kvn * sizeof(uint16_t));
+    gbuf mb = gb_new((uint64_t)n_heads * ns);
+    gbuf sb = gb_new((uint64_t)n_heads * ns);
+    gbuf ab = gb_new((uint64_t)n_heads * ns * hd);
+    gbuf ob = gb_new(out_n);
+    uint32_t p[8] = {n_heads, n_kv, hd, seq, q_stride, f32_bits(scale), ns, 0};
+
+    size_t ms_bytes = (size_t)n_heads * ns * sizeof(float);
+    size_t acc_bytes = (size_t)n_heads * ns * hd * sizeof(float);
+    size_t out_bytes = (size_t)out_n * sizeof(float);
+    uint8_t *first_m = xmalloc(ms_bytes), *first_s = xmalloc(ms_bytes);
+    uint8_t *first_acc = xmalloc(acc_bytes), *first_out = xmalloc(out_bytes);
+    uint32_t mism_m = 0, mism_s = 0, mism_acc = 0, mism_out = 0;
+
+    for (int rep = 0; rep < 100; rep++) {
+        gb_poison(&mb); gb_poison(&sb); gb_poison(&ab); gb_poison(&ob);
+        sg_err e = sg_gpu_run_attn_splitk_partial_gqa(g_gpu, qb.b, kb.b, vb.b,
+                                                      mb.b, sb.b, ab.b, p);
+        if (!sg_failed(e)) e = sg_gpu_run_attn_splitk_combine(g_gpu, mb.b, sb.b, ab.b, ob.b, p);
+        tt_assert(!sg_failed(e), "splitk gqa determinism rep %d: %s", rep, e.msg ? e.msg : "ok");
+        if (sg_failed(e)) break;
+        if (rep == 0) {
+            memcpy(first_m, mb.h, ms_bytes);
+            memcpy(first_s, sb.h, ms_bytes);
+            memcpy(first_acc, ab.h, acc_bytes);
+            memcpy(first_out, ob.h, out_bytes);
+        } else {
+            if (memcmp(first_m, mb.h, ms_bytes) != 0) mism_m++;
+            if (memcmp(first_s, sb.h, ms_bytes) != 0) mism_s++;
+            if (memcmp(first_acc, ab.h, acc_bytes) != 0) mism_acc++;
+            if (memcmp(first_out, ob.h, out_bytes) != 0) mism_out++;
+        }
+    }
+    tt_assert(mism_m == 0 && mism_s == 0 && mism_acc == 0 && mism_out == 0,
+              "GQA split-K partial over 99 reruns: m differed on %u, s on %u, "
+              "acc on %u, out on %u", mism_m, mism_s, mism_acc, mism_out);
+    if (mism_m == 0 && mism_s == 0 && mism_acc == 0 && mism_out == 0) {
+        fprintf(stderr, "   GQA split-K partial: m/s/acc/out byte-identical "
+                        "over 100 reruns\n");
+    }
+
+    free(first_m); free(first_s); free(first_acc); free(first_out);
+    free(q); free(k16); free(v16);
+    gb_free(&qb); gb16_free(&kb); gb16_free(&vb);
+    gb_free(&mb); gb_free(&sb); gb_free(&ab); gb_free(&ob);
+}
+
+/* The GQA entry point must reject everything the per-head one does: the two
+ * share splitk_partial_run, so this is a check that they are still wired to
+ * the SAME validation rather than a second implementation of it. */
+static void splitk_gqa_rejects_bad_arguments(void) {
+    const uint32_t n_heads = 4, n_kv = 2, hd = 8, seq = 16, ns = 3;
+    uint32_t good[8] = {n_heads, n_kv, hd, seq, hd, f32_bits(0.35f), ns, 0};
+    gbuf qb = gb_new((uint64_t)n_heads * hd);
+    gbuf16 kb = gb16_new((uint64_t)seq * n_kv * hd), vb = gb16_new((uint64_t)seq * n_kv * hd);
+    gbuf mb = gb_new((uint64_t)n_heads * ns), sb = gb_new((uint64_t)n_heads * ns);
+    gbuf ab = gb_new((uint64_t)n_heads * ns * hd), ob = gb_new((uint64_t)n_heads * hd);
+    sg_err e;
+
+    e = sg_gpu_run_attn_splitk_partial_gqa(g_gpu, NULL, kb.b, vb.b, mb.b, sb.b, ab.b, good);
+    tt_assert(sg_failed(e), "splitk gqa partial should reject a NULL q");
+
+    uint32_t zero_k[8]; memcpy(zero_k, good, sizeof good); zero_k[6] = 0;
+    e = sg_gpu_run_attn_splitk_partial_gqa(g_gpu, qb.b, kb.b, vb.b, mb.b, sb.b, ab.b, zero_k);
+    tt_assert(sg_failed(e), "splitk gqa partial should reject n_splits == 0");
+
+    /* The rule the GQA grid actually depends on: without it the group starting
+     * at hk*repeat would not tile the query heads. */
+    uint32_t bad_gqa[8]; memcpy(bad_gqa, good, sizeof good); bad_gqa[1] = 3;
+    e = sg_gpu_run_attn_splitk_partial_gqa(g_gpu, qb.b, kb.b, vb.b, mb.b, sb.b, ab.b, bad_gqa);
+    tt_assert(sg_failed(e), "splitk gqa partial should reject n_heads not a multiple of n_kv");
+
+    uint32_t bad_stride[8]; memcpy(bad_stride, good, sizeof good); bad_stride[4] = hd - 1;
+    e = sg_gpu_run_attn_splitk_partial_gqa(g_gpu, qb.b, kb.b, vb.b, mb.b, sb.b, ab.b, bad_stride);
+    tt_assert(sg_failed(e), "splitk gqa partial should reject q_stride < head_dim");
+
+    uint32_t big_k[8]; memcpy(big_k, good, sizeof good); big_k[6] = ns + 1;
+    e = sg_gpu_run_attn_splitk_partial_gqa(g_gpu, qb.b, kb.b, vb.b, mb.b, sb.b, ab.b, big_k);
+    tt_assert(sg_failed(e), "splitk gqa partial should reject buffers sized for fewer splits");
+
+    e = sg_gpu_run_attn_splitk_partial_gqa(g_gpu, qb.b, kb.b, vb.b, mb.b, mb.b, ab.b, good);
+    tt_assert(sg_failed(e), "splitk gqa partial should reject m and s being the same buffer");
+
+    e = sg_gpu_run_op(g_gpu, "k_attn_decode_splitk_partial_gqa", qb.b, kb.b, ob.b, good);
+    tt_assert(sg_failed(e), "sg_gpu_run_op should refuse k_attn_decode_splitk_partial_gqa");
+
+    gb_free(&qb); gb16_free(&kb); gb16_free(&vb);
+    gb_free(&mb); gb_free(&sb); gb_free(&ab); gb_free(&ob);
+}
+
+/* Task P2.5: sg_gpu_splitk_gqa_n_splits against the measured table the task
+ * brief gives verbatim (also reproduced in metal.m's splitk_gqa_n_splits and
+ * in docs/17082026_splitk_gqa_threadgroups.md). The formula is a pure
+ * function of seq, so the eight (shape, seq) points collapse to four
+ * distinct seq values, but all eight are asserted anyway to keep this test
+ * traceable to the brief's table line for line rather than to a
+ * hand-simplified version of it. No GPU dispatch here: this is metal.m's
+ * internal policy function, exercised directly. */
+static void splitk_gqa_n_splits_policy(void) {
+    struct { const char *shape; uint32_t seq, want; } cases[] = {
+        {"27B 24h/4kv/256d", 8192,   32},
+        {"27B 24h/4kv/256d", 32768,  128},
+        {"27B 24h/4kv/256d", 131072, 256},
+        {"27B 24h/4kv/256d", 262144, 256},
+        {"4B 32h/8kv/128d",  8192,   32},
+        {"4B 32h/8kv/128d",  32768,  128},
+        {"4B 32h/8kv/128d",  131072, 256},
+        {"4B 32h/8kv/128d",  262144, 256},
+    };
+    for (size_t i = 0; i < sizeof cases / sizeof cases[0]; i++) {
+        uint32_t got = sg_gpu_splitk_gqa_n_splits(cases[i].seq);
+        tt_assert(got == cases[i].want,
+                  "splitk_gqa_n_splits(%s, seq %u): got %u, want %u",
+                  cases[i].shape, cases[i].seq, got, cases[i].want);
+    }
+    /* The 256 cap must NOT bind at 8192/32768 (seq/SG_TG, 32 and 128, is
+     * already below it and IS the answer) and MUST bind at 131072/262144
+     * (seq/SG_TG would be 512 and 1024 there, which is where the per-head
+     * policy keeps climbing and overshoots the GQA optimum). This is exactly
+     * the property the rejected "half the per-head optimum" policy gets
+     * backwards (see the brief / metal.m for why it is the worst of the
+     * four candidates scored). */
+    tt_assert(sg_gpu_splitk_gqa_n_splits(8192) < 256, "cap must not bind at seq 8192");
+    tt_assert(sg_gpu_splitk_gqa_n_splits(32768) < 256, "cap must not bind at seq 32768");
+    tt_assert(sg_gpu_splitk_gqa_n_splits(131072) == 256, "cap must bind at seq 131072");
+    tt_assert(sg_gpu_splitk_gqa_n_splits(262144) == 256, "cap must bind at seq 262144");
+}
+
+static void metal_attn_splitk_gqa_bit_identical(void) {
+    /* EVERY ARM OF THE KERNEL'S switch(repeat) IS DISPATCHED HERE, which is the
+     * point of the shape list (fix round 1, review finding I2). The kernel has
+     * nine near-duplicate arms; a copy-paste that made `case 8u:` call
+     * splitk_partial_group<7> would leave head h0+7's triple unwritten and the
+     * combine would fold stale bytes into the logits, and only a dispatch at
+     * exactly repeat 8 can catch it. The static_assert in kernels.metal guards
+     * the CONSTANT, not the arms. 7 (28/4) and 8 (64/8) are common real ratios,
+     * so neither is hypothetical.
+     *
+     * The two real decode shapes come first, at both q_stride conventions:
+     *   repeat 4  (4B dense: 32 heads over 8 kv, head_dim 128)
+     *   repeat 6  (27B: 24 heads over 4 kv, head_dim 256), a non-power-of-two
+     *             group, which is the case a hardcoded shift would get wrong
+     * then one shape per remaining group size, tiny on purpose since what is
+     * under test is the arm, not the shape:
+     *   repeat 1  (no GQA at all: the group is one head, and the GQA grid is
+     *             then exactly the per-head grid)
+     *   repeat 2, 3, 5, 7 and 8 (8 is SG_SPLITK_GQA_MAX, the boundary)
+     *   repeat 16 (PAST the bound, so the kernel's one-head-at-a-time default
+     *             arm runs; it must STILL be byte-identical, which is what makes
+     *             that arm safe to keep as a fallback)
+     * Every row also gets its own > seq split count from splitk_gqa_shape, so the
+     * empty-split -INFINITY/0/0 encoding is exercised at every one of those group
+     * sizes rather than only at the one 200-token shape (finding I3). */
+    splitk_gqa_shape("32x8x128 seq200 dense r4", 32, 8, 128, 200, 128, 0x6C0A1u);
+    splitk_gqa_shape("32x8x128 seq1000 gated r4", 32, 8, 128, 1000, 256, 0x6C0A2u);
+    splitk_gqa_shape("24x4x256 seq1000 dense r6", 24, 4, 256, 1000, 256, 0x6C0A3u);
+    splitk_gqa_shape("24x4x256 seq1000 gated r6", 24, 4, 256, 1000, 512, 0x6C0A4u);
+    splitk_gqa_shape("8x8x64 seq300 r1", 8, 8, 64, 300, 64, 0x6C0A5u);
+    splitk_gqa_shape("4x2x32 seq300 r2", 4, 2, 32, 300, 32, 0x6C0A8u);
+    splitk_gqa_shape("6x2x64 seq300 r3", 6, 2, 64, 300, 128, 0x6C0A6u);
+    splitk_gqa_shape("10x2x32 seq300 gated r5", 10, 2, 32, 300, 64, 0x6C0A9u);
+    splitk_gqa_shape("14x2x32 seq300 r7", 14, 2, 32, 300, 32, 0x6C0AAu);
+    splitk_gqa_shape("16x2x32 seq300 r8", 16, 2, 32, 300, 32, 0x6C0ABu);
+    splitk_gqa_shape("16x1x64 seq300 r16", 16, 1, 64, 300, 64, 0x6C0A7u);
+    splitk_gqa_determinism();
+    splitk_gqa_rejects_bad_arguments();
+    splitk_gqa_n_splits_policy();
+}
+
+/* --------------------------------------------------------------------
+ * P2.8: k_attn_decode_splitk_partial_gqa_online (online softmax)
+ * --------------------------------------------------------------------
+ *
+ * WRITTEN WITH THE GPU HELD BY A 256K BENCHMARK and never executed when
+ * committed, exactly like the P2.2 and P2.4 blocks above.
+ *
+ * THE BAR IS NOT BYTE-IDENTITY AND MUST NOT BE. The online kernel replaces the
+ * four-pass kernel's device-memory score row with a running (m, s, acc) that is
+ * rescaled by exp(m_old - m_new) as each 256-key tile is folded in. That
+ * REORDERS the exponential sums, so s and acc differ from the four-pass kernels
+ * in the last bits whenever a split spans more than one tile. Gating on memcmp
+ * here would be gating on a property the design does not have; the correctness
+ * standard is the P2.2 one, agreement with sg_ref_attn_decode_splitk (and with
+ * sg_ref_attn_decode) to float rounding, plus determinism.
+ *
+ * THREE THINGS ARE STILL EXACT, and each is asserted below because each would
+ * hide a real bug if it drifted:
+ *
+ *   1. `m`. A maximum is order-independent, and the online kernel gives thread
+ *      lid the SAME subset of the split's keys the four-pass kernel does, so
+ *      every m must be bit-identical to the four-pass GQA kernel's. If it is
+ *      not, the streaming loop visited a different key set, which no tolerance
+ *      should absorb. (The one theoretical exception is a tie between +0.0 and
+ *      -0.0 scores, where the fold's `b > a` keeps whichever came first; a dot
+ *      product of hundreds of random f32s hitting exactly zero does not happen
+ *      in this fixture.)
+ *   2. The empty-split encoding, m = -INFINITY / s = 0 / acc = 0, checked
+ *      structurally by splitk_check_partials, which every shape below reaches
+ *      because its split list ends with a count greater than seq.
+ *   3. Determinism: repeated dispatches must be byte-identical to each other.
+ *
+ * The s/acc/out byte differences against the four-pass kernel are REPORTED
+ * rather than asserted, because the interesting number is how small they are,
+ * and because "zero differences" is a legitimate outcome for the shapes whose
+ * splits fit one tile (one key per lane, same trees, same order).
+ *
+ * P2.9 NARROWS THAT LAST SENTENCE, deliberately. With head_dim < SG_TG the kernel
+ * now splits the tile's keys across SG_TG/kw KEY GROUPS so that every thread owns
+ * an output dim in the V phase, and each group's exponential sum is folded
+ * separately and then merged by the split-K combine's own log-sum-exp weights. So
+ * a ONE-TILE split at head_dim 128 is no longer bit-identical to the four-pass
+ * kernel, while at head_dim 256 (n_kgroups 1, the path P2.8 measured winning) it
+ * still is. That change of ORDER is exactly what the reported diff lines below
+ * make visible, and it is why `m` (a maximum, order-independent) is the only thing
+ * still asserted exact. */
+static void online_report_diff(const char *label, const float *a, const float *b, size_t n) {
+    size_t ndiff = 0;
+    double worst = 0.0;
+    for (size_t i = 0; i < n; i++) {
+        if (memcmp(&a[i], &b[i], sizeof(float)) != 0) {
+            ndiff++;
+            double d = fabs((double)a[i] - (double)b[i]);
+            if (d > worst) worst = d;
+        }
+    }
+    fprintf(stderr, "   %-46s %llu/%llu floats differ, worst |delta| %.3e\n",
+            label, (unsigned long long)ndiff, (unsigned long long)n, worst);
+}
+
+/* One (shape, q_stride) sweep for the online partial: per n_splits, run it plus
+ * the shared combine, compare the result against BOTH CPU oracles, check the
+ * partial structure, and compare m bit for bit against the four-pass GQA kernel
+ * on the same inputs.
+ *
+ * THE SPLIT LIST is P2.4's, including the per-shape count above seq for the
+ * empty-split case. The low counts matter more here than they did there: with
+ * n_splits 1 a 1000-key sequence is FOUR tiles in one split, which is the only
+ * regime where the rescale factor is ever anything but an exact 1.0, and
+ * therefore the only regime this kernel's streaming update is really under test.
+ * With n_splits 7 the same sequence gives ~143 keys per split, one tile, where
+ * the online kernel should land on the four-pass kernel's exact bytes. */
+static void splitk_online_shape(const char *what, uint32_t n_heads, uint32_t n_kv,
+                                uint32_t hd, uint32_t seq, uint32_t q_stride,
+                                uint32_t seed) {
+    const uint32_t splits[] = {1, 2, 3, 7, 64, 257, seq + seq / 4 + 1};
+    uint32_t out_n = n_heads * hd;
+    uint64_t kvn = (uint64_t)seq * n_kv * hd;
+    float scale = (float)(1.0 / sqrt((double)hd));
+
+    lcg_seed(seed);
+    float *q = xmalloc((size_t)n_heads * q_stride * sizeof *q);
+    for (uint32_t h = 0; h < n_heads; h++) {
+        float *qh = q + (size_t)h * q_stride;
+        for (uint32_t i = 0; i < hd; i++) qh[i] = lcg_next();
+        /* Not query data. NaN-poisoned for P2.4's reason: the online kernel also
+         * reaches head h0+j through a j*q_stride stride rather than its own base
+         * pointer, so an off-by-one there turns every comparison into NaN. */
+        for (uint32_t i = hd; i < q_stride; i++) qh[i] = (float)NAN;
+    }
+
+    uint16_t *k16 = xmalloc((size_t)kvn * sizeof *k16);
+    uint16_t *v16 = xmalloc((size_t)kvn * sizeof *v16);
+    float *k32 = xmalloc((size_t)kvn * sizeof *k32);
+    float *v32 = xmalloc((size_t)kvn * sizeof *v32);
+    for (uint64_t i = 0; i < kvn; i++) {
+        k16[i] = sg_f32_to_f16(lcg_next() * 2.0f);
+        v16[i] = sg_f32_to_f16(lcg_next() * 2.0f);
+        k32[i] = sg_f16_to_f32(k16[i]);   /* the f16 rounding, widened back exactly */
+        v32[i] = sg_f16_to_f32(v16[i]);
+    }
+
+    float *want_direct = xmalloc(out_n * sizeof *want_direct);
+    sg_ref_attn_decode(q, k32, v32, n_heads, n_kv, hd, seq, q_stride, scale, want_direct);
+
+    gbuf qb = gb_from(q, (uint64_t)n_heads * q_stride);
+    gbuf16 kb = gb16_new(kvn), vb = gb16_new(kvn);
+    memcpy(kb.h, k16, (size_t)kvn * sizeof(uint16_t));
+    memcpy(vb.h, v16, (size_t)kvn * sizeof(uint16_t));
+
+    float *want_split = xmalloc(out_n * sizeof *want_split);
+    for (size_t si = 0; si < sizeof splits / sizeof splits[0]; si++) {
+        uint32_t ns = splits[si];
+        uint32_t p[8] = {n_heads, n_kv, hd, seq, q_stride, f32_bits(scale), ns, 0};
+        uint64_t parts = (uint64_t)n_heads * ns;
+        gbuf m1 = gb_new(parts), s1 = gb_new(parts), a1 = gb_new(parts * hd);
+        gbuf m2 = gb_new(parts), s2 = gb_new(parts), a2 = gb_new(parts * hd);
+        gbuf o1 = gb_new(out_n), o2 = gb_new(out_n);
+        gb_poison(&m1); gb_poison(&s1); gb_poison(&a1); gb_poison(&o1);
+        gb_poison(&m2); gb_poison(&s2); gb_poison(&a2); gb_poison(&o2);
+
+        /* THE ONLINE PARTIAL RUNS FIRST, P2.4's finding-M2 ordering for a
+         * stronger reason here: it is the kernel under test, and it must not be
+         * able to pass by reading anything the four-pass kernel left in the
+         * shared splitk_scratch. It does not bind that buffer at all, so running
+         * it first means the buffer may still hold the PREVIOUS iteration's
+         * bytes for a different shape when it runs. */
+        sg_err e = sg_gpu_run_attn_splitk_partial_gqa_online(g_gpu, qb.b, kb.b, vb.b,
+                                                            m2.b, s2.b, a2.b, p);
+        tt_assert(!sg_failed(e), "splitk online partial (%s, n_splits %u): %s",
+                  what, ns, e.msg ? e.msg : "ok");
+        if (!sg_failed(e)) {
+            e = sg_gpu_run_attn_splitk_combine(g_gpu, m2.b, s2.b, a2.b, o2.b, p);
+            tt_assert(!sg_failed(e), "splitk combine after online (%s, n_splits %u): %s",
+                      what, ns, e.msg ? e.msg : "ok");
+        }
+        if (!sg_failed(e)) {
+            e = sg_gpu_run_attn_splitk_partial_gqa(g_gpu, qb.b, kb.b, vb.b,
+                                                  m1.b, s1.b, a1.b, p);
+            tt_assert(!sg_failed(e), "splitk four-pass gqa partial (%s, n_splits %u): %s",
+                      what, ns, e.msg ? e.msg : "ok");
+        }
+        if (!sg_failed(e)) {
+            e = sg_gpu_run_attn_splitk_combine(g_gpu, m1.b, s1.b, a1.b, o1.b, p);
+            tt_assert(!sg_failed(e), "splitk combine after four-pass (%s, n_splits %u): %s",
+                      what, ns, e.msg ? e.msg : "ok");
+        }
+        if (!sg_failed(e)) {
+            char lbl[128];
+
+            /* Nothing below can be read out of a buffer the dispatch never
+             * wrote (P2.4 finding M1). m and s are strict: m is finite or
+             * -INFINITY and s is 0.0 or >= 1.0, neither of which can coincide
+             * with the poison word. */
+            snprintf(lbl, sizeof lbl, "online %s K=%-3u m", what, ns);
+            gqa_not_poison(lbl, m2.h, (size_t)parts, true);
+            snprintf(lbl, sizeof lbl, "online %s K=%-3u s", what, ns);
+            gqa_not_poison(lbl, s2.h, (size_t)parts, true);
+            snprintf(lbl, sizeof lbl, "online %s K=%-3u acc", what, ns);
+            gqa_not_poison(lbl, a2.h, (size_t)(parts * hd), false);
+            snprintf(lbl, sizeof lbl, "online %s K=%-3u out", what, ns);
+            gqa_not_poison(lbl, o2.h, (size_t)out_n, false);
+
+            /* The empty-split encoding and the s >= 1.0 invariant, structurally. */
+            snprintf(lbl, sizeof lbl, "online partials (%s, K=%u)", what, ns);
+            splitk_check_partials(lbl, m2.h, s2.h, a2.h, n_heads, hd, seq, ns);
+
+            /* m is exact (see the block comment). This is the assertion that
+             * proves the streaming loop covered the same keys. */
+            snprintf(lbl, sizeof lbl, "online %s K=%-3u m vs four-pass", what, ns);
+            gqa_same_bytes(lbl, m1.h, m2.h, (size_t)parts);
+
+            /* The primary correctness gate: the CPU oracles. */
+            sg_ref_attn_decode_splitk(q, k32, v32, n_heads, n_kv, hd, seq,
+                                      q_stride, scale, ns, want_split);
+            snprintf(lbl, sizeof lbl, "online %s K=%-3u vs ref_splitk", what, ns);
+            check_rel(lbl, o2.h, want_split, out_n);
+            snprintf(lbl, sizeof lbl, "online %s K=%-3u vs ref_decode", what, ns);
+            check_rel(lbl, o2.h, want_direct, out_n);
+
+            /* Reported, not asserted: how far the reordered sums actually moved.
+             * Only for the first two split counts, which is where a split spans
+             * several tiles and the rescale is live; printing all seven per
+             * shape would bury the accuracy lines above. */
+            if (si < 2) {
+                snprintf(lbl, sizeof lbl, "online %s K=%-3u s vs four-pass", what, ns);
+                online_report_diff(lbl, s1.h, s2.h, (size_t)parts);
+                snprintf(lbl, sizeof lbl, "online %s K=%-3u out vs four-pass", what, ns);
+                online_report_diff(lbl, o1.h, o2.h, (size_t)out_n);
+            }
+        }
+
+        gb_free(&m1); gb_free(&s1); gb_free(&a1); gb_free(&o1);
+        gb_free(&m2); gb_free(&s2); gb_free(&a2); gb_free(&o2);
+    }
+
+    gb_free(&qb); gb16_free(&kb); gb16_free(&vb);
+    free(q); free(k16); free(v16); free(k32); free(v32);
+    free(want_direct); free(want_split);
+}
+
+/* 100 reruns of the online partial + combine on identical inputs must be
+ * byte-identical to each other. This is the gate that matters most for this
+ * kernel: the four-pass kernels could lean on a memcmp against each other,
+ * while everything the online form changes (a running accumulator, a rescale
+ * every thread recomputes, a transpose through threadgroup memory) is exactly
+ * the kind of change that reaches for an atomic or a simd_sum. The shape is
+ * P2.4's, and n_splits 7 over seq 1000 also gives a split that is one tile plus
+ * a remainder. */
+static void splitk_online_determinism(void) {
+    const uint32_t n_heads = 32, n_kv = 8, hd = 128, seq = 1000, q_stride = 2 * hd;
+    const uint32_t ns = 7;
+    uint32_t out_n = n_heads * hd;
+    uint64_t kvn = (uint64_t)seq * n_kv * hd;
+    float scale = (float)(1.0 / sqrt((double)hd));
+
+    lcg_seed(0x7B2Eu);
+    float *q = xmalloc((size_t)n_heads * q_stride * sizeof *q);
+    for (uint32_t i = 0; i < n_heads * q_stride; i++) q[i] = lcg_next();
+    uint16_t *k16 = xmalloc((size_t)kvn * sizeof *k16);
+    uint16_t *v16 = xmalloc((size_t)kvn * sizeof *v16);
+    for (uint64_t i = 0; i < kvn; i++) {
+        k16[i] = sg_f32_to_f16(lcg_next() * 2.0f);
+        v16[i] = sg_f32_to_f16(lcg_next() * 2.0f);
+    }
+
+    gbuf qb = gb_from(q, (uint64_t)n_heads * q_stride);
+    gbuf16 kb = gb16_new(kvn), vb = gb16_new(kvn);
+    memcpy(kb.h, k16, (size_t)kvn * sizeof(uint16_t));
+    memcpy(vb.h, v16, (size_t)kvn * sizeof(uint16_t));
+    gbuf mb = gb_new((uint64_t)n_heads * ns);
+    gbuf sb = gb_new((uint64_t)n_heads * ns);
+    gbuf ab = gb_new((uint64_t)n_heads * ns * hd);
+    gbuf ob = gb_new(out_n);
+    uint32_t p[8] = {n_heads, n_kv, hd, seq, q_stride, f32_bits(scale), ns, 0};
+
+    size_t ms_bytes = (size_t)n_heads * ns * sizeof(float);
+    size_t acc_bytes = (size_t)n_heads * ns * hd * sizeof(float);
+    size_t out_bytes = (size_t)out_n * sizeof(float);
+    uint8_t *first_m = xmalloc(ms_bytes), *first_s = xmalloc(ms_bytes);
+    uint8_t *first_acc = xmalloc(acc_bytes), *first_out = xmalloc(out_bytes);
+    uint32_t mism_m = 0, mism_s = 0, mism_acc = 0, mism_out = 0;
+
+    for (int rep = 0; rep < 100; rep++) {
+        gb_poison(&mb); gb_poison(&sb); gb_poison(&ab); gb_poison(&ob);
+        sg_err e = sg_gpu_run_attn_splitk_partial_gqa_online(g_gpu, qb.b, kb.b, vb.b,
+                                                            mb.b, sb.b, ab.b, p);
+        if (!sg_failed(e)) e = sg_gpu_run_attn_splitk_combine(g_gpu, mb.b, sb.b, ab.b, ob.b, p);
+        tt_assert(!sg_failed(e), "splitk online determinism rep %d: %s", rep,
+                  e.msg ? e.msg : "ok");
+        if (sg_failed(e)) break;
+        if (rep == 0) {
+            memcpy(first_m, mb.h, ms_bytes);
+            memcpy(first_s, sb.h, ms_bytes);
+            memcpy(first_acc, ab.h, acc_bytes);
+            memcpy(first_out, ob.h, out_bytes);
+        } else {
+            if (memcmp(first_m, mb.h, ms_bytes) != 0) mism_m++;
+            if (memcmp(first_s, sb.h, ms_bytes) != 0) mism_s++;
+            if (memcmp(first_acc, ab.h, acc_bytes) != 0) mism_acc++;
+            if (memcmp(first_out, ob.h, out_bytes) != 0) mism_out++;
+        }
+    }
+    tt_assert(mism_m == 0 && mism_s == 0 && mism_acc == 0 && mism_out == 0,
+              "online split-K partial over 99 reruns: m differed on %u, s on %u, "
+              "acc on %u, out on %u", mism_m, mism_s, mism_acc, mism_out);
+    if (mism_m == 0 && mism_s == 0 && mism_acc == 0 && mism_out == 0) {
+        fprintf(stderr, "   online split-K partial: m/s/acc/out byte-identical "
+                        "over 100 reruns\n");
+    }
+
+    free(first_m); free(first_s); free(first_acc); free(first_out);
+    free(q); free(k16); free(v16);
+    gb_free(&qb); gb16_free(&kb); gb16_free(&vb);
+    gb_free(&mb); gb_free(&sb); gb_free(&ab); gb_free(&ob);
+}
+
+/* The online entry point must reject everything the other two do: all three
+ * share splitk_partial_run, so this checks they are still wired to the SAME
+ * validation rather than to a second copy of it. */
+static void splitk_online_rejects_bad_arguments(void) {
+    const uint32_t n_heads = 4, n_kv = 2, hd = 8, seq = 16, ns = 3;
+    uint32_t good[8] = {n_heads, n_kv, hd, seq, hd, f32_bits(0.35f), ns, 0};
+    gbuf qb = gb_new((uint64_t)n_heads * hd);
+    gbuf16 kb = gb16_new((uint64_t)seq * n_kv * hd), vb = gb16_new((uint64_t)seq * n_kv * hd);
+    gbuf mb = gb_new((uint64_t)n_heads * ns), sb = gb_new((uint64_t)n_heads * ns);
+    gbuf ab = gb_new((uint64_t)n_heads * ns * hd), ob = gb_new((uint64_t)n_heads * hd);
+    sg_err e;
+
+    e = sg_gpu_run_attn_splitk_partial_gqa_online(g_gpu, NULL, kb.b, vb.b, mb.b, sb.b,
+                                                 ab.b, good);
+    tt_assert(sg_failed(e), "splitk online partial should reject a NULL q");
+
+    uint32_t zero_k[8]; memcpy(zero_k, good, sizeof good); zero_k[6] = 0;
+    e = sg_gpu_run_attn_splitk_partial_gqa_online(g_gpu, qb.b, kb.b, vb.b, mb.b, sb.b,
+                                                 ab.b, zero_k);
+    tt_assert(sg_failed(e), "splitk online partial should reject n_splits == 0");
+
+    uint32_t bad_gqa[8]; memcpy(bad_gqa, good, sizeof good); bad_gqa[1] = 3;
+    e = sg_gpu_run_attn_splitk_partial_gqa_online(g_gpu, qb.b, kb.b, vb.b, mb.b, sb.b,
+                                                 ab.b, bad_gqa);
+    tt_assert(sg_failed(e),
+              "splitk online partial should reject n_heads not a multiple of n_kv");
+
+    uint32_t bad_stride[8]; memcpy(bad_stride, good, sizeof good); bad_stride[4] = hd - 1;
+    e = sg_gpu_run_attn_splitk_partial_gqa_online(g_gpu, qb.b, kb.b, vb.b, mb.b, sb.b,
+                                                 ab.b, bad_stride);
+    tt_assert(sg_failed(e), "splitk online partial should reject q_stride < head_dim");
+
+    uint32_t big_k[8]; memcpy(big_k, good, sizeof good); big_k[6] = ns + 1;
+    e = sg_gpu_run_attn_splitk_partial_gqa_online(g_gpu, qb.b, kb.b, vb.b, mb.b, sb.b,
+                                                 ab.b, big_k);
+    tt_assert(sg_failed(e),
+              "splitk online partial should reject buffers sized for fewer splits");
+
+    e = sg_gpu_run_attn_splitk_partial_gqa_online(g_gpu, qb.b, kb.b, vb.b, mb.b, mb.b,
+                                                 ab.b, good);
+    tt_assert(sg_failed(e), "splitk online partial should reject m and s being one buffer");
+
+    e = sg_gpu_run_op(g_gpu, "k_attn_decode_splitk_partial_gqa_online", qb.b, kb.b,
+                      ob.b, good);
+    tt_assert(sg_failed(e),
+              "sg_gpu_run_op should refuse k_attn_decode_splitk_partial_gqa_online");
+
+    gb_free(&qb); gb16_free(&kb); gb16_free(&vb);
+    gb_free(&mb); gb_free(&sb); gb_free(&ab); gb_free(&ob);
+}
+
+/* The DEFAULT, asserted rather than assumed: with no state created on this gpu
+ * (so SURGE_ATTN_SPLITK_ONLINE was never read and attn_splitk_online is false),
+ * the decode path must never select the online kernel, for any shape, including
+ * the two real ones at a depth where every other condition is satisfied. This is
+ * the "off by default" claim as a check instead of a comment; the switched-on
+ * behaviour needs a loaded model and lives in tests/test_gpu_fwd.c. */
+static void splitk_online_off_by_default(void) {
+    struct { const char *shape; uint32_t n_heads, n_kv, hd, seq; } cases[] = {
+        { "27B 24h/4kv/256d @262144", 24, 4, 256, 262144 },
+        { "4B  32h/8kv/128d @262144", 32, 8, 128, 262144 },
+        { "27B 24h/4kv/256d @16384",  24, 4, 256, 16384  },
+    };
+    for (size_t i = 0; i < sizeof cases / sizeof cases[0]; i++) {
+        bool sel = sg_gpu_splitk_online_selected(g_gpu, cases[i].n_heads, cases[i].n_kv,
+                                                 cases[i].hd, cases[i].seq);
+        tt_assert(!sel, "online split-K must be OFF by default, but %s reported selected",
+                  cases[i].shape);
+    }
+    tt_assert(sg_gpu_splitk_online_selected(NULL, 24, 4, 256, 262144) == false,
+              "sg_gpu_splitk_online_selected(NULL, ...) must answer false");
+    tt_assert(sg_gpu_splitk_online_dispatches(g_gpu) == 0,
+              "no decode step ran on this gpu, so the online dispatch count must be 0");
+    tt_assert(sg_gpu_splitk_online_dispatches(NULL) == 0,
+              "sg_gpu_splitk_online_dispatches(NULL) must answer 0");
+}
+
+static void metal_attn_splitk_online_matches_ref(void) {
+    /* Shape coverage, and what each row is here to reach:
+     *   the two REAL decode shapes at both q_stride conventions (repeat 4 with
+     *     head_dim 128, repeat 6 with head_dim 256 == SG_TG, the widest head_dim
+     *     that keeps the running accumulator in one register per head);
+     *   repeat 1 through 8, one shape each, so every arm of the kernel's
+     *     switch(repeat) is dispatched (P2.4's finding I2 applies verbatim: the
+     *     arms are near-duplicates and only a dispatch at that exact group size
+     *     can catch a copy-paste in one of them);
+     *   repeat 16, PAST SG_SPLITK_GQA_MAX, so the one-head-at-a-time default arm
+     *     runs and must still be correct;
+     *   head_dim 320 > SG_TG, the ONE regime where the dbase loop runs twice and
+     *     the kernel re-streams the split per band of output dims. The policy
+     *     declines that shape for the decode path, but the kernel must still
+     *     answer correctly, and the second band is deliberately PARTIAL (320 =
+     *     256 + 64), so only 64 of 256 threads own an output dim in it.
+     * seq 1000 with n_splits 1 gives four tiles in one split, which is where the
+     * rescale is live; every row also gets a split count above its seq, so the
+     * empty-split encoding is exercised at every group size.
+     *
+     * P2.9 ADDS THE KEY-GROUP COVERAGE. n_kgroups = SG_TG / kw with kw the
+     * smallest power of two >= head_dim (floor SG_SPLITK_ONLINE_KW_MIN 32), so the
+     * rows above already reach n_kgroups 1 (head_dim 256 and 320), 2 (128), 4 (64)
+     * and 8 (32), and every one of them at a seq/n_splits pair where the LAST
+     * group's slice of a tile is partial (seq 200 or 300 with n_splits 1) and
+     * where later groups are EMPTY for the whole split (n_splits 2 and up, where
+     * a split is shorter than one tile). What they do NOT reach is a head_dim that
+     * is not a power of two, where kw > head_dim and some lanes of EVERY group own
+     * no dim, and a head_dim below the 32 floor. Three rows for that:
+     *   head_dim 96  -> kw 128, 2 groups, 32 of each group's 128 lanes idle;
+     *   head_dim 40  -> kw 64,  4 groups, 24 of each group's 64 lanes idle;
+     *   head_dim 16  -> kw 32 (the floor), 8 groups, half of each group idle. */
+    splitk_online_shape("32x8x128 seq200 dense r4", 32, 8, 128, 200, 128, 0x7C0A1u);
+    splitk_online_shape("32x8x128 seq1000 gated r4", 32, 8, 128, 1000, 256, 0x7C0A2u);
+    splitk_online_shape("24x4x256 seq1000 dense r6", 24, 4, 256, 1000, 256, 0x7C0A3u);
+    splitk_online_shape("24x4x256 seq1000 gated r6", 24, 4, 256, 1000, 512, 0x7C0A4u);
+    splitk_online_shape("8x8x64 seq300 r1", 8, 8, 64, 300, 64, 0x7C0A5u);
+    splitk_online_shape("4x2x32 seq300 r2", 4, 2, 32, 300, 32, 0x7C0A6u);
+    splitk_online_shape("6x2x64 seq300 r3", 6, 2, 64, 300, 128, 0x7C0A7u);
+    splitk_online_shape("10x2x32 seq300 gated r5", 10, 2, 32, 300, 64, 0x7C0A8u);
+    splitk_online_shape("14x2x32 seq300 r7", 14, 2, 32, 300, 32, 0x7C0A9u);
+    splitk_online_shape("16x2x32 seq300 r8", 16, 2, 32, 300, 32, 0x7C0AAu);
+    splitk_online_shape("16x1x64 seq300 r16", 16, 1, 64, 300, 64, 0x7C0ABu);
+    splitk_online_shape("8x2x320 seq600 r4 hd>SG_TG", 8, 2, 320, 600, 320, 0x7C0ACu);
+    splitk_online_shape("8x2x96 seq300 r4 kw>hd", 8, 2, 96, 300, 96, 0x7C0ADu);
+    splitk_online_shape("6x2x40 seq300 r3 kw>hd", 6, 2, 40, 300, 80, 0x7C0AEu);
+    splitk_online_shape("4x2x16 seq300 r2 kw floor", 4, 2, 16, 300, 16, 0x7C0AFu);
+    splitk_online_determinism();
+    splitk_online_rejects_bad_arguments();
+    splitk_online_off_by_default();
+}
+
+static void metal_attn_splitk_matches_ref(void) {
+    /* The real decode shape this exists for: Qwen3-4B-Instruct-2507's
+     * 32 query heads over 8 kv heads, head_dim 128 (repeat 4). Two sequence
+     * lengths on purpose: seq 200 puts n_splits 257 ABOVE seq, so the tail
+     * splits are genuinely empty and exercise the -inf/0/0 encoding; seq 1000
+     * keeps every split populated and pushes the low n_splits cases past 256
+     * keys per threadgroup, where the score loop strides. Both q_stride
+     * variants at both lengths: head_dim (dense qwen3, no gate) and
+     * 2*head_dim (the hybrid's interleaved attention gate, NaN-poisoned). */
+    splitk_shape("32x8x128 seq200 dense", 32, 8, 128, 200, 128, 0x51A7Cu);
+    splitk_shape("32x8x128 seq200 gated", 32, 8, 128, 200, 256, 0x51A7Du);
+    splitk_shape("32x8x128 seq1000 dense", 32, 8, 128, 1000, 128, 0x51A7Eu);
+    splitk_shape("32x8x128 seq1000 gated", 32, 8, 128, 1000, 256, 0x51A7Fu);
+    splitk_determinism();
+    splitk_rejects_bad_arguments();
+}
+
 /* -------------------------------------------------------------------- */
 
 int main(void) {
@@ -1132,12 +3647,30 @@ int main(void) {
     tt_run("metal_rmsnorm_matches_ref", metal_rmsnorm_matches_ref);
     tt_run("metal_rope_matches_ref", metal_rope_matches_ref);
     tt_run("metal_matvec_matches_ref", metal_matvec_matches_ref);
+    tt_run("metal_matvec_q8_matches_ref", metal_matvec_q8_matches_ref);
+    tt_run("metal_matmul_matches_host_f64", metal_matmul_matches_host_f64);
+    tt_run("metal_matmul_row_consistency", metal_matmul_row_consistency);
+    tt_run("metal_matmul_q8_matches_ref_looped", metal_matmul_q8_matches_ref_looped);
+    tt_run("metal_matmul_deterministic", metal_matmul_deterministic);
+    tt_run("metal_matmul_rejects_bad_params", metal_matmul_rejects_bad_params);
     tt_run("metal_softmax_matches_ref", metal_softmax_matches_ref);
     tt_run("metal_elementwise_match_ref", metal_elementwise_match_ref);
     tt_run("metal_conv1d_step_matches_ref", metal_conv1d_step_matches_ref);
     tt_run("metal_delta_step_matches_ref", metal_delta_step_matches_ref);
     tt_run("metal_rmsnorm_gated_matches_ref", metal_rmsnorm_gated_matches_ref);
     tt_run("metal_attn_decode_matches_ref", metal_attn_decode_matches_ref);
+    tt_run("metal_kv_store_f16_roundtrips", metal_kv_store_f16_roundtrips);
+    tt_run("metal_attn_decode_f16_matches_f32", metal_attn_decode_f16_matches_f32);
+    tt_run("metal_rope_chunk_matches_rope_heads", metal_rope_chunk_matches_rope_heads);
+    tt_run("metal_attn_prefill_matches_decode", metal_attn_prefill_matches_decode);
+    tt_run("metal_attn_splitk_matches_ref", metal_attn_splitk_matches_ref);
+    tt_run("metal_attn_splitk_gqa_bit_identical", metal_attn_splitk_gqa_bit_identical);
+    tt_run("metal_attn_splitk_online_matches_ref", metal_attn_splitk_online_matches_ref);
+    tt_run("metal_conv1d_chunk_matches_step", metal_conv1d_chunk_matches_step);
+    tt_run("metal_delta_gates_chunk_matches", metal_delta_gates_chunk_matches);
+    tt_run("metal_delta_chunk_matches_multi", metal_delta_chunk_matches_multi);
+    tt_run("metal_rmsnorm_gated_chunk_matches", metal_rmsnorm_gated_chunk_matches);
+    tt_run("metal_chunk_rejects_bad_arguments", metal_chunk_rejects_bad_arguments);
     tt_run("metal_wrap_handles_page_offset", metal_wrap_handles_page_offset);
     tt_run("metal_reductions_are_deterministic", metal_reductions_are_deterministic);
     tt_run("metal_rejects_bad_arguments", metal_rejects_bad_arguments);

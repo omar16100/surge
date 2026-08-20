@@ -233,6 +233,328 @@ void sg_ref_softmax(float *x, uint32_t n) {
 }
 
 /* ---------------------------------------------------------------------
+ * Split-K attention combine (Task P2.0)
+ * --------------------------------------------------------------------- */
+
+/* The per-partition rescale weight exp(mi - M), with ONE guard: when mi and M
+ * are the identical value (a tie for the max, checked by == not by
+ * subtracting), the weight is exactly 1.0 by definition, computed without
+ * subtracting at all. This is a no-op for an ordinary finite tie (ordinary
+ * IEEE-754 subtraction already gives exp(0.0) == 1.0 exactly there), but it
+ * is load-bearing for M == +INFINITY: mi == M == +INFINITY makes mi - M the
+ * indeterminate form INF - INF (NaN), even though the two values are
+ * genuinely equal and the weight they represent is unambiguously 1.0. Every
+ * other combination mi can take relative to a finite-or-+INFINITY M (mi <
+ * M, or mi == -INFINITY, i.e. an empty partition) already evaluates
+ * correctly through the subtraction (mi - M is -INFINITY, and
+ * exp(-INFINITY) == 0.0, no special case needed), including
+ * -INFINITY - (+INFINITY), which IEEE-754 defines as -INFINITY, not NaN
+ * (the indeterminate forms are only same-signed-infinity minus itself). A
+ * NaN mi (not caught here, since NaN == anything is always false) still
+ * correctly falls through to exp(NaN - M) == NaN, which is exactly the
+ * signal sg_ref_attn_combine below propagates rather than launders. */
+static double attn_combine_weight(double mi, double M) {
+    if (mi == M) return 1.0;
+    return exp(mi - M);
+}
+
+/* m/s/acc partial results into out. See surge.h for the full contract
+ * (the math, the determinism rule, and every documented degenerate-input
+ * case: n_parts == 0, all-empty, NaN, +/-INFINITY, and the NULL/contract-
+ * violation convention). */
+void sg_ref_attn_combine(const float *m, const float *s, const float *acc,
+                         uint32_t n_parts, uint32_t head_dim, float *out) {
+    if (!out || head_dim == 0) return;
+    /* NULL m/s/acc with n_parts > 0 is a caller contract violation, not the
+     * documented all-empty case: leave out untouched, matching the matvec
+     * functions' NULL convention above. */
+    if (n_parts > 0 && (!m || !s || !acc)) return;
+
+    /* n_parts == 0: no partitions at all. m/s/acc are never indexed below,
+     * so they may legitimately be NULL for this call. Same "attention over
+     * zero keys" convention as the all-empty branch further down: write a
+     * defined zero rather than leaving out whatever the caller's buffer
+     * previously held. */
+    if (n_parts == 0) {
+        for (uint32_t d = 0; d < head_dim; d++) out[d] = 0.0f;
+        return;
+    }
+
+    /* Pass 1: M = max_i m[i]. Strictly increasing i (determinism rule, see
+     * surge.h / src/kernels.metal:7-27) -- not that max-of-a-sequence can
+     * differ by iteration order anyway, but every pass here follows the same
+     * fixed order on principle, since a future Metal port copies this shape
+     * verbatim. A NaN m[i] at i > 0 is never picked up here (NaN > M is
+     * always false), matching sg_ref_softmax's own max-scan above; that is
+     * handled below by the isnan(S) check instead, not here. */
+    double M = (double)m[0];
+    for (uint32_t i = 1; i < n_parts; i++) {
+        if ((double)m[i] > M) M = (double)m[i];
+    }
+
+    /* m[0] itself NaN (the only way M can end up NaN, by the same reasoning
+     * sg_ref_softmax's isnan(m) check above relies on): mirror softmax's
+     * choice exactly -- "there is no defensible distribution to invent, so
+     * propagate rather than manufacture one." Every output dimension gets
+     * the same NaN value M carries, not a silently-manufactured 0.0. */
+    if (isnan(M)) {
+        for (uint32_t d = 0; d < head_dim; d++) out[d] = (float)M;
+        return;
+    }
+
+    /* All partitions empty (every m[i] == -INFINITY): M is -INFINITY here,
+     * and M - M below would be -INFINITY - -INFINITY = NaN. Caught up front
+     * and defined instead: out[d] = 0.0 for every d, the same documented
+     * convention as n_parts == 0 above. */
+    if (M == -INFINITY) {
+        for (uint32_t d = 0; d < head_dim; d++) out[d] = 0.0f;
+        return;
+    }
+
+    /* M == +INFINITY (at least one partition reports +INFINITY as its own
+     * max) needs no branch of its own: attn_combine_weight gives every
+     * partition tied at that +INFINITY weight exactly 1.0 and every other
+     * partition weight exactly 0.0 (see its comment), which is precisely
+     * "the partition(s) achieving the max dominate completely" -- the same
+     * log-sum-exp limit sg_ref_softmax's own m == +INFINITY branch computes
+     * by counting hits, just expressed through the general formula instead
+     * of a separate hit-count loop. A single +INFINITY partition reduces
+     * exactly to that partition alone (out[d] = acc_k[d]/s_k, an implicit
+     * K == 1); several tied +INFINITY partitions combine among only
+     * themselves via their own (s_i, acc_i), exactly as if the others did
+     * not exist.
+     *
+     * Pass 2: S = sum_i s[i] * attn_combine_weight(m[i], M), strictly
+     * increasing i. An empty partition has m[i] == -INFINITY here (M is
+     * finite or +INFINITY because of the checks above), so its weight is
+     * 0.0 and its s[i] (0.0 by contract) times that is 0.0, no special case
+     * needed. */
+    double S = 0.0;
+    for (uint32_t i = 0; i < n_parts; i++) {
+        S += (double)s[i] * attn_combine_weight((double)m[i], M);
+    }
+
+    /* A NaN m[i] at i > 0 was not caught by isnan(M) above (see pass 1's
+     * comment); it poisons this sum instead, exactly like sg_ref_softmax's
+     * own sum gets poisoned by a stray NaN score. Catch it HERE rather than
+     * only guarding the final division: S > 0.0 is false for a NaN S (every
+     * comparison with NaN is false), so without this check the division
+     * guard below would silently turn that NaN into a manufactured 0.0 --
+     * the exact failure mode sg_ref_softmax's own header comment calls out
+     * as "the worst possible answer." Propagate instead. */
+    if (isnan(S)) {
+        for (uint32_t d = 0; d < head_dim; d++) out[d] = (float)S;
+        return;
+    }
+
+    /* Pass 3: out[d] = ( sum_i acc[i][d] * attn_combine_weight(m[i], M) ) /
+     * S, strictly increasing i for every d. attn_combine_weight(m[i], M)
+     * does not depend on d and is recomputed here rather than cached in a
+     * scratch array: this file's policy is accuracy and obvious correctness
+     * over speed (the Metal kernel, a later task, is where performance is
+     * actually earned), and recomputing a pure function of already-fixed
+     * inputs changes no bit of the result.
+     *
+     * S > 0.0 whenever this line is reached under the documented input
+     * contract: the partition achieving M is non-empty (M came from a real
+     * m[i]), and a non-empty partition's s[i] sums at least one
+     * exp(score - m[i]) term that equals exactly 1.0 for the key achieving
+     * that partition's own max, so s[i] >= 1.0 and S >= 1.0 * exp(0) = 1.0.
+     * The guard is defensive only, for a caller that violates that contract
+     * (e.g. a "non-empty" m[i] paired with s[i] == 0); S == NaN is ruled out
+     * above, so this comparison is never silently swallowing one. */
+    for (uint32_t d = 0; d < head_dim; d++) {
+        double num = 0.0;
+        for (uint32_t i = 0; i < n_parts; i++) {
+            num += (double)acc[(size_t)i * head_dim + d] * attn_combine_weight((double)m[i], M);
+        }
+        out[d] = (S > 0.0) ? (float)(num / S) : 0.0f;
+    }
+}
+
+/* ---------------------------------------------------------------------
+ * Decode attention: direct + split-K CPU oracle (Task P2.1)
+ * --------------------------------------------------------------------- */
+
+/* One (head, key-range) partial-attention triple: m/s/acc exactly as
+ * sg_ref_attn_combine's contract defines them (see surge.h). Computed over
+ * [t0, t1) of one kv head. Empty range (t0 >= t1) writes the documented
+ * m=-INFINITY/s=0/acc=0 encoding.
+ *
+ * Two passes over the range (max, then sum-exp/weighted-V), EACH recomputing
+ * the q.k dot product rather than caching a scores[seq] array -- this file's
+ * established "recomputing a pure function of already-fixed inputs changes
+ * no bit of the result" policy (see attn_combine_weight's comment above),
+ * which keeps this helper allocation-free regardless of seq. The two passes
+ * compute bit-for-bit the same per-key score, since both run the identical
+ * dot-product -> scale -> round-to-float sequence on the same qh/kt.
+ *
+ * qh already points at this head's own q_stride-sized row; only
+ * qh[0 .. head_dim) is ever read here, so a q_stride > head_dim gate half
+ * (Task P1) is never touched. dacc[head_dim] is caller-owned double scratch,
+ * overwritten on every call (not read beforehand). */
+/* Overflow-checked size_t multiply/add, mirroring src/metal.m's mul_ck/
+ * add_ck (same problem, different translation unit and a different integer
+ * domain: metal.m guards GPU buffer byte counts in uint64_t, this guards a
+ * host malloc() size in size_t, the type malloc actually takes). A wrapped
+ * byte count would be SMALL, so an undersized allocation would sail through
+ * and the write loops that follow would index with the original, unwrapped
+ * n_parts/head_dim -- worse than no check at all. An overflow is therefore
+ * treated as an allocation failure (returns false) rather than a silently
+ * wrapped number (review finding, P2.1 fix round 1). */
+static bool ref_mul_ck(size_t a, size_t b, size_t *out) {
+    if (a != 0 && b > SIZE_MAX / a) return false;
+    *out = a * b;
+    return true;
+}
+static bool ref_add_ck(size_t a, size_t b, size_t *out) {
+    if (a > SIZE_MAX - b) return false;
+    *out = a + b;
+    return true;
+}
+
+static void attn_partial(const float *qh, const float *kc, const float *vc,
+                         uint32_t n_kv_heads, uint32_t hk, uint32_t head_dim,
+                         double scale, uint32_t t0, uint32_t t1, double *dacc,
+                         float *m_out, float *s_out, float *acc_out) {
+    if (t0 >= t1) {
+        *m_out = -INFINITY;
+        *s_out = 0.0f;
+        for (uint32_t d = 0; d < head_dim; d++) acc_out[d] = 0.0f;
+        return;
+    }
+
+    /* Pass 1: m = max score, strictly increasing t. */
+    float m = -INFINITY;
+    for (uint32_t t = t0; t < t1; t++) {
+        const float *kt = kc + ((size_t)t * n_kv_heads + hk) * head_dim;
+        double dot = 0.0;
+        for (uint32_t i = 0; i < head_dim; i++) dot += (double)qh[i] * (double)kt[i];
+        float score = (float)(dot * scale);
+        if (score > m) m = score;
+    }
+
+    /* Pass 2: s = sum exp(score-m); acc[d] = sum exp(score-m)*v[d], strictly
+     * increasing t. */
+    for (uint32_t d = 0; d < head_dim; d++) dacc[d] = 0.0;
+    double s = 0.0;
+    for (uint32_t t = t0; t < t1; t++) {
+        const float *kt = kc + ((size_t)t * n_kv_heads + hk) * head_dim;
+        const float *vt = vc + ((size_t)t * n_kv_heads + hk) * head_dim;
+        double dot = 0.0;
+        for (uint32_t i = 0; i < head_dim; i++) dot += (double)qh[i] * (double)kt[i];
+        float score = (float)(dot * scale);
+        double e = exp((double)score - (double)m);
+        s += e;
+        for (uint32_t d = 0; d < head_dim; d++) dacc[d] += e * (double)vt[d];
+    }
+
+    *m_out = m;
+    *s_out = (float)s;
+    for (uint32_t d = 0; d < head_dim; d++) acc_out[d] = (float)dacc[d];
+}
+
+/* Shared core of sg_ref_attn_decode and sg_ref_attn_decode_splitk below (see
+ * their surge.h contracts for the full documented behavior, including every
+ * degenerate-input convention). Partitions [0, seq) into n_parts contiguous
+ * ranges by the fixed rule t0=i*seq/n_parts, t1=(i+1)*seq/n_parts (i in
+ * [0,n_parts), 64-bit intermediate to avoid overflow), iterates head then
+ * partition in strictly increasing index order (determinism rule,
+ * src/kernels.metal:7-27), and combines each head's n_parts triples with ONE
+ * call to sg_ref_attn_combine. n_parts == 1 makes the single partition
+ * exactly [0, seq), which is why sg_ref_attn_decode (n_parts hardcoded to 1)
+ * is bit-identical to this function at n_parts==1: sharing this core, rather
+ * than two independently written loops, is what makes that bit-exactness
+ * structural instead of coincidental. */
+static void attn_decode_core(const float *q, const float *kc, const float *vc,
+                             uint32_t n_heads, uint32_t n_kv_heads, uint32_t head_dim,
+                             uint32_t seq, uint32_t q_stride, float scale,
+                             uint32_t n_parts, float *out) {
+    if (!out || head_dim == 0) return;
+    if (n_heads == 0) return;
+    if (!q || !kc || !vc) return;
+    if (n_kv_heads == 0) return;   /* mirrors k_attn_decode_f16's own n_kv==0 no-op */
+
+    double dscale = (double)scale;
+    uint32_t repeat = n_heads / n_kv_heads;   /* n_kv_heads > 0 guaranteed above */
+    size_t np = (size_t)n_parts, hd = (size_t)head_dim;
+
+    /* m[n_parts]/s[n_parts]/acc[n_parts][head_dim]: sg_ref_attn_combine's
+     * own contract needs all n_parts triples materialized before its one
+     * call per head. Heap-allocated rather than a VLA: n_parts is an
+     * uncapped caller argument (a future large split-K sweep must not risk a
+     * stack overflow), reused across every head. Left NULL when n_parts ==
+     * 0 (malloc(0)'s return value is implementation-defined, so it is never
+     * called at all here; sg_ref_attn_combine's own n_parts==0 case
+     * tolerates NULL m/s/acc). dacc[head_dim] is attn_partial's scratch,
+     * bounded by the model's own head_dim (never uncapped like n_parts) but
+     * heap-allocated anyway to keep this function's stack frame free of any
+     * size tied to a caller argument. Allocation failure leaves `out`
+     * entirely untouched -- the same contract-violation convention
+     * sg_ref_attn_combine documents for its own NULL-array case, rather than
+     * a partial write across some heads but not others.
+     *
+     * The byte counts below are every one of ref_mul_ck/ref_add_ck-guarded
+     * (review finding, P2.1 fix round 1): np and hd are both caller-supplied
+     * uint32_t with surge.h documenting n_parts as explicitly UNCAPPED, so
+     * `np*2 + np*hd` genuinely can overflow size_t for large-but individually
+     * valid inputs, and an unguarded overflow would wrap to a small `need`,
+     * pass malloc, and let the write loops below run off the end with the
+     * original (unwrapped) n_parts/head_dim -- an overflow is rejected as an
+     * allocation failure instead (out left untouched), never truncated. */
+    float *fbuf = NULL;
+    if (n_parts > 0) {
+        size_t t0, t1, t2, need;
+        bool sizes_ok = ref_mul_ck(np, 2, &t0)              /* m[np] + s[np] */
+                     && ref_mul_ck(np, hd, &t1)              /* acc[np][hd] */
+                     && ref_add_ck(t0, t1, &t2)
+                     && ref_mul_ck(t2, sizeof(float), &need);
+        if (!sizes_ok) return;
+        fbuf = malloc(need);
+        if (!fbuf) return;
+    }
+    size_t dacc_need;
+    if (!ref_mul_ck(hd, sizeof(double), &dacc_need)) { free(fbuf); return; }
+    double *dacc = malloc(dacc_need);
+    if (!dacc) { free(fbuf); return; }
+
+    float *m = fbuf;
+    float *s = fbuf ? fbuf + np : NULL;
+    float *acc = fbuf ? fbuf + 2 * np : NULL;
+
+    for (uint32_t h = 0; h < n_heads; h++) {
+        const float *qh = q + (size_t)h * q_stride;
+        uint32_t hk = repeat ? (h / repeat) : 0u;
+
+        for (uint32_t i = 0; i < n_parts; i++) {
+            uint32_t t0 = (uint32_t)((uint64_t)i * seq / n_parts);
+            uint32_t t1 = (uint32_t)((uint64_t)(i + 1) * seq / n_parts);
+            attn_partial(qh, kc, vc, n_kv_heads, hk, head_dim, dscale, t0, t1,
+                        dacc, &m[i], &s[i], acc + (size_t)i * hd);
+        }
+        sg_ref_attn_combine(m, s, acc, n_parts, head_dim, out + (size_t)h * hd);
+    }
+
+    free(fbuf);
+    free(dacc);
+}
+
+void sg_ref_attn_decode(const float *q, const float *kc, const float *vc,
+                        uint32_t n_heads, uint32_t n_kv_heads, uint32_t head_dim,
+                        uint32_t seq, uint32_t q_stride, float scale, float *out) {
+    attn_decode_core(q, kc, vc, n_heads, n_kv_heads, head_dim, seq, q_stride,
+                     scale, 1, out);
+}
+
+void sg_ref_attn_decode_splitk(const float *q, const float *kc, const float *vc,
+                               uint32_t n_heads, uint32_t n_kv_heads, uint32_t head_dim,
+                               uint32_t seq, uint32_t q_stride, float scale,
+                               uint32_t n_parts, float *out) {
+    attn_decode_core(q, kc, vc, n_heads, n_kv_heads, head_dim, seq, q_stride,
+                     scale, n_parts, out);
+}
+
+/* ---------------------------------------------------------------------
  * RoPE
  * --------------------------------------------------------------------- */
 
@@ -567,7 +889,8 @@ struct sg_ref_state {
 
     /* derived widths */
     uint32_t key_dim, value_dim, conv_dim;
-    uint32_t q_width;          /* n_heads * head_dim * 2 (queries + gate) */
+    uint32_t q_width;          /* attn_width, doubled when cfg.attn_output_gate
+                                 * (queries + folded output gate) */
     uint32_t kv_width;         /* n_kv_heads * head_dim */
     uint32_t attn_width;       /* n_heads * head_dim */
 
@@ -748,7 +1071,9 @@ sg_err sg_ref_state_new(const sg_model *m, uint32_t max_ctx, sg_ref_state **out)
     uint64_t value_dim = (uint64_t)c->n_v_heads * c->head_v_dim;
     uint64_t conv_dim = 2 * key_dim + value_dim;
     uint64_t attn_width = (uint64_t)c->n_heads * c->head_dim;
-    uint64_t q_width = attn_width * 2;
+    /* Doubled only when the model actually folds an output gate into q_proj
+     * (Task P1; see cfg.attn_output_gate in surge.h). Dense qwen3 has none. */
+    uint64_t q_width = c->attn_output_gate ? attn_width * 2 : attn_width;
     uint64_t kv_width = (uint64_t)c->n_kv_heads * c->head_dim;
     if (key_dim > width_max || value_dim > width_max || conv_dim > width_max
         || q_width > width_max || kv_width > width_max
@@ -873,20 +1198,30 @@ static void attn_layer(sg_ref_state *st, const sg_layer_w *w, sg_ref_layer *L,
                        const float *in, float *out, uint32_t pos) {
     const sg_cfg *c = &st->cfg;
     uint32_t hd = c->head_dim;
+    /* Task P1: per-head stride into st->qg. Double width (queries + folded
+     * gate) on the hybrid, single width on dense qwen3 -- see
+     * cfg.attn_output_gate (surge.h) and st->q_width above, which this must
+     * stay consistent with (st->q_width == c->n_heads * q_stride always). */
+    uint32_t q_stride = c->attn_output_gate ? 2 * hd : hd;
 
-    /* q_proj is DOUBLE width: mlx reshapes to [n_heads, 2*head_dim] and
-     * splits on the LAST axis, so head h's gate sits immediately after head
-     * h's queries rather than in one block after all of them. */
+    /* q_proj is DOUBLE width on the hybrid: mlx reshapes to [n_heads,
+     * 2*head_dim] and splits on the LAST axis, so head h's gate sits
+     * immediately after head h's queries rather than in one block after all
+     * of them. Dense qwen3 has no gate at all: q_proj is single width and
+     * q_stride collapses to hd, so every access below reads exactly the
+     * queries and nothing past them. */
     wmatvec(w->q_proj, st->mat_type, in, st->qg, st->q_width, c->hidden);
     wmatvec(w->k_proj, st->mat_type, in, st->kbuf, st->kv_width, c->hidden);
     wmatvec(w->v_proj, st->mat_type, in, st->vbuf, st->kv_width, c->hidden);
 
     for (uint32_t h = 0; h < c->n_heads; h++) {
-        float *qh = st->qg + (size_t)h * 2 * hd;
+        float *qh = st->qg + (size_t)h * q_stride;
         /* q_norm applies to the queries only, never to the gate. */
         sg_ref_rmsnorm(qh, L->q_norm_w, hd, c->rms_eps);
         sg_ref_rope_partial(qh, hd, c->rope_dim, pos, c->rope_theta);
-        memcpy(st->gate + (size_t)h * hd, qh + hd, (size_t)hd * sizeof(float));
+        if (c->attn_output_gate) {
+            memcpy(st->gate + (size_t)h * hd, qh + hd, (size_t)hd * sizeof(float));
+        }
     }
     for (uint32_t h = 0; h < c->n_kv_heads; h++) {
         float *kh = st->kbuf + (size_t)h * hd;
@@ -904,7 +1239,7 @@ static void attn_layer(sg_ref_state *st, const sg_layer_w *w, sg_ref_layer *L,
     uint32_t repeat = c->n_heads / c->n_kv_heads;
     for (uint32_t h = 0; h < c->n_heads; h++) {
         uint32_t hk = h / repeat;      /* GQA: mlx repeats the kv head axis */
-        const float *qh = st->qg + (size_t)h * 2 * hd;
+        const float *qh = st->qg + (size_t)h * q_stride;
         for (uint32_t t = 0; t < used; t++) {
             const float *kt = L->k_cache + ((size_t)t * c->n_kv_heads + hk) * hd;
             double dot = 0.0;
@@ -924,8 +1259,12 @@ static void attn_layer(sg_ref_state *st, const sg_layer_w *w, sg_ref_layer *L,
         for (uint32_t i = 0; i < hd; i++) ch[i] = (float)st->dacc[i];
     }
 
-    /* The output gate is a SIGMOID applied before o_proj. */
-    sg_ref_gate_sigmoid(st->ctx, st->gate, st->attn_width);
+    /* The output gate is a SIGMOID applied before o_proj -- only when the
+     * model actually has one (Task P1). Dense qwen3 feeds the raw attention
+     * output straight to o_proj. */
+    if (c->attn_output_gate) {
+        sg_ref_gate_sigmoid(st->ctx, st->gate, st->attn_width);
+    }
     wmatvec(w->o_proj, st->mat_type, st->ctx, out, c->hidden, st->attn_width);
 }
 

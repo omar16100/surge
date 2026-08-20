@@ -42,8 +42,8 @@ static double now_s(void) {
 static void usage(void) {
     fprintf(stderr,
             "usage: surge <model_dir_or_gguf> [-p TEXT | --ids 1,2,3] [-n N]\n"
-            "             [--ref] [--max-ctx N] [--logits OUT.f32] [--margins]\n"
-            "             [--quiet]\n"
+            "             [--ref] [--max-ctx N] [--chunk N] [--no-prefill]\n"
+            "             [--logits OUT.f32] [--margins] [--quiet]\n"
             "\n"
             "  -p TEXT       prompt text; needs a GGUF (safetensors dirs carry no\n"
             "                tokenizer surge can read, so use --ids there)\n"
@@ -51,7 +51,12 @@ static void usage(void) {
             "  -n N          greedy-decode N tokens after the prompt (default 0)\n"
             "  --ref         run the scalar CPU reference forward instead of Metal\n"
             "  --max-ctx N   cache size; defaults to prompt length + N\n"
+            "  --chunk N     prefill chunk size (default 1024); ignored with\n"
+            "                --no-prefill / --ref / --logits\n"
+            "  --no-prefill  ingest the prompt one token at a time (the serial M2\n"
+            "                path) instead of the chunked Metal prefill\n"
             "  --logits P    write every position's logits to P as raw f32\n"
+            "                (forces the serial prompt path)\n"
             "  --margins     print each generated token's top1-top2 logit gap\n"
             "  --quiet       suppress progress on stderr\n");
 }
@@ -98,15 +103,11 @@ static bool ends_with(const char *s, const char *suffix) {
     return ls >= lx && strcmp(s + ls - lx, suffix) == 0;
 }
 
-/* THE argmax, used by both paths. Lowest index wins an exact tie, which is
- * the same rule surge-ref uses. Written once so the two paths cannot drift. */
-static uint32_t argmax_f32(const float *v, uint32_t n) {
-    uint32_t arg = 0;
-    for (uint32_t i = 1; i < n; i++) if (v[i] > v[arg]) arg = i;
-    return arg;
-}
-
-/* The top-1 minus top-2 gap at this position. Printed under --margins
+/* THE argmax lives in src/greedy.c (sg_argmax_f32) so surge and surge-bench
+ * cannot drift apart on tie-break convention; both call the same symbol. The
+ * ref path (--ref) shares it too, keeping the M2 metal-vs-ref gate honest.
+ *
+ * The top-1 minus top-2 gap at this position. Printed under --margins
  * because it is the number that decides whether a token that DID diverge is
  * a real error or a legitimate near-tie: the two paths differ by ~1e-4 on a
  * 2B, so a gap far above that cannot flip and a gap below it can. */
@@ -136,8 +137,8 @@ int main(int argc, char **argv) {
     if (argc < 2) { usage(); return 2; }
     const char *path = argv[1];
     const char *prompt = NULL, *ids_arg = NULL, *logits_path = NULL;
-    uint32_t n_gen = 0, max_ctx_arg = 0;
-    bool quiet = false, use_ref = false, margins = false;
+    uint32_t n_gen = 0, max_ctx_arg = 0, chunk_size = SG_PREFILL_CHUNK_DEFAULT;
+    bool quiet = false, use_ref = false, margins = false, no_prefill = false;
 
 #define NEED_VALUE(flag) do { \
         if (i + 1 >= argc) { \
@@ -163,6 +164,8 @@ int main(int argc, char **argv) {
         else if (strcmp(argv[i], "-n") == 0) PARSE_U32("-n", n_gen);
         else if (strcmp(argv[i], "--logits") == 0) { NEED_VALUE("--logits"); logits_path = argv[++i]; }
         else if (strcmp(argv[i], "--max-ctx") == 0) PARSE_U32("--max-ctx", max_ctx_arg);
+        else if (strcmp(argv[i], "--chunk") == 0) PARSE_U32("--chunk", chunk_size);
+        else if (strcmp(argv[i], "--no-prefill") == 0) no_prefill = true;
         else if (strcmp(argv[i], "--ref") == 0) use_ref = true;
         else if (strcmp(argv[i], "--margins") == 0) margins = true;
         else if (strcmp(argv[i], "--quiet") == 0) quiet = true;
@@ -225,9 +228,31 @@ int main(int argc, char **argv) {
     }
 
     /* max_position_embeddings is 262144 on this model family, so the cache is
-     * sized from the ACTUAL run length, never from the config. */
-    uint32_t max_ctx = max_ctx_arg ? max_ctx_arg : (uint32_t)(n_ids + n_gen);
-    if ((uint64_t)max_ctx < n_ids + n_gen) max_ctx = (uint32_t)(n_ids + n_gen);
+     * sized from the ACTUAL run length, never from the config.
+     *
+     * An explicit --max-ctx is a HARD cap on the cache (M5.7). A prompt (plus
+     * the tokens it asks to generate) that does not fit is REJECTED here with a
+     * clear message and a nonzero exit, rather than silently enlarging the cache
+     * (which would make --max-ctx meaningless) or letting the ingest run past
+     * the cap. Without an explicit --max-ctx the cache is sized to the run. */
+    uint32_t max_ctx;
+    if (max_ctx_arg) {
+        if (n_ids > max_ctx_arg) {
+            fprintf(stderr, "surge: prompt is %llu tokens but --max-ctx is %u; "
+                            "the prompt exceeds the context cap\n",
+                    (unsigned long long)n_ids, max_ctx_arg);
+            goto done;
+        }
+        if (n_ids + n_gen > max_ctx_arg) {
+            fprintf(stderr, "surge: %llu prompt + %u generated tokens exceeds "
+                            "--max-ctx %u; raise --max-ctx or lower -n\n",
+                    (unsigned long long)n_ids, n_gen, max_ctx_arg);
+            goto done;
+        }
+        max_ctx = max_ctx_arg;
+    } else {
+        max_ctx = (uint32_t)(n_ids + n_gen);
+    }
 
     if (use_ref) {
         e = sg_ref_state_new(&m, max_ctx, &rs);
@@ -258,26 +283,43 @@ int main(int argc, char **argv) {
     double t_prompt = 0.0, t_gen = 0.0;
     uint32_t produced = 0;
 
+    /* Chunked Metal prefill is the default for the prompt. It falls back to the
+     * serial one-token-at-a-time path for the CPU reference (which has no
+     * prefill), when --no-prefill is passed, or when --logits is requested
+     * (prefill returns only the last position's logits, but --logits wants
+     * every position's). Both paths feed the SAME argmax_f32 below, so the
+     * gen_ids must be identical either way. */
+    bool do_prefill = !use_ref && !no_prefill && !logits_path;
+
     double t0 = now_s();
-    for (uint64_t t = 0; t < n_ids; t++) {
-        e = FORWARD(ids[t], (uint32_t)t, &lg);
-        if (sg_failed(e)) {
-            fprintf(stderr, "surge: %s\n", e.msg);
-            if (lf) { fclose(lf); lf = NULL; remove(logits_path); }
-            goto done;
+    if (do_prefill) {
+        e = sg_gpu_prefill(gpu, &m, ids, (uint32_t)n_ids, chunk_size, &lg);
+        if (sg_failed(e)) { fprintf(stderr, "surge: %s\n", e.msg); goto done; }
+        if (!quiet) {
+            fprintf(stderr, "  prefill %llu tokens, chunk %u\n",
+                    (unsigned long long)n_ids, chunk_size);
         }
-        if (lf && fwrite(lg, sizeof(float), m.cfg.vocab, lf) != m.cfg.vocab) {
-            fprintf(stderr, "surge: short write to %s\n", logits_path);
-            fclose(lf); lf = NULL; remove(logits_path);
-            goto done;
+    } else {
+        for (uint64_t t = 0; t < n_ids; t++) {
+            e = FORWARD(ids[t], (uint32_t)t, &lg);
+            if (sg_failed(e)) {
+                fprintf(stderr, "surge: %s\n", e.msg);
+                if (lf) { fclose(lf); lf = NULL; remove(logits_path); }
+                goto done;
+            }
+            if (lf && fwrite(lg, sizeof(float), m.cfg.vocab, lf) != m.cfg.vocab) {
+                fprintf(stderr, "surge: short write to %s\n", logits_path);
+                fclose(lf); lf = NULL; remove(logits_path);
+                goto done;
+            }
+            if (!quiet && (t % 8 == 0 || t + 1 == n_ids)) {
+                fprintf(stderr, "\r  prompt %llu/%llu", (unsigned long long)(t + 1),
+                        (unsigned long long)n_ids);
+            }
         }
-        if (!quiet && (t % 8 == 0 || t + 1 == n_ids)) {
-            fprintf(stderr, "\r  prompt %llu/%llu", (unsigned long long)(t + 1),
-                    (unsigned long long)n_ids);
-        }
+        if (!quiet) fprintf(stderr, "\n");
     }
     t_prompt = now_s() - t0;
-    if (!quiet) fprintf(stderr, "\n");
 
     if (n_gen > 0) {
         gen = malloc((size_t)n_gen * sizeof *gen);
@@ -287,7 +329,7 @@ int main(int argc, char **argv) {
          * token at position n_ids. Step i emits that token and feeds it back
          * at position n_ids + i. */
         for (uint32_t i = 0; i < n_gen; i++) {
-            uint32_t arg = argmax_f32(lg, m.cfg.vocab);
+            uint32_t arg = sg_argmax_f32(lg, m.cfg.vocab);
             if (margins) {
                 fprintf(stderr, "  margin[%u] tok %u gap %.6e\n", i, arg,
                         (double)top2_gap(lg, m.cfg.vocab, arg));

@@ -24,7 +24,8 @@
  * alloc_bytes lives in src/metal.m and is therefore unreachable (and
  * untested) here under SURGE_NO_METAL, exactly like every other Metal
  * symbol. See the Makefile's METAL_HYBRID_TESTS rule, which links this file
- * against LIB_SRC in both modes but only pulls in metal.m/the frameworks
+ * against LIB_SRC in both modes but only pulls in metal.m + metal_prefill.m /
+ * the frameworks
  * when Metal is actually being built.
  */
 #include "tinytest.h"

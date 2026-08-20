@@ -165,7 +165,7 @@ int main(void) {
 
 #define DEFAULT_REPS 20
 
-/* SG_TG, mirrored from src/metal.m / src/kernels.metal: the fixed threadgroup
+/* SG_TG, mirrored from src/metal_internal.h / src/kernels.metal: the fixed threadgroup
  * width both k_attn_decode_f16 and the split-K pair dispatch. Used only to
  * derive the occupancy band's upper bound (seq / SPLIT_TG_KEYS), exactly as
  * surge.h documents it next to sg_gpu_run_attn_splitk_partial. */

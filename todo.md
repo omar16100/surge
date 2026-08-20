@@ -3388,7 +3388,7 @@ edits to the spec:
 2. **M4 milestone line** marked AMENDED and pointed at the new section. The bar itself is
    left in place, unedited.
 3. **New section "M4 amendment (2026-08-18)"**: the occupancy diagnosis with code anchors
-   (`src/kernels.metal:455`, `src/metal.m:1743`), the P2.3-to-P4.0 task table with each
+   (`src/kernels.metal:455`, `src/metal.m:1448`), the P2.3-to-P4.0 task table with each
    task's measured effect, the cumulative 28.3x shipping by default, the two
    counter-intuitive results (the split policy is a CAP not a rescaling, worst candidate
    13.4 percent regret; the occupancy guard is a threadgroup count not a `seq` threshold,
@@ -3512,3 +3512,77 @@ Final line counts: `src/kernels.metal` 1295, `src/kernels_splitk.metal` 1277,
 `src/kernels_common.metal.h` 65 (was one file of 2548).
 
 Full report: `.superpowers/sdd/2026-08-09-surge-m3-m5/task-R1-report.md`.
+
+## Task R2 Results: split the chunked prefill out of `src/metal.m` (2026-08-20)
+
+DONE. `src/metal.m` was 4641 lines against this project's ~2000-line guideline, the worst
+offender in the repo and the one task R1 deliberately left alone. This is the FIRST of the
+three cuts R1's report proposed, and the one it recommended going first: prefill.
+
+What moved to `src/metal_prefill.m` (826 lines, of which 782 are verbatim from `metal.m`):
+old lines 3076-3315, the M5.4 full-attention chunk encoder `enc_attn_prefill` and the M5.5
+gated-DeltaNet chunk encoder `enc_gdn_prefill` with their comment blocks, and old lines
+4100-4641, the whole `Chunked prompt prefill (Task M5.6)` block (`sg_prefill_bufs`,
+`prefill_save` / `prefill_restore` / `prefill_free_chunk`, `pf_now_s`, `pf_sleep_ms`,
+`PF_EST_MARGIN`, `PF_ALLOC`, `sg_gpu_set_prefill_rest`, `sg_gpu_set_prefill_max_burst`,
+`sg_gpu_prefill_segments`, `sg_gpu_prefill_rest_ms`, `sg_gpu_prefill`). The 782 moved lines
+were diffed against `git show HEAD:src/metal.m` by script: rc 0, not one character changed.
+This seam was chosen because NOTHING IN DECODE CALLS ANY OF IT (`sg_gpu_forward`,
+`enc_attn`, `enc_gdn` stayed and reach nothing in the new file), so the traffic across it is
+one-way.
+
+R1'S BYTE-IDENTITY GATE DOES NOT TRANSFER AND WAS NOT CLAIMED. Objective-C translation
+units really link. Every `static` crossing the seam was enumerated BEFORE anything moved and
+decided one at a time (14 of them; the full table is in the report). Five one-line accessors
+and bit casts on the per-element encode path (`bufof`, `offof`, `fbits`, `mul_ck`, `add_ck`)
+became `static inline` in the new `src/metal_internal.h`, so they keep inlining in both
+files and gain no external symbol at all. Nine larger helpers (`gpu_errf`, `scratch_ensure`,
+`gpu_elem_width`, `gemm_kernel_for`, `gpu_embed_row`, `gpu_alloc_f32`, `enc_op`,
+`enc_kv_store`, `enc_matmul`) lost `static` and are declared in that header: they DO gain
+external linkage and lose cross-TU inlining, and they are all per-dispatch or
+per-allocation, never per-element. `enc_attn_prefill` / `enc_gdn_prefill` were already
+non-static, so they cost nothing. `g_errbuf`, the one piece of translation-unit-local state
+in the file, did NOT move: `gpu_errf` stayed with it and is the only writer, so there is
+still exactly one error buffer.
+
+`src/metal_internal.h` (425 lines) also carries the types the new file dereferences, moved
+once and not copied: `SG_TG`, the `KI_` enum, `sg_gpu_buf`, `sg_gpu_layer`, `struct sg_gpu`,
+`sg_enc`, `PARAMS`. One forced edit inside moved code: `pipes[SG_N_KERNELS]` became
+`pipes[KI_COUNT]`, because `SG_N_KERNELS` is `sizeof SG_KERNELS / sizeof SG_KERNELS[0]` and
+that table stays in `metal.m`. Same number and same layout, and metal.m's
+`_Static_assert(SG_N_KERNELS == KI_COUNT)` is untouched, so the table and the enum are still
+locked together.
+
+Build: `METAL_M = src/metal.m src/metal_prefill.m` and `METAL_M_DEPS` add
+`src/metal_internal.h`; the four rules that named `src/metal.m` (the Metal tests, `surge`,
+`surge-bench`, `tests/bench_splitk.bin`) now name both. Dropping one would fail the link
+loudly rather than silently, which is the point.
+
+Gates, both EXACT against the figure re-verified at HEAD on 2026-08-19: `make check` 87604
+checks 0 failures, rc 0, 19 count blocks; `make debug` (SURGE_NO_METAL, ASan/UBSan) 83614
+checks 0 failures, rc 0, zero sanitizer diagnostics, 16 blocks. Both reproduced from `make
+clean`. `clang -fsyntax-only -std=c11 -Wall -Wextra -Werror` clean on both `.m` files in
+both the Metal and the `-DSURGE_NO_METAL` configuration. The P2.4/P2.6/P2.7/P4.0 control
+lines are unmoved (`513 GQA dispatches ... 15873 per-head with it off, logits byte-identical
+at 16896/16896`, `257/257 positions differ above the divergence seq, 0 of 16639 below`, and
+`m/s/acc/out byte-identical over 100 reruns` for all three partials).
+
+Comment anchors: five `src/metal.m:N` line anchors were retargeted for the shrink
+(`1305 -> 1010`, `1491 -> 1196`, `1743 -> 1448` twice, `3762 -> 3208`) and each was verified
+against the line it now lands on. A sixth, `docs/15082026_prefill_duty_cycle_plan.md`'s
+`src/metal.m:3477`, was ALREADY dangling at HEAD (it pointed at a Q8_0 width check, not at
+the work-budget test it describes) and now reads `src/metal_prefill.m:786`. Eleven
+by-name cross-file references were qualified with the file the symbol now lives in
+(`src/sched.c` x2, `src/kv.c`, `src/ref.c`, `tests/test_gpu_fwd.c`, `tests/bench_splitk.c`,
+`tests/test_gpu_mem.c`, `tools/prefill_longctx_gate.sh`, and four inside `metal.m` itself),
+plus one directional `public one-shots above` inside the moved block that no longer has an
+above.
+
+Line counts: `src/metal.m` 4641 -> 3547, `src/metal_prefill.m` 826 (new),
+`src/metal_internal.h` 425 (new). NOT DONE, AND SAID PLAINLY: 3547 is still well over the
+~2000-line guideline. R1's proposed cuts two (the split-K host layer, ~800 lines) and three
+(the KI_ table + `check_sizes` / `check_params` / `gpu_grid`, ~1100 lines) remain, and
+either would bring `metal.m` under it. They were not bundled here: cut two crosses the hot
+decode encoder, which is a different risk class from a seam decode never touches.
+
+Full report: `.superpowers/sdd/2026-08-09-surge-m3-m5/task-R2-report.md`.

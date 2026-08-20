@@ -103,7 +103,8 @@ compositor can render and the watchdog does not fire.
 
 ## Finding 2: the duty-cycle gate overshoots by up to one chunk
 
-`src/metal.m:3477` checks the work budget only *after* a chunk's command buffer
+`src/metal_prefill.m:786` (task R2 moved it out of `src/metal.m`; the
+anchor was already stale before that) checks the work budget only *after* a chunk's command buffer
 completes. So a burst runs to `budget + one_chunk_duration`. That is bounded, not
 unbounded, but the bound is one chunk and one chunk's duration grows with context until it
 alone exceeds the watchdog window.

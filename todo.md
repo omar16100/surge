@@ -2529,17 +2529,33 @@ buffer, instead of `k_attn_decode_f16`. No wait between the two dispatches:
 `MTLDispatchTypeSerial` is the barrier, which is exactly what the one-shot entry points
 had to buy with a commit-and-wait.
 
-**Split count:** `n_splits = clamp(seq / SG_TG, 4, 1024)`, the P2.3a MEASURED optimum (the
-top of the occupancy band: every split gets exactly SG_TG = 256 keys). Re-measured at seq
-32768 on 2026-08-16: 27B shape 15193.45 us -> 1393.00 us = 10.907x, 4B dense shape
-13783.10 us -> 1035.20 us = 13.314x, and the closed form's 128 was the best n_splits for
-both shapes in that run.
+**Split count:** `n_splits = clamp(seq / SG_TG, 4, 1024)`, the top of the occupancy band
+(every split gets exactly SG_TG = 256 keys) and P2.3a's measured best in SEVEN of its eight
+(seq, shape) cells. Re-measured at seq 32768 on 2026-08-16: 27B shape 15193.45 us ->
+1393.00 us = 10.907x, 4B dense shape 13783.10 us -> 1035.20 us = 13.314x, and the closed
+form's 128 was the best n_splits for both shapes in that run.
+
+**The eighth cell, corrected 2026-08-20 (P2.3 review F2).** P2.3a's claim that the closed
+form was the optimum at EVERY measured cell is false. On the 27B shape at seq 8192 the best
+n_splits is 16, not 32: P2.3's own re-sweep read 5.226x vs 4.965x and the P2.3 reviewer's
+independent sweep (`--reps 20`, fans firmware auto) read 5.447x vs 5.180x, two runs agreeing
+on a ~5% gap in the same direction. The reviewer also saw the 27B curve go non-monotonic at
+32768 (16 -> 9.699x above 32 -> 9.129x, before 128 -> 10.783x wins). The 4B shape at 8192
+does peak at the closed form. THE POLICY IS UNCHANGED on purpose: the closed form is the
+band's top rather than a fitted constant, the curve is shallow near the optimum, and one 5%
+outlier at one shape and one depth (attention is not the decode bottleneck there) does not
+justify a shape-specific special case with its own sweep and gate. Corrected in
+`docs/c4model.md`, `surge.h`, `src/metal.m`, `src/kernels_splitk.metal` and
+`docs/16082026_splitk_decode_gate.md`.
 
 **Fallback policy (MEASURED, not extrapolated):** below seq 1024 (`SG_TG * 4`, where the
 clamp's floor starts binding and splits fall under SG_TG keys) decode keeps the incumbent.
 Added `--seqs` to `tests/bench_splitk.c` to measure the crossover the default sweep (>=
 8192) cannot reach: at seq 256 split-K is 0.710x / 0.689x (a REGRESSION), at 512 it is
-1.021x / 0.948x (a wash), at 1024 it is 1.880x / 1.272x, and it climbs from there
+1.021x / 0.948x (the P2.3 review re-measured 512 at 0.924x / 0.948x, i.e. a small
+regression on BOTH shapes rather than the wash this originally called it; its fans were on
+firmware auto, so limiter shape versus a real disagreement is unresolved, and either way it
+justifies the 1024 threshold slightly better), at 1024 it is 1.880x / 1.272x, and it climbs from there
 (4096: 3.43x / 3.23x, 8192: 5.23x / 5.22x). `SURGE_ATTN_SPLITK=0` pins the incumbent for
 every step, which is what makes the A/B possible and why that kernel is kept reachable;
 the f32-KV path always uses it (split-K reads half-typed K/V).
@@ -3512,3 +3528,64 @@ Final line counts: `src/kernels.metal` 1295, `src/kernels_splitk.metal` 1277,
 `src/kernels_common.metal.h` 65 (was one file of 2548).
 
 Full report: `.superpowers/sdd/2026-08-09-surge-m3-m5/task-R1-report.md`.
+
+## Task: correct three shipped claims from the P2.3 review (2026-08-20, branch `fix/p2.3-claims`)
+
+Documentation and comment corrections only. No behaviour changed, no tolerance changed, no
+policy changed. Gates re-run on this worktree at `f11637c` with NO `SURGE_*` variables
+exported: `make check` rc 0, **87604 checks, 0 failures** (identical to before the edits);
+`make debug` rc 0, **83614 checks, 0 failures, 0 sanitizer diagnostics**;
+`-Wall -Wextra -Werror` clean (the whole build runs under it, plus `xcrun clang
+-fsyntax-only` on `src/metal.m` and `tests/test_gpu_fwd.c`, plus `xcrun metal -fno-fast-math
+-Wall -c src/kernels_splitk.metal`). GPU confirmed free before every `make`.
+
+**1. "The closed form is the optimum at EVERY measured cell" was false and is now corrected
+everywhere it was live.** The 27B decode shape at seq 8192 peaks at `n_splits` 16, not the
+closed form's 32, and two independent sweeps agree on the roughly 5 percent gap (P2.3:
+5.226x vs 4.965x; the P2.3 reviewer, `--reps 20`, fans firmware auto: 5.447x vs 5.180x).
+The reviewer also measured the 27B curve non-monotonic at 32768 (16 -> 9.699x above
+32 -> 9.129x and 64 -> 9.123x, before 128 -> 10.783x wins). The 4B shape at 8192 does peak
+at the closed form. Sites corrected: `docs/c4model.md` (the architecture source of truth,
+which said "at every measured cell"), `surge.h`, `src/metal.m` (`splitk_n_splits`'s policy
+block), `src/kernels_splitk.metal` (the kernels moved there in task R1, so the review's
+`src/kernels.metal` line numbers were stale), `docs/16082026_splitk_decode_gate.md`,
+`docs/17082026_splitk_gqa_threadgroups.md`, `docs/index.md` and the P2.3 Results section
+above. **THE POLICY IS UNCHANGED and that is a decision, not an oversight:** the closed form
+is the top of the occupancy band the kernel header derives rather than a constant fitted to
+a table, so it extrapolates to shapes and depths nobody swept; the curve is shallow near the
+optimum; and one 5 percent outlier at one shape and one depth, where attention is not the
+decode bottleneck, does not pay for a shape-specific special case that would need its own
+sweep and its own regression gate to stay true. The anomaly is stated in each place rather
+than smoothed over.
+
+**2. The P2.3 report's absolute `make check` / `make debug` counts are environment-dependent
+and were not reproducible.** The reviewer measured exactly 430 fewer in all three numbers.
+Per-variable deltas measured here (suites `make debug` also runs, i.e. non-Metal):
+`SURGE_ST` +183, `SURGE_GGUF` +237 (plus +13 in `test_gpu_fwd`, `check` only),
+both together +423 (a +3 cross term), `SURGE_GGUF_TWIN` +158, `SURGE_GGUF_QWEN3` +780,
+`SURGE_KV_ALLOC` +5. **No environment can produce a CONSTANT 430 across both targets**:
+`make debug` stubs every Metal-only suite, so the variables that move `check` and `debug`
+equally are `SURGE_ST`, `SURGE_GGUF_QWEN3` and `SURGE_KV_ALLOC`, whose subset sums are
+0, 5, 183, 188, 780, 785, 963, 968. The leading remaining hypothesis is extra uncommitted
+test code in the shared working tree, which that report already documents a second session
+using. Every count in the report now carries the environment it was taken in.
+
+**3. The report's tolerance defence described a metric `tests/test_gpu_fwd.c` does not
+have.** The file's one pre-existing relative metric is `max |err| / max |scale|` per row, not
+a per-element ratio; on this comparison it reads 4.608e-07 and PASSES its own 1e-4 bar by
+217x, so no bar was failed and no metric had to be replaced. The 1.471e-03 figure is a real
+measurement of a true per-element ratio, a metric this file has never used. The conclusion is
+unchanged and independently verified: no existing tolerance was removed or modified, and the
+new gate is strictly stronger (it keeps the scaled metric and adds argmax equality and
+`worst_abs < min_margin`). The same wrong description was in the gate's own source comment
+(`tests/test_gpu_fwd.c` step 3) and is corrected there.
+
+Minors closed in the report: mutation A's pasted line number (`:402`, from a non-committed
+tree, is `:412`), the parent commit stated as `1fcebb0` in gate 1 (it is `bf830f3`), the
+seq-512 "wash" (the reviewer measured 0.924x / 0.948x, a small regression on both shapes,
+which justifies the 1024 threshold slightly better rather than worse), and the `todo.md`
+line count at that commit (2595, not 2594).
+
+The report and the SDD ledger are untracked files under `.superpowers/`, so they are amended
+in place rather than in this commit:
+`.superpowers/sdd/2026-08-09-surge-m3-m5/task-P2.3-report.md` and `progress.md`.

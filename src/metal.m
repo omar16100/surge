@@ -1182,14 +1182,35 @@ static sg_err splitk_scratch_ensure(sg_gpu *g, uint64_t nbytes) {
  * with `make bench-splitk` on this machine), not a guess: sweeping n_splits
  * over {1..1024} at seq 8192 / 32768 / 131072 / 262144 on both the real 27B
  * decode shape (24 heads, 4 kv, head_dim 256) and the real 4B dense shape (32
- * heads, 8 kv, head_dim 128), the fastest n_splits was EXACTLY seq / SG_TG in
- * every one of those eight cells (8192 -> 32, 32768 -> 128, 131072 -> 512,
- * 262144 -> 1024), i.e. hand every split exactly SG_TG keys so every lane of
- * the threadgroup gets one. That is the top of the occupancy band documented
- * on k_attn_decode_splitk_partial (n_heads*n_splits >= GPU cores from below,
+ * heads, 8 kv, head_dim 128), the fastest n_splits was seq / SG_TG in SEVEN of
+ * those eight cells (8192 -> 32, 32768 -> 128, 131072 -> 512, 262144 -> 1024),
+ * i.e. hand every split exactly SG_TG keys so every lane of the threadgroup
+ * gets one. That is the top of the occupancy band documented on
+ * k_attn_decode_splitk_partial (n_heads*n_splits >= GPU cores from below,
  * n_splits <= seq/SG_TG from above), so the closed form and the band agree.
  * At 262144 the pair beat k_attn_decode_f16 by 15.9x (27B shape) and 21.9x
  * (4B shape).
+ *
+ * THE EIGHTH CELL, stated rather than buried. On the 27B shape at seq 8192 the
+ * fastest value is n_splits 16, NOT the closed form's 32, and it has now been
+ * measured twice by two people: P2.3's re-sweep read 16 -> 5.226x against
+ * 32 -> 4.965x, and the P2.3 review's independent sweep (--reps 20, fans on
+ * firmware auto) read 16 -> 5.447x against 32 -> 5.180x. Two runs agreeing on a
+ * roughly 5 percent gap in the same direction is not run-to-run noise, so
+ * P2.3a's "optimum at every cell" is FALSE as written. That review also found
+ * the 27B curve non-monotonic at 32768 (16 -> 9.699x above 32 -> 9.129x and
+ * 64 -> 9.123x, before 128 -> 10.783x won the cell). The 4B shape at 8192 does
+ * peak at 32, the closed form.
+ *
+ * WHY THE POLICY KEEPS THE CLOSED FORM ANYWAY. It is the top of the occupancy
+ * band the kernel header derives, not a constant fitted to a table, so it
+ * extrapolates to shapes and depths nobody swept; the curve is shallow near the
+ * optimum (5 percent between neighbouring powers of two here); and one 5 percent
+ * outlier at one shape at one depth, where attention is not the decode
+ * bottleneck, does not pay for a shape-specific special case that would then
+ * need its own sweep and its own regression gate to stay honest. What this
+ * comment must NOT be read as is a proof that the closed form is optimal
+ * everywhere: it is not, and anyone extending the policy re-measures first.
  *
  * The 1024 ceiling is the band's own upper bound at SG_KV_CAP_MAX == 262144
  * (262144/256), so it only ever binds for a hypothetical longer context; the

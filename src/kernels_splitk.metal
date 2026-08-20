@@ -99,9 +99,18 @@ using namespace metal;
  * wide, but it IS bounded.
  *
  * THE MEASUREMENT WAS TAKEN (P2.3a, `make bench-splitk`): the fastest n_splits
- * was exactly seq / SG_TG at every seq and both real shapes tested, i.e. the
- * TOP of that band, giving each split exactly SG_TG keys. So the decode path
- * uses n_splits = clamp(seq / SG_TG, 4, 1024).
+ * was seq / SG_TG in seven of the eight (seq, shape) cells swept, i.e. the TOP
+ * of that band, giving each split exactly SG_TG keys. So the decode path uses
+ * n_splits = clamp(seq / SG_TG, 4, 1024).
+ *
+ * THE EIGHTH CELL DISAGREES and the disagreement is reproduced: on the 27B
+ * decode shape at seq 8192, n_splits 16 beats the closed form's 32 by about
+ * 5 percent (P2.3's re-sweep 5.226x vs 4.965x; the P2.3 review's independent
+ * one 5.447x vs 5.180x). The policy still ships the closed form on purpose: it
+ * is the band's top rather than a fitted constant, the curve is shallow near
+ * the optimum, and one outlier at one shape and depth does not earn a special
+ * case. Read the closed form as a good default, not as a proven optimum at
+ * every cell. metal.m's splitk_n_splits carries the full argument.
  *
  * WIRED INTO THE DECODE PATH (P2.3). enc_attn's fp16 branch dispatches this
  * pair through metal.m's enc_attn_splitk once seq reaches SG_TG * 4 == 1024,

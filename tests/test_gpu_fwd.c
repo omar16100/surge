@@ -445,13 +445,20 @@ static void mini_f16_splitk_decode_matches_incumbent(void) {
               "positions differ, so the split-K path never ran)",
               SPLITK_GATE_THRESHOLD, above_total);
 
-    /* 3. The two paths must still AGREE. The metric is DELIBERATELY NOT this
-     *    file's bare per-element relative ratio: task P2.0 established (and
-     *    its reviewer independently confirmed against an all-double gold
-     *    reference) that such a ratio explodes on a logit that lands near zero
-     *    by cancellation, reporting a huge number for an error of one float
-     *    ULP. Two summation orders over the same keys is exactly the case that
-     *    triggers it. So this asserts what actually matters for a decode:
+    /* 3. The two paths must still AGREE. The metric is DELIBERATELY NOT a bare
+     *    PER-ELEMENT relative ratio, |a-b|/|b| maximized over elements: task
+     *    P2.0 established (and its reviewer independently confirmed against an
+     *    all-double gold reference) that such a ratio explodes on a logit that
+     *    lands near zero by cancellation, reporting a huge number for an error
+     *    of one float ULP. Two summation orders over the same keys is exactly
+     *    the case that triggers it. NOTE, corrected after the P2.3 review: that
+     *    per-element ratio is NOT a metric this file has ever used, so nothing
+     *    here replaces an existing bar. This file's own gpu-vs-ref metric
+     *    (fwd_matches_ref above) is max|err| / max|scale| over the row, which is
+     *    structurally the third tooth below, and on this comparison it reads
+     *    4.608e-07, passing its own 1e-4 bar by 217x. The three teeth below are
+     *    therefore strictly ADDITIVE strength, not a substitution. This asserts
+     *    what actually matters for a decode:
      *
      *      - identical argmax at every position (the token-level property),
      *      - the worst ABSOLUTE logit delta is smaller than the SMALLEST

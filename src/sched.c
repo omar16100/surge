@@ -12,9 +12,11 @@
  * decode loop is not inside metal.m at all -- sg_gpu_forward is ONE step and
  * the per-token loop belongs to the caller -- so nothing here needs to be
  * near Metal. Keeping it out matters: the Metal host layer is still the
- * largest thing in src (task R2 split it into src/metal.m + src/metal_prefill.m
- * and metal.m is STILL over this project's ~2000-line guideline), and adding
- * pacing there would have made the worst offender worse.
+ * largest thing in src (task R2 split it into src/metal.m +
+ * src/metal_prefill.m, task R3 split src/metal_validate.m out as well, so it
+ * is THREE translation units now, and metal.m is STILL over this project's
+ * ~2000-line guideline), and adding pacing there would have made the worst
+ * offender worse.
  *
  * WHAT IS DELIBERATELY NOT HERE. No fan control, no power management, no
  * shelling out to any external daemon. surge is a public engine; driving a

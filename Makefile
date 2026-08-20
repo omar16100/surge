@@ -6,6 +6,15 @@ LDLIBS = -lm
 FRAMEWORKS = -framework Metal -framework Foundation
 TESTS = $(wildcard tests/test_*.c)
 check: $(TESTS:.c=.bin)
+# Interim guard for the twelve UNPREFIXED globals the R2/R3 host-layer splits
+# promoted (check_params, check_sizes, gpu_grid, enc_op, ...). Pure grep over
+# source: no compiler, no GPU, no model, no ordering dependence, so it is free
+# and deterministic in both `check` and `debug`'s -DSURGE_NO_METAL recursion,
+# and it asserts NOTHING about test counts. It fails if a NEW unprefixed
+# global joins the set, or if any file outside src/metal*.m + metal_internal.h
+# declares one of them. The real fix is task R4 (sg_ prefix all twelve), which
+# must land before the next src/metal.m cut. See the script's header comment.
+	@bash tools/check_metal_globals.sh
 	@set -e; for t in $^; do ./$$t; done
 # Gate 4 (M5.6): the `surge` CLI's prefill (default) vs --no-prefill must emit
 # byte-identical gen_ids. This drives the real binary, so it is skipped under

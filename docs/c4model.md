@@ -43,7 +43,12 @@ optionally Accelerate for the CPU reference path. No third-party libraries.
   three more; both gated on the exact `make check` / `make debug` counts instead, plus a
   per-function disassembly comparison against the parent). All three `.m` files are on
   every link line that names the Metal layer (the Makefile's `METAL_M`); none is
-  optional.
+  optional. The twelve promoted helpers are still UNPREFIXED globals and are all in the
+  `surge` binary's dynamic export trie; task R4 will `sg_` prefix all twelve and must land
+  BEFORE the next `src/metal.m` cut, which would promote roughly another dozen. Until it
+  does, `tools/check_metal_globals.sh` (run from the `check` recipe, pure grep, no
+  compiler) fails the build if a thirteenth unprefixed global joins the set or if any file
+  outside `src/metal*.m` + `src/metal_internal.h` declares one of them.
   Only binaries that need the GPU link these.
 - **CLIs**: `surge-info` (GGUF dump), `surge-ref` (CPU-reference forward + `--logits`),
   `surge` (Metal decode), `surge-bench` (benchmark harness; B5 shipped, wires B1-B4 + the

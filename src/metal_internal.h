@@ -10,7 +10,7 @@
  * helpers. Nothing outside src/metal*.m may include it.
  *
  * WHAT BELONGS HERE, AND WHAT DOES NOT. Only declarations that genuinely
- * CROSS the metal.m / metal_prefill.m seam. A helper with callers on one side
+ * CROSS a seam between the three .m files. A helper with callers on one side
  * only stays static in that file. There is exactly one definition of
  * everything below; nothing here is a copy of anything in src/metal.m.
  *

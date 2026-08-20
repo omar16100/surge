@@ -123,8 +123,11 @@ mutation-proved rather than merely green.
   after further split-K work and before the next task touching a non-split-K kernel there.
   (Both recommended cuts have since been done: task R1 on 2026-08-18 split
   `src/kernels_splitk.metal` out, leaving `src/kernels.metal` at 1295, and task R2 on
-  2026-08-20 split `src/metal_prefill.m` out, leaving `src/metal.m` at 3547, still over the
-  guideline. The `4616` figure this bullet originally carried was already wrong when written:
+  2026-08-20 split `src/metal_prefill.m` out, leaving `src/metal.m` at 3547. Task R3, also on
+  2026-08-20, then split the per-dispatch validation trio out into `src/metal_validate.m`,
+  leaving `src/metal.m` at 3207 and the Metal host layer at THREE Objective-C translation
+  units; 3207 is still over the guideline. The `4616` figure this bullet originally carried
+  was already wrong when written:
   `src/metal.m` was 4641 at the time. Corrected in R2 fix round 1, 2026-08-20, because this
   was the last place in the tree still repeating the stale 4616 that R2 removed from
   `src/sched.c`. Dated summary docs are otherwise left as historical records; this one is

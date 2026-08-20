@@ -55,7 +55,8 @@ echo "depths: (A) 8192 / 16384 / 32768   (B) 262112 prefill + 32 decode = 262144
 [ -n "${SURGE_GATE_SKIP_A:-}" ] && echo "note  : SURGE_GATE_SKIP_A set -> running gate (B) only" >&2
 
 # Build the Metal test binary (the Makefile's static pattern rule links
-# src/metal.m + src/metal_prefill.m + the metallib for this target).
+# $(METAL_M), which is src/metal.m + src/metal_prefill.m +
+# src/metal_validate.m since task R3, plus the metallib for this target).
 echo "-- building $BIN --" >&2
 if ! make "$BIN"; then
     echo "FAIL: could not build $BIN" >&2

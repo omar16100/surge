@@ -19,9 +19,9 @@
  * dispatch order, buffer sizes and error text are unchanged.
  *
  * WHAT THE SPLIT DID COST, stated plainly because R1's byte-identity gate does
- * NOT transfer to Objective-C: enc_op, enc_matmul, enc_kv_store, gpu_errf,
- * scratch_ensure, gpu_elem_width, gemm_kernel_for, gpu_embed_row and
- * gpu_alloc_f32 were `static` in src/metal.m and are now declared in
+ * NOT transfer to Objective-C: sg_enc_op, sg_enc_matmul, sg_enc_kv_store, sg_gpu_errf,
+ * sg_scratch_ensure, sg_gpu_elem_width, sg_gemm_kernel_for, sg_gpu_embed_row and
+ * sg_gpu_alloc_f32 were `static` in src/metal.m and are now declared in
  * src/metal_internal.h, so they have external linkage and can no longer be
  * inlined into the call sites below. They are all per-dispatch or
  * per-allocation, never per-element. The one-line accessors that ARE on the
@@ -75,31 +75,31 @@ void enc_attn_prefill(sg_enc *E, sg_gpu_layer *L, uint32_t layer_idx,
     uint32_t hd = c->head_dim;
     uint32_t eps = fbits(c->rms_eps);
     float scale = (float)(1.0 / sqrt((double)hd));
-    int gemm = gemm_kernel_for(g->model->wtype);
+    int gemm = sg_gemm_kernel_for(g->model->wtype);
     /* Task P1: per-head stride into g->b_qg, same rule as enc_attn's
      * decode-step twin. */
     uint32_t q_stride = c->attn_output_gate ? 2 * hd : hd;
 
     /* Q/K/V projections for the whole chunk in one tiled GEMM each:
      * Y[n, width] = b_h[n, hidden] @ W[width, hidden]^T. */
-    enc_matmul(E, gemm, g->b_h, 0, L->w_q, g->b_qg, 0, n, g->q_width, c->hidden);
+    sg_enc_matmul(E, gemm, g->b_h, 0, L->w_q, g->b_qg, 0, n, g->q_width, c->hidden);
     /* q_norm on every (token, head) query slice: n*n_heads slices of head_dim
      * at stride q_stride (2*head_dim when gated, head_dim when not), weight =
      * qk_norm[0..head_dim). Same in-place k_rmsnorm_heads the decode path
      * uses, applied across the chunk. */
-    enc_op(E, KI_RMSNORM_HEADS, g->b_qg, 0, L->qk_norm, 0, g->b_qg, 0, nil, 0,
-           PARAMS(hd, n * c->n_heads, eps, 1, q_stride));
+    sg_enc_op(E, KI_RMSNORM_HEADS, g->b_qg, 0, L->qk_norm, 0, g->b_qg, 0, nil, 0,
+              PARAMS(hd, n * c->n_heads, eps, 1, q_stride));
     /* Partial RoPE per token at its absolute position, from the chunk's cos/sin
      * table in g->b_cs. */
-    enc_op(E, KI_ROPE_CHUNK, g->b_qg, 0, g->b_cs, 0, g->b_qg, 0, nil, 0,
-           PARAMS(hd, c->rope_dim, c->n_heads, q_stride, n));
+    sg_enc_op(E, KI_ROPE_CHUNK, g->b_qg, 0, g->b_cs, 0, g->b_qg, 0, nil, 0,
+              PARAMS(hd, c->rope_dim, c->n_heads, q_stride, n));
 
-    enc_matmul(E, gemm, g->b_h, 0, L->w_k, g->b_k32, 0, n, g->kv_width, c->hidden);
-    enc_matmul(E, gemm, g->b_h, 0, L->w_v, g->b_v32, 0, n, g->kv_width, c->hidden);
-    enc_op(E, KI_RMSNORM_HEADS, g->b_k32, 0, L->qk_norm, hd, g->b_k32, 0, nil, 0,
-           PARAMS(hd, n * c->n_kv_heads, eps, 1, hd));
-    enc_op(E, KI_ROPE_CHUNK, g->b_k32, 0, g->b_cs, 0, g->b_k32, 0, nil, 0,
-           PARAMS(hd, c->rope_dim, c->n_kv_heads, hd, n));
+    sg_enc_matmul(E, gemm, g->b_h, 0, L->w_k, g->b_k32, 0, n, g->kv_width, c->hidden);
+    sg_enc_matmul(E, gemm, g->b_h, 0, L->w_v, g->b_v32, 0, n, g->kv_width, c->hidden);
+    sg_enc_op(E, KI_RMSNORM_HEADS, g->b_k32, 0, L->qk_norm, hd, g->b_k32, 0, nil, 0,
+              PARAMS(hd, n * c->n_kv_heads, eps, 1, hd));
+    sg_enc_op(E, KI_ROPE_CHUNK, g->b_k32, 0, g->b_cs, 0, g->b_k32, 0, nil, 0,
+              PARAMS(hd, c->rope_dim, c->n_kv_heads, hd, n));
 
     /* STORE: cast the chunk's finished K and V (f32) into the fp16 cache at
      * positions base..base+n-1. The chunk's [n, kv_width] rows map one-to-one
@@ -107,8 +107,8 @@ void enc_attn_prefill(sg_enc *E, sg_gpu_layer *L, uint32_t layer_idx,
      * store of n*kv_width elements at cache offset base*kv_width lands them. */
     void *kbuf = sg_kv_k(g->kv, layer_idx);
     void *vbuf = sg_kv_v(g->kv, layer_idx);
-    enc_kv_store(E, g->b_k32, kbuf, (uint64_t)base * g->kv_width, n * g->kv_width);
-    enc_kv_store(E, g->b_v32, vbuf, (uint64_t)base * g->kv_width, n * g->kv_width);
+    sg_enc_kv_store(E, g->b_k32, kbuf, (uint64_t)base * g->kv_width, n * g->kv_width);
+    sg_enc_kv_store(E, g->b_v32, vbuf, (uint64_t)base * g->kv_width, n * g->kv_width);
 
     /* ATTEND: k_attn_prefill over the now base+n-position cache, one
      * threadgroup per (token, head). Dispatched by hand (three device inputs),
@@ -132,10 +132,10 @@ void enc_attn_prefill(sg_enc *E, sg_gpu_layer *L, uint32_t layer_idx,
      * then o_proj, both chunked -- gate only when the model has one (Task
      * P1); dense qwen3 feeds g->b_ctx straight to o_proj unmodified. */
     if (c->attn_output_gate) {
-        enc_op(E, KI_GATE_STRIDED, g->b_ctx, 0, g->b_qg, 0, g->b_ctx, 0, nil, 0,
-               PARAMS(hd, n * c->n_heads, 2 * hd, hd));
+        sg_enc_op(E, KI_GATE_STRIDED, g->b_ctx, 0, g->b_qg, 0, g->b_ctx, 0, nil, 0,
+                  PARAMS(hd, n * c->n_heads, 2 * hd, hd));
     }
-    enc_matmul(E, gemm, g->b_ctx, 0, L->w_o, g->b_r, 0, n, c->hidden, g->attn_width);
+    sg_enc_matmul(E, gemm, g->b_ctx, 0, L->w_o, g->b_r, 0, n, c->hidden, g->attn_width);
 }
 
 /* GatedDeltaNet for a CHUNK of `n` tokens, the chunked twin of enc_gdn (Task
@@ -180,17 +180,17 @@ void enc_gdn_prefill(sg_enc *E, sg_gpu_layer *L, uint32_t layer_idx,
     uint32_t eps6 = fbits(1e-6f);
     uint32_t neg_exp = (g->model->ssm_a_form == SG_SSM_A_NEG_EXP) ? 1u : 0u;
     uint32_t tiled = g->model->v_heads_tiled ? 1u : 0u;
-    int gemm = gemm_kernel_for(g->model->wtype);
+    int gemm = sg_gemm_kernel_for(g->model->wtype);
     id<MTLComputeCommandEncoder> e = E->enc;
     (void)base;
 
     /* in_proj: qkv, a and b for the whole chunk (z is computed later, into the
      * b_qkv scratch the delta scan frees). a-chunk lands in b_ab[0..n*n_v), the
      * b-chunk in b_ab[n*n_v..2*n*n_v). */
-    enc_matmul(E, gemm, g->b_h, 0, L->w_qkv, g->b_qkv, 0, n, conv_dim, c->hidden);
-    enc_matmul(E, gemm, g->b_h, 0, L->w_a, g->b_ab, 0, n, c->n_v_heads, c->hidden);
-    enc_matmul(E, gemm, g->b_h, 0, L->w_b, g->b_ab, (uint64_t)n * c->n_v_heads,
-               n, c->n_v_heads, c->hidden);
+    sg_enc_matmul(E, gemm, g->b_h, 0, L->w_qkv, g->b_qkv, 0, n, conv_dim, c->hidden);
+    sg_enc_matmul(E, gemm, g->b_h, 0, L->w_a, g->b_ab, 0, n, c->n_v_heads, c->hidden);
+    sg_enc_matmul(E, gemm, g->b_h, 0, L->w_b, g->b_ab, (uint64_t)n * c->n_v_heads,
+                  n, c->n_v_heads, c->hidden);
 
     /* conv1d over the chunk (in place on b_qkv), threading the conv tail via
      * sg_kv, then SiLU in place. */
@@ -203,12 +203,12 @@ void enc_gdn_prefill(sg_enc *E, sg_gpu_layer *L, uint32_t layer_idx,
         [e setBuffer:bufof(g->b_qkv) offset:(NSUInteger)offof(g->b_qkv) atIndex:2];
         [e setBytes:pc length:8 * sizeof(uint32_t) atIndex:3];
         [e setBuffer:bufof(conv_state) offset:(NSUInteger)offof(conv_state) atIndex:4];
-        NSUInteger w = gpu_elem_width(g, KI_CONV1D_CHUNK, conv_dim);
+        NSUInteger w = sg_gpu_elem_width(g, KI_CONV1D_CHUNK, conv_dim);
         [e dispatchThreads:MTLSizeMake(conv_dim, 1, 1)
         threadsPerThreadgroup:MTLSizeMake(w, 1, 1)];
     }
-    enc_op(E, KI_SILU, g->b_qkv, 0, NULL, 0, g->b_qkv, 0, nil, 0,
-           PARAMS(n * conv_dim));
+    sg_enc_op(E, KI_SILU, g->b_qkv, 0, NULL, 0, g->b_qkv, 0, nil, 0,
+              PARAMS(n * conv_dim));
 
     /* q and k RMS-normed per key head (no weight, hardcoded eps 1e-6) then
      * scaled (q by 1/head_k_dim, k by 1/sqrt(head_k_dim)), exactly enc_gdn's
@@ -217,16 +217,16 @@ void enc_gdn_prefill(sg_enc *E, sg_gpu_layer *L, uint32_t layer_idx,
      * so a single strided k_rmsnorm_heads cannot span the chunk. */
     for (uint32_t t = 0; t < n; t++) {
         uint64_t roff = (uint64_t)t * conv_dim;
-        enc_op(E, KI_RMSNORM_HEADS, g->b_qkv, roff, NULL, 0, g->b_qkv, roff, nil, 0,
-               PARAMS(dk, c->n_k_heads, eps6, 0, dk));
-        enc_op(E, KI_RMSNORM_HEADS, g->b_qkv, roff + key_dim, NULL, 0,
-               g->b_qkv, roff + key_dim, nil, 0,
-               PARAMS(dk, c->n_k_heads, eps6, 0, dk));
-        enc_op(E, KI_SCALE, g->b_qkv, roff, NULL, 0, g->b_qkv, roff, nil, 0,
-               PARAMS(key_dim, fbits((float)(inv * inv))));
-        enc_op(E, KI_SCALE, g->b_qkv, roff + key_dim, NULL, 0,
-               g->b_qkv, roff + key_dim, nil, 0,
-               PARAMS(key_dim, fbits((float)inv)));
+        sg_enc_op(E, KI_RMSNORM_HEADS, g->b_qkv, roff, NULL, 0, g->b_qkv, roff, nil, 0,
+                  PARAMS(dk, c->n_k_heads, eps6, 0, dk));
+        sg_enc_op(E, KI_RMSNORM_HEADS, g->b_qkv, roff + key_dim, NULL, 0,
+                  g->b_qkv, roff + key_dim, nil, 0,
+                  PARAMS(dk, c->n_k_heads, eps6, 0, dk));
+        sg_enc_op(E, KI_SCALE, g->b_qkv, roff, NULL, 0, g->b_qkv, roff, nil, 0,
+                  PARAMS(key_dim, fbits((float)(inv * inv))));
+        sg_enc_op(E, KI_SCALE, g->b_qkv, roff + key_dim, NULL, 0,
+                  g->b_qkv, roff + key_dim, nil, 0,
+                  PARAMS(key_dim, fbits((float)inv)));
     }
 
     /* gates for the whole chunk (a = b_ab[0..], b = b_ab[n*n_v..]). */
@@ -241,7 +241,7 @@ void enc_gdn_prefill(sg_enc *E, sg_gpu_layer *L, uint32_t layer_idx,
         [e setBytes:pg length:8 * sizeof(uint32_t) atIndex:3];
         [e setBuffer:bufof(L->a_dt) offset:(NSUInteger)offof(L->a_dt) atIndex:4];
         uint64_t elems = (uint64_t)n * c->n_v_heads;
-        NSUInteger w = gpu_elem_width(g, KI_DELTA_GATES_CHUNK, elems);
+        NSUInteger w = sg_gpu_elem_width(g, KI_DELTA_GATES_CHUNK, elems);
         [e dispatchThreads:MTLSizeMake((NSUInteger)elems, 1, 1)
         threadsPerThreadgroup:MTLSizeMake(w, 1, 1)];
     }
@@ -263,7 +263,7 @@ void enc_gdn_prefill(sg_enc *E, sg_gpu_layer *L, uint32_t layer_idx,
 
     /* z = w_z @ h into the now-free b_qkv scratch, then RMSNormGated
      * (silu(z) * rms_norm(y, ssm_norm)) over the chunk, in place on b_y. */
-    enc_matmul(E, gemm, g->b_h, 0, L->w_z, g->b_qkv, 0, n, value_dim, c->hidden);
+    sg_enc_matmul(E, gemm, g->b_h, 0, L->w_z, g->b_qkv, 0, n, value_dim, c->hidden);
     {
         const uint32_t pn[8] = { dv, c->n_v_heads, fbits(c->rms_eps), n, 0, 0, 0, 0 };
         [e setComputePipelineState:g->pipes[KI_RMSNORM_GATED_CHUNK]];
@@ -279,7 +279,7 @@ void enc_gdn_prefill(sg_enc *E, sg_gpu_layer *L, uint32_t layer_idx,
             threadsPerThreadgroup:MTLSizeMake(SG_TG, 1, 1)];
     }
 
-    enc_matmul(E, gemm, g->b_y, 0, L->w_out, g->b_r, 0, n, c->hidden, value_dim);
+    sg_enc_matmul(E, gemm, g->b_y, 0, L->w_out, g->b_r, 0, n, c->hidden, value_dim);
 }
 
 /* --------------------------------------------------------------------
@@ -504,7 +504,7 @@ sg_err sg_gpu_prefill(sg_gpu *g, const sg_model *m, const int32_t *tokens,
         if (g->ls[i].is_attn) n_attn++; else n_gdn++;
     }
 
-    int gemm = gemm_kernel_for(m->wtype);
+    int gemm = sg_gemm_kernel_for(m->wtype);
     uint32_t eps = fbits(c->rms_eps);
     uint32_t half = c->rope_dim / 2u;
 
@@ -518,7 +518,7 @@ sg_err sg_gpu_prefill(sg_gpu *g, const sg_model *m, const int32_t *tokens,
 
     sg_err e = SG_OK;
 #define PF_ALLOC(field, nelem, hostpp) do { \
-        e = gpu_alloc_f32(g, (uint64_t)(nelem), &g->field, (hostpp)); \
+        e = sg_gpu_alloc_f32(g, (uint64_t)(nelem), &g->field, (hostpp)); \
         if (sg_failed(e)) goto cleanup; \
     } while (0)
 
@@ -591,8 +591,8 @@ sg_err sg_gpu_prefill(sg_gpu *g, const sg_model *m, const int32_t *tokens,
 
         /* Host embedding for the chunk (ref.c's wrow, exactly like decode). */
         for (uint32_t t = 0; t < n; t++) {
-            gpu_embed_row(m->tok_emb, m->wtype, (uint64_t)tokens[base + t],
-                          c->hidden, g->h_x + (size_t)t * c->hidden);
+            sg_gpu_embed_row(m->tok_emb, m->wtype, (uint64_t)tokens[base + t],
+                             c->hidden, g->h_x + (size_t)t * c->hidden);
         }
         /* Per-token RoPE cos/sin table in double, uploaded f32: one row per
          * absolute position, [cos(rope_dim/2), sin(rope_dim/2)], byte-identical
@@ -620,7 +620,7 @@ sg_err sg_gpu_prefill(sg_gpu *g, const sg_model *m, const int32_t *tokens,
                 e = (sg_err){"gpu: prefill score-scratch size overflows 64 bits"};
                 goto cleanup;
             }
-            e = scratch_ensure(g, need);
+            e = sg_scratch_ensure(g, need);
             if (sg_failed(e)) goto cleanup;
         }
 
@@ -662,25 +662,25 @@ sg_err sg_gpu_prefill(sg_gpu *g, const sg_model *m, const int32_t *tokens,
                      * formula and tg_sum tree), so ln1/ln2 are bit-identical to
                      * decode per token and the only prefill-vs-decode numeric
                      * gap is GEMM-vs-matvec reassociation. */
-                    enc_op(&E, KI_RMSNORM_HEADS, g->b_x, 0, L->ln1, 0, g->b_h, 0,
-                           nil, 0, PARAMS(c->hidden, n, eps, 1, c->hidden));
+                    sg_enc_op(&E, KI_RMSNORM_HEADS, g->b_x, 0, L->ln1, 0, g->b_h, 0,
+                              nil, 0, PARAMS(c->hidden, n, eps, 1, c->hidden));
                     if (L->is_attn) enc_attn_prefill(&E, L, i, base, n);
                     else            enc_gdn_prefill(&E, L, i, base, n);
-                    enc_op(&E, KI_ADD, g->b_x, 0, g->b_r, 0, g->b_x, 0, nil, 0,
-                           PARAMS(n * c->hidden));
+                    sg_enc_op(&E, KI_ADD, g->b_x, 0, g->b_r, 0, g->b_x, 0, nil, 0,
+                              PARAMS(n * c->hidden));
 
-                    enc_op(&E, KI_RMSNORM_HEADS, g->b_x, 0, L->ln2, 0, g->b_h, 0,
-                           nil, 0, PARAMS(c->hidden, n, eps, 1, c->hidden));
-                    enc_matmul(&E, gemm, g->b_h, 0, L->w_gate, g->b_ffg, 0,
-                               n, c->ffn_hidden, c->hidden);
-                    enc_matmul(&E, gemm, g->b_h, 0, L->w_up, g->b_ffu, 0,
-                               n, c->ffn_hidden, c->hidden);
-                    enc_op(&E, KI_SWIGLU, g->b_ffg, 0, g->b_ffu, 0, g->b_ffg, 0,
-                           nil, 0, PARAMS(n * c->ffn_hidden));
-                    enc_matmul(&E, gemm, g->b_ffg, 0, L->w_down, g->b_r, 0,
-                               n, c->hidden, c->ffn_hidden);
-                    enc_op(&E, KI_ADD, g->b_x, 0, g->b_r, 0, g->b_x, 0, nil, 0,
-                           PARAMS(n * c->hidden));
+                    sg_enc_op(&E, KI_RMSNORM_HEADS, g->b_x, 0, L->ln2, 0, g->b_h, 0,
+                              nil, 0, PARAMS(c->hidden, n, eps, 1, c->hidden));
+                    sg_enc_matmul(&E, gemm, g->b_h, 0, L->w_gate, g->b_ffg, 0,
+                                  n, c->ffn_hidden, c->hidden);
+                    sg_enc_matmul(&E, gemm, g->b_h, 0, L->w_up, g->b_ffu, 0,
+                                  n, c->ffn_hidden, c->hidden);
+                    sg_enc_op(&E, KI_SWIGLU, g->b_ffg, 0, g->b_ffu, 0, g->b_ffg, 0,
+                              nil, 0, PARAMS(n * c->ffn_hidden));
+                    sg_enc_matmul(&E, gemm, g->b_ffg, 0, L->w_down, g->b_r, 0,
+                                  n, c->hidden, c->ffn_hidden);
+                    sg_enc_op(&E, KI_ADD, g->b_x, 0, g->b_r, 0, g->b_x, 0, nil, 0,
+                              PARAMS(n * c->hidden));
                 }
                 /* Logits belong to the FINAL segment of the final chunk, so
                  * that b_x already carries every layer's contribution. */
@@ -689,11 +689,11 @@ sg_err sg_gpu_prefill(sg_gpu *g, const sg_model *m, const int32_t *tokens,
                      * that row (KI_RMSNORM_HEADS, heads=1, reading b_x at the
                      * last token's offset) then lm_head via the matvec kernel,
                      * exactly decode's final two ops. */
-                    enc_op(&E, KI_RMSNORM_HEADS, g->b_x,
-                           (uint64_t)(n - 1) * c->hidden, g->out_norm, 0,
-                           g->b_h, 0, nil, 0, PARAMS(c->hidden, 1, eps, 1, c->hidden));
-                    enc_op(&E, g->mat_kernel, g->lm_head, 0, g->b_h, 0,
-                           g->b_logits, 0, nil, 0, PARAMS(c->vocab, c->hidden));
+                    sg_enc_op(&E, KI_RMSNORM_HEADS, g->b_x,
+                              (uint64_t)(n - 1) * c->hidden, g->out_norm, 0,
+                              g->b_h, 0, nil, 0, PARAMS(c->hidden, 1, eps, 1, c->hidden));
+                    sg_enc_op(&E, g->mat_kernel, g->lm_head, 0, g->b_h, 0,
+                              g->b_logits, 0, nil, 0, PARAMS(c->vocab, c->hidden));
                 }
                 [enc endEncoding];
                 t_gpu0 = pf_now_s();
@@ -701,8 +701,8 @@ sg_err sg_gpu_prefill(sg_gpu *g, const sg_model *m, const int32_t *tokens,
                 [cb waitUntilCompleted];
                 t_gpu1 = pf_now_s();
                 if ([cb error]) {
-                    rc = gpu_errf("gpu: prefill chunk failed: %s",
-                                  [[[cb error] localizedDescription] UTF8String]);
+                    rc = sg_gpu_errf("gpu: prefill chunk failed: %s",
+                                     [[[cb error] localizedDescription] UTF8String]);
                 }
             }
         }

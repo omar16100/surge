@@ -127,7 +127,7 @@ static inline float attn_combine_weight(float mi, float M) {
 /* One threadgroup per (query head, split), a 2D grid dispatched as
  * (x = split, y = head); the host's SG_K_HEADS2D class is what carries those
  * two group dimensions, since SG_K_ATTN's single *groups count cannot (see
- * gpu_grid in metal_validate.m, and the SG_K_TILES2D precedent it follows;
+ * sg_gpu_grid in metal_validate.m, and the SG_K_TILES2D precedent it follows;
  * both SG_K_ kinds are declared in metal_internal.h since task R3).
  *
  * Buffers: q f32 [n_heads, q_stride]; kc, vc f16 [seq, n_kv_heads, head_dim]
@@ -627,14 +627,14 @@ kernel void k_attn_decode_splitk_partial_gqa(device const float *q [[buffer(0)]]
 
     uint repeat = n_heads / n_kv;
     /* UNREACHABLE through metal.m's entry points, which reject n_kv_heads == 0
-     * and n_heads % n_kv_heads != 0 before encoding anything (check_params).
+     * and n_heads % n_kv_heads != 0 before encoding anything (sg_check_params).
      * Guarded anyway, and as a no-op rather than a best effort: with a group
      * size that does not tile n_heads exactly, the group starting at hk*repeat
      * would run off the end of the m/s/acc buffers, and a wild write is far
      * worse than an unwritten one. NOTE WHAT "UNWRITTEN" MEANS, though: the
      * m/s/acc buffers keep whatever they held, and the combine consumes those
      * stale bytes without complaint. This is a last resort against memory
-     * corruption, NOT a diagnostic; check_params is where a bad shape is
+     * corruption, NOT a diagnostic; sg_check_params is where a bad shape is
      * supposed to be caught, and it is. */
     if (repeat == 0u || n_kv * repeat != n_heads) return;
 
@@ -1226,7 +1226,7 @@ kernel void k_attn_decode_splitk_partial_gqa_online(device const float *q [[buff
     if (n_kv == 0u || hd == 0u || hk >= n_kv || part >= n_splits) return;
 
     uint repeat = n_heads / n_kv;
-    /* UNREACHABLE through metal.m's entry points (check_params, in
+    /* UNREACHABLE through metal.m's entry points (sg_check_params, in
      * metal_validate.m since task R3, rejects
      * n_kv_heads == 0 and n_heads % n_kv_heads != 0 first). Guarded as a no-op
      * for the reason the four-pass kernel states: with a group size that does

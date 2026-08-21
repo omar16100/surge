@@ -47,7 +47,7 @@
 #define SG_TG 256u
 
 /* The GRID KIND of a kernel: how its grid is derived from params[]. Moved here
- * from src/metal.m by task R3, because gpu_grid (the switch that reads it) is
+ * from src/metal.m by task R3, because sg_gpu_grid (the switch that reads it) is
  * now in src/metal_validate.m while the SG_KERNELS table that assigns it and
  * sg_gpu_init's threadgroup-width check that consults it both stayed in
  * src/metal.m. An anonymous enum is a declaration with no storage and no
@@ -69,19 +69,19 @@ enum {
     SG_K_GROUPS2, /* params[2] threadgroups of SG_TG */
     /* M5.3: a 2D grid of ceil(params[1]/SG_GEMM_TN) x ceil(params[0]/SG_GEMM_TM)
      * threadgroups of SG_TG, one per GEMM output tile. Computed by hand in
-     * sg_gpu_run_op (not by gpu_grid, which only returns a 1D count) because
+     * sg_gpu_run_op (not by sg_gpu_grid, which only returns a 1D count) because
      * this is the only kind whose group count needs two dimensions. */
     SG_K_TILES2D,
     /* M5.4: k_rope_chunk, one thread per (token, head, element) of the chunk,
      * params[0]*params[2]*params[4] = head_dim*heads*n_tok threads, non-uniform
      * threadgroups. An elementwise kernel with no reduction, dispatched through
-     * gpu_grid's *elems path like SG_K_ELEM but with a 3-factor count. */
+     * sg_gpu_grid's *elems path like SG_K_ELEM but with a 3-factor count. */
     SG_K_ROPE_CHUNK,
     /* P2.2: the split-K decode-attention partial kernel's grid, a 2D
      * params[6] x params[0] (split, query head) block of threadgroups of
      * SG_TG. The SECOND kind after SG_K_TILES2D that needs two group
      * dimensions and for the same reason SG_K_ATTN cannot be reused: that
-     * class carries exactly one *groups count (see gpu_grid in
+     * class carries exactly one *groups count (see sg_gpu_grid in
      * src/metal_validate.m), so it can express "one threadgroup per head" and
      * nothing wider. Computed by hand in sg_gpu_run_attn_splitk_partial, which
      * is the only path that reaches the kernel at all (it takes six device
@@ -149,10 +149,10 @@ typedef struct {
  * params/buffer mismatch is an out-of-bounds DEVICE read: not a crash the
  * process can catch, but a GPU fault that takes down the whole context (and
  * on a bad day the display driver). Hence a size precondition per kernel,
- * checked by check_sizes in src/metal_validate.m, before anything is encoded.
+ * checked by sg_check_sizes in src/metal_validate.m, before anything is encoded.
  *
  * `static inline` and in this header since task R3, for the same reason the
- * other one-liners here are. check_sizes moved to src/metal_validate.m and
+ * other one-liners here are. sg_check_sizes moved to src/metal_validate.m and
  * needs it, but twenty-six of its twenty-nine call sites are the one-shot
  * entry points that stayed in src/metal.m. A two-instruction predicate behind
  * a real call at all twenty-nine would be pure loss, and it would add one more
@@ -211,7 +211,7 @@ struct sg_gpu {
      *
      * ONE ALLOCATION, SHARED BY EVERY USER, ALWAYS BOUND AT OFFSET 0:
      * k_attn_decode, k_attn_decode_f16, k_attn_prefill and sg_gpu_forward's
-     * encoder all point at these same bytes. scratch_ensure only ever GROWS
+     * encoder all point at these same bytes. sg_scratch_ensure only ever GROWS
      * it; it never partitions it and hands nobody a private range. That is
      * safe today because each of those is either its own commit-and-wait or
      * the only scratch user in the command buffer it is encoded into, and it
@@ -459,37 +459,37 @@ typedef struct {
 /* Format an error whose text quotes a runtime detail into metal.m's single
  * static message buffer. Single-threaded contract, as ever. */
 __attribute__((format(printf, 1, 2)))
-sg_err gpu_errf(const char *fmt, ...);
+sg_err sg_gpu_errf(const char *fmt, ...);
 
 /* Grow g->scratch to at least nbytes (the shared per-head score row). */
-sg_err scratch_ensure(sg_gpu *g, uint64_t nbytes);
+sg_err sg_scratch_ensure(sg_gpu *g, uint64_t nbytes);
 
 /* Threadgroup width for an elementwise dispatch of `elems` threads. */
-NSUInteger gpu_elem_width(sg_gpu *g, int ki, uint64_t elems);
+NSUInteger sg_gpu_elem_width(sg_gpu *g, int ki, uint64_t elems);
 
 /* The tiled-GEMM kernel index for a weight tensor of the given dtype. */
-int gemm_kernel_for(sg_tensor_type t);
+int sg_gemm_kernel_for(sg_tensor_type t);
 
 /* One embedding row widened into f32, bit-identical to ref.c's wrow. */
-void gpu_embed_row(const void *w, sg_tensor_type t, uint64_t row,
-                   uint32_t cols, float *out);
+void sg_gpu_embed_row(const void *w, sg_tensor_type t, uint64_t row,
+                      uint32_t cols, float *out);
 
 /* Allocate n floats of shared-storage device memory and hand back both the
  * handle and, optionally, the host pointer. */
-sg_err gpu_alloc_f32(sg_gpu *g, uint64_t n, void **buf, float **host);
+sg_err sg_gpu_alloc_f32(sg_gpu *g, uint64_t n, void **buf, float **host);
 
 /* One dispatch into an already-open encoder; see the definition's comment for
  * what `ao`/`bo`/`oo` and `aux` mean. */
-void enc_op(sg_enc *E, int ki, void *a, uint64_t ao, void *b, uint64_t bo,
-            void *o, uint64_t oo, id<MTLBuffer> aux, uint64_t auxoff,
-            const uint32_t *p);
+void sg_enc_op(sg_enc *E, int ki, void *a, uint64_t ao, void *b, uint64_t bo,
+               void *o, uint64_t oo, id<MTLBuffer> aux, uint64_t auxoff,
+               const uint32_t *p);
 
 /* Cast n f32 elements into the fp16 KV cache at a destination offset. */
-void enc_kv_store(sg_enc *E, void *src, void *dst, uint64_t dst_off, uint32_t n);
+void sg_enc_kv_store(sg_enc *E, void *src, void *dst, uint64_t dst_off, uint32_t n);
 
 /* One tiled-GEMM dispatch, Y[n, m] = X[n, k] @ W[m, k]^T. */
-void enc_matmul(sg_enc *E, int ki, void *x, uint64_t xoff, void *w,
-                void *y, uint64_t yoff, uint32_t nn, uint32_t mm, uint32_t kk);
+void sg_enc_matmul(sg_enc *E, int ki, void *x, uint64_t xoff, void *w,
+                   void *y, uint64_t yoff, uint32_t nn, uint32_t mm, uint32_t kk);
 
 /* --------------------------------------------------------------------
  * The helpers that cross the seam, DEFINED IN src/metal_validate.m
@@ -499,20 +499,20 @@ void enc_matmul(sg_enc *E, int ki, void *x, uint64_t xoff, void *w,
  * src/metal_validate.m is called from there; all six call sites of the three
  * below stayed in src/metal.m, so it is the MOVED code that had to lose
  * `static`, not the code it calls. All three are per-DISPATCH (once per
- * sg_gpu_run_op call, once per encoded dispatch for gpu_grid), never per
+ * sg_gpu_run_op call, once per encoded dispatch for sg_gpu_grid), never per
  * element, so the cost is one call each. */
 
 /* Buffer-size preconditions per kernel name; see the definition. One caller,
  * sg_gpu_run_op. */
-sg_err check_sizes(const char *kernel, const sg_gpu_buf *a, const sg_gpu_buf *b,
-                   const sg_gpu_buf *o, const uint32_t *p);
+sg_err sg_check_sizes(const char *kernel, const sg_gpu_buf *a, const sg_gpu_buf *b,
+                      const sg_gpu_buf *o, const uint32_t *p);
 
 /* Per-kernel preconditions that are not about buffer sizes. Three callers, all
  * one-shot entry points in src/metal.m. */
-sg_err check_params(const char *kernel, const uint32_t *p);
+sg_err sg_check_params(const char *kernel, const uint32_t *p);
 
 /* Grid geometry from the kernel's SG_K_* kind and its params. Two callers,
- * sg_gpu_run_op and enc_op. */
-void gpu_grid(int kind, const uint32_t *p, uint64_t *groups, uint64_t *elems);
+ * sg_gpu_run_op and sg_enc_op. */
+void sg_gpu_grid(int kind, const uint32_t *p, uint64_t *groups, uint64_t *elems);
 
 #endif /* SURGE_METAL_INTERNAL_H */

@@ -8,7 +8,7 @@
  * (Task M5.6's sg_gpu_prefill, its B8 duty-cycle controls, and the M5.4/M5.5
  * per-layer chunk encoders enc_attn_prefill / enc_gdn_prefill) is in
  * src/metal_prefill.m; the per-dispatch validation and grid geometry
- * (check_sizes, check_params, gpu_grid) is in src/metal_validate.m. What the
+ * (sg_check_sizes, sg_check_params, sg_gpu_grid) is in src/metal_validate.m. What the
  * three share -- struct sg_gpu, the KI_ kernel index enum, the SG_K_* grid-kind
  * enum, sg_enc, and the helpers listed at the bottom of it -- is declared once
  * in src/metal_internal.h. Decode never calls prefill, so the traffic across
@@ -57,7 +57,7 @@
 static char g_errbuf[512];
 
 __attribute__((format(printf, 1, 2)))
-sg_err gpu_errf(const char *fmt, ...) {
+sg_err sg_gpu_errf(const char *fmt, ...) {
     va_list ap;
     va_start(ap, fmt);
     vsnprintf(g_errbuf, sizeof g_errbuf, fmt, ap);
@@ -70,11 +70,11 @@ sg_err gpu_errf(const char *fmt, ...) {
  * --------------------------------------------------------------------
  *
  * The SG_K_* grid-kind enum this table's `kind` column is drawn from moved to
- * src/metal_internal.h in task R3, with gpu_grid (the switch that reads it,
+ * src/metal_internal.h in task R3, with sg_gpu_grid (the switch that reads it,
  * now in src/metal_validate.m). The table itself, SG_N_KERNELS and the
  * _Static_assert below stayed here, because five functions in this file read
  * them: sg_gpu_free, sg_gpu_init, sg_gpu_run_op, gpu_run_delta_common and
- * enc_op. */
+ * sg_enc_op. */
 
 /* The largest GQA group (n_heads / n_kv_heads) k_attn_decode_splitk_partial_gqa
  * keeps in registers, mirroring kernels.metal's SG_SPLITK_GQA_MAX constant of
@@ -273,8 +273,8 @@ sg_err sg_gpu_init(sg_gpu **out) {
         /* newLibraryWithURL: is already +1, so no retain here. */
         g->lib = [g->dev newLibraryWithURL:[NSURL fileURLWithPath:path] error:&err];
         if (!g->lib) {
-            sg_err e = gpu_errf("gpu: cannot load %s: %s", [path UTF8String],
-                                err ? [[err localizedDescription] UTF8String] : "unknown error");
+            sg_err e = sg_gpu_errf("gpu: cannot load %s: %s", [path UTF8String],
+                                   err ? [[err localizedDescription] UTF8String] : "unknown error");
             sg_gpu_free(g);
             return e;
         }
@@ -286,16 +286,16 @@ sg_err sg_gpu_init(sg_gpu **out) {
             NSString *nm = [NSString stringWithUTF8String:SG_KERNELS[i].name];
             id<MTLFunction> fn = [g->lib newFunctionWithName:nm];
             if (!fn) {
-                sg_err e = gpu_errf("gpu: kernel '%s' missing from the metallib",
-                                    SG_KERNELS[i].name);
+                sg_err e = sg_gpu_errf("gpu: kernel '%s' missing from the metallib",
+                                       SG_KERNELS[i].name);
                 sg_gpu_free(g);
                 return e;
             }
             g->pipes[i] = [g->dev newComputePipelineStateWithFunction:fn error:&err];
             [fn release];
             if (!g->pipes[i]) {
-                sg_err e = gpu_errf("gpu: pipeline for '%s' failed: %s", SG_KERNELS[i].name,
-                                    err ? [[err localizedDescription] UTF8String] : "unknown error");
+                sg_err e = sg_gpu_errf("gpu: pipeline for '%s' failed: %s", SG_KERNELS[i].name,
+                                       err ? [[err localizedDescription] UTF8String] : "unknown error");
                 sg_gpu_free(g);
                 return e;
             }
@@ -306,10 +306,10 @@ sg_err sg_gpu_init(sg_gpu **out) {
              * assume. */
             if (SG_KERNELS[i].kind != SG_K_ELEM &&
                 [g->pipes[i] maxTotalThreadsPerThreadgroup] < SG_TG) {
-                sg_err e = gpu_errf("gpu: '%s' allows only %lu threads per threadgroup, need %u",
-                                    SG_KERNELS[i].name,
-                                    (unsigned long)[g->pipes[i] maxTotalThreadsPerThreadgroup],
-                                    SG_TG);
+                sg_err e = sg_gpu_errf("gpu: '%s' allows only %lu threads per threadgroup, need %u",
+                                       SG_KERNELS[i].name,
+                                       (unsigned long)[g->pipes[i] maxTotalThreadsPerThreadgroup],
+                                       SG_TG);
                 sg_gpu_free(g);
                 return e;
             }
@@ -353,8 +353,8 @@ sg_err sg_gpu_wrap(sg_gpu *g, const void *ptr, uint64_t nbytes, void **buf_out) 
      * offset is a real case; see sg_st_read_f32's note. Those get copied, not
      * wrapped.) */
     if (base % 4 != 0) {
-        return gpu_errf("gpu: sg_gpu_wrap needs a 4-byte aligned pointer (offset %llu)",
-                        (unsigned long long)(base % 4));
+        return sg_gpu_errf("gpu: sg_gpu_wrap needs a 4-byte aligned pointer (offset %llu)",
+                           (unsigned long long)(base % 4));
     }
 
     uintptr_t aligned = base & ~(uintptr_t)(page - 1);
@@ -378,9 +378,9 @@ sg_err sg_gpu_wrap(sg_gpu *g, const void *ptr, uint64_t nbytes, void **buf_out) 
     len = (len + page - 1) & ~(page - 1);
 
     if (len > [g->dev maxBufferLength]) {
-        return gpu_errf("gpu: %llu bytes exceeds the device limit of %llu",
-                        (unsigned long long)len,
-                        (unsigned long long)[g->dev maxBufferLength]);
+        return sg_gpu_errf("gpu: %llu bytes exceeds the device limit of %llu",
+                           (unsigned long long)len,
+                           (unsigned long long)[g->dev maxBufferLength]);
     }
 
     sg_gpu_buf *b = calloc(1, sizeof *b);
@@ -411,9 +411,9 @@ sg_err sg_gpu_alloc(sg_gpu *g, uint64_t nbytes, void **buf_out, void **host_out)
     if (host_out) *host_out = NULL;
     if (nbytes == 0) return (sg_err){"gpu: cannot allocate a zero-length buffer"};
     if (nbytes > [g->dev maxBufferLength]) {
-        return gpu_errf("gpu: %llu bytes exceeds the device limit of %llu",
-                        (unsigned long long)nbytes,
-                        (unsigned long long)[g->dev maxBufferLength]);
+        return sg_gpu_errf("gpu: %llu bytes exceeds the device limit of %llu",
+                           (unsigned long long)nbytes,
+                           (unsigned long long)[g->dev maxBufferLength]);
     }
 
     sg_gpu_buf *b = calloc(1, sizeof *b);
@@ -491,7 +491,7 @@ static bool bufs_overlap(const sg_gpu_buf *x, const sg_gpu_buf *y) {
 /* k_attn_decode's scores live in device memory, one private row of seq_len
  * floats per head, so nothing about the context length is capped by the
  * 32 KB threadgroup allocation. */
-sg_err scratch_ensure(sg_gpu *g, uint64_t nbytes) {
+sg_err sg_scratch_ensure(sg_gpu *g, uint64_t nbytes) {
     if (g->scratch && g->scratch_bytes >= nbytes) return SG_OK;
     id<MTLBuffer> nb = nil;
     @autoreleasepool {
@@ -499,8 +499,8 @@ sg_err scratch_ensure(sg_gpu *g, uint64_t nbytes) {
                                  options:MTLResourceStorageModePrivate];
     }
     if (!nb) {
-        return gpu_errf("gpu: cannot allocate %llu bytes of scratch",
-                        (unsigned long long)nbytes);
+        return sg_gpu_errf("gpu: cannot allocate %llu bytes of scratch",
+                           (unsigned long long)nbytes);
     }
     [g->scratch release];
     g->scratch = nb;
@@ -510,7 +510,7 @@ sg_err scratch_ensure(sg_gpu *g, uint64_t nbytes) {
 
 /* The same grow-on-demand allocator for the split-K partial's OWN score
  * buffer (P2.2 review finding 1). Deliberately a second function rather than
- * a refactor of scratch_ensure into a shared (buffer, bytes) helper: that
+ * a refactor of sg_scratch_ensure into a shared (buffer, bytes) helper: that
  * would have rewritten the allocation path every existing Metal gate runs
  * through, and the point of the finding was to add isolation, not to churn
  * the code the isolated-from kernels depend on. The duplication is fifteen
@@ -524,8 +524,8 @@ static sg_err splitk_scratch_ensure(sg_gpu *g, uint64_t nbytes) {
                                  options:MTLResourceStorageModePrivate];
     }
     if (!nb) {
-        return gpu_errf("gpu: cannot allocate %llu bytes of split-K score scratch",
-                        (unsigned long long)nbytes);
+        return sg_gpu_errf("gpu: cannot allocate %llu bytes of split-K score scratch",
+                           (unsigned long long)nbytes);
     }
     [g->splitk_scratch release];
     g->splitk_scratch = nb;
@@ -723,7 +723,7 @@ static bool splitk_gqa_use(const sg_gpu *g, uint32_t n_heads, uint32_t n_kv,
  * kernel keeps its running acc in registers by giving each thread exactly one
  * output dim, which works while head_dim fits one SG_TG-wide band. Past that
  * the kernel re-streams the split (and re-reads K) once per band: still exactly
- * correct, which is why the one-shot entry point accepts it and check_params
+ * correct, which is why the one-shot entry point accepts it and sg_check_params
  * (src/metal_validate.m) does not reject it, but strictly more traffic than the
  * four-pass kernel it is
  * supposed to beat. Both real shapes are inside the bound (27B head_dim 256 ==
@@ -912,12 +912,12 @@ sg_err sg_gpu_run_op(sg_gpu *g, const char *kernel, void *a, void *b, void *out,
     for (int i = 0; i < SG_N_KERNELS; i++) {
         if (strcmp(SG_KERNELS[i].name, kernel) == 0) { idx = i; break; }
     }
-    if (idx < 0) return gpu_errf("gpu: unknown kernel '%s'", kernel);
+    if (idx < 0) return sg_gpu_errf("gpu: unknown kernel '%s'", kernel);
 
     sg_gpu_buf *ab = (sg_gpu_buf *)a, *bb = (sg_gpu_buf *)b, *ob = (sg_gpu_buf *)out;
-    sg_err e = check_params(kernel, params);
+    sg_err e = sg_check_params(kernel, params);
     if (sg_failed(e)) return e;
-    e = check_sizes(kernel, ab, bb, ob, params);
+    e = sg_check_sizes(kernel, ab, bb, ob, params);
     if (sg_failed(e)) return e;
     /* surge.h forbids `out` overlapping an input, and the reason is not
      * style: a threadgroup that has already written its output row would be
@@ -928,7 +928,7 @@ sg_err sg_gpu_run_op(sg_gpu *g, const char *kernel, void *a, void *b, void *out,
      * which is `a`, and k_conv1d_step's carried state lives inside `out`, so
      * neither of them wants out to overlap an input either. */
     if (bufs_overlap(ab, ob) || bufs_overlap(bb, ob)) {
-        return gpu_errf("gpu: %s output overlaps an input buffer", kernel);
+        return sg_gpu_errf("gpu: %s output overlaps an input buffer", kernel);
     }
 
     /* Grid geometry. A zero threadgroup count is a Metal API violation
@@ -936,13 +936,13 @@ sg_err sg_gpu_run_op(sg_gpu *g, const char *kernel, void *a, void *b, void *out,
     int kind = SG_KERNELS[idx].kind;
     uint64_t groups = 1, elems = 0;
     uint64_t tiles_m = 0, tiles_n = 0;
-    gpu_grid(kind, params, &groups, &elems);
+    sg_gpu_grid(kind, params, &groups, &elems);
     if (kind == SG_K_ELEM || kind == SG_K_ELEM01 || kind == SG_K_ELEM02
         || kind == SG_K_ROPE_CHUNK) {
-        if (elems == 0) return gpu_errf("gpu: %s dispatched with zero elements", kernel);
+        if (elems == 0) return sg_gpu_errf("gpu: %s dispatched with zero elements", kernel);
     } else if (kind == SG_K_TILES2D) {
         /* Two group dimensions: params[0]=N tiles vertically, params[1]=M
-         * tiles horizontally. check_params (src/metal_validate.m) has already
+         * tiles horizontally. sg_check_params (src/metal_validate.m) has already
          * rejected N == 0 and
          * M == 0 for every k_matmul_* kernel, so both ceil-divisions here are
          * already known nonzero; the explicit check below is a second,
@@ -950,16 +950,16 @@ sg_err sg_gpu_run_op(sg_gpu *g, const char *kernel, void *a, void *b, void *out,
         tiles_n = ((uint64_t)params[0] + SG_GEMM_TM - 1) / SG_GEMM_TM;
         tiles_m = ((uint64_t)params[1] + SG_GEMM_TN - 1) / SG_GEMM_TN;
         if (tiles_n == 0 || tiles_m == 0) {
-            return gpu_errf("gpu: %s dispatched with zero tiles", kernel);
+            return sg_gpu_errf("gpu: %s dispatched with zero tiles", kernel);
         }
     } else if (groups == 0) {
-        return gpu_errf("gpu: %s dispatched with zero threadgroups", kernel);
+        return sg_gpu_errf("gpu: %s dispatched with zero threadgroups", kernel);
     }
 
     if (kind == SG_K_ATTN) {
         uint64_t need = (uint64_t)params[0] * params[3] * 4;
-        if (need == 0) return gpu_errf("gpu: %s dispatched with an empty score row", kernel);
-        e = scratch_ensure(g, need);
+        if (need == 0) return sg_gpu_errf("gpu: %s dispatched with an empty score row", kernel);
+        e = sg_scratch_ensure(g, need);
         if (sg_failed(e)) return e;
     }
 
@@ -1008,8 +1008,8 @@ sg_err sg_gpu_run_op(sg_gpu *g, const char *kernel, void *a, void *b, void *out,
             [cb commit];
             [cb waitUntilCompleted];
             if ([cb error]) {
-                rc = gpu_errf("gpu: %s failed: %s", kernel,
-                              [[[cb error] localizedDescription] UTF8String]);
+                rc = sg_gpu_errf("gpu: %s failed: %s", kernel,
+                                 [[[cb error] localizedDescription] UTF8String]);
             }
         }
     }
@@ -1036,12 +1036,12 @@ sg_err sg_gpu_run_attn_decode_f16(sg_gpu *g, void *q, void *k, void *v, void *ou
     uint32_t n_heads = params[0], n_kv = params[1], hd = params[2], seq = params[3];
     uint32_t q_stride = params[4];
     if (n_kv == 0 || n_heads % n_kv != 0) {
-        return gpu_errf("gpu: k_attn_decode_f16 n_heads %u is not a multiple of n_kv_heads %u",
-                        n_heads, n_kv);
+        return sg_gpu_errf("gpu: k_attn_decode_f16 n_heads %u is not a multiple of n_kv_heads %u",
+                           n_heads, n_kv);
     }
     if (q_stride < hd) {
-        return gpu_errf("gpu: k_attn_decode_f16 q_stride %u is smaller than head_dim %u",
-                        q_stride, hd);
+        return sg_gpu_errf("gpu: k_attn_decode_f16 q_stride %u is smaller than head_dim %u",
+                           q_stride, hd);
     }
     if (n_heads == 0 || hd == 0 || seq == 0) {
         return (sg_err){"gpu: k_attn_decode_f16 dispatched with a zero dimension"};
@@ -1058,20 +1058,20 @@ sg_err sg_gpu_run_attn_decode_f16(sg_gpu *g, void *q, void *k, void *v, void *ou
         return (sg_err){"gpu: k_attn_decode_f16 params describe a region that overflows 64 bits"};
     }
     if (!buf_big_enough(qb, need_q)) {
-        return gpu_errf("gpu: k_attn_decode_f16 q is %llu bytes, needs %llu",
-                        (unsigned long long)(qb ? qb->nbytes : 0), (unsigned long long)need_q);
+        return sg_gpu_errf("gpu: k_attn_decode_f16 q is %llu bytes, needs %llu",
+                           (unsigned long long)(qb ? qb->nbytes : 0), (unsigned long long)need_q);
     }
     if (!buf_big_enough(kb, need_kv)) {
-        return gpu_errf("gpu: k_attn_decode_f16 k is %llu bytes, needs %llu",
-                        (unsigned long long)(kb ? kb->nbytes : 0), (unsigned long long)need_kv);
+        return sg_gpu_errf("gpu: k_attn_decode_f16 k is %llu bytes, needs %llu",
+                           (unsigned long long)(kb ? kb->nbytes : 0), (unsigned long long)need_kv);
     }
     if (!buf_big_enough(vb, need_kv)) {
-        return gpu_errf("gpu: k_attn_decode_f16 v is %llu bytes, needs %llu",
-                        (unsigned long long)(vb ? vb->nbytes : 0), (unsigned long long)need_kv);
+        return sg_gpu_errf("gpu: k_attn_decode_f16 v is %llu bytes, needs %llu",
+                           (unsigned long long)(vb ? vb->nbytes : 0), (unsigned long long)need_kv);
     }
     if (!buf_big_enough(ob, need_o)) {
-        return gpu_errf("gpu: k_attn_decode_f16 out is %llu bytes, needs %llu",
-                        (unsigned long long)(ob ? ob->nbytes : 0), (unsigned long long)need_o);
+        return sg_gpu_errf("gpu: k_attn_decode_f16 out is %llu bytes, needs %llu",
+                           (unsigned long long)(ob ? ob->nbytes : 0), (unsigned long long)need_o);
     }
     if (bufs_overlap(qb, ob) || bufs_overlap(kb, ob) || bufs_overlap(vb, ob)) {
         return (sg_err){"gpu: k_attn_decode_f16 output overlaps an input buffer"};
@@ -1079,12 +1079,12 @@ sg_err sg_gpu_run_attn_decode_f16(sg_gpu *g, void *q, void *k, void *v, void *ou
 
     /* n_heads*seq alone cannot wrap (two uint32 factors, as above), but *4
      * can when both sit near UINT32_MAX; guard it like every other byte
-     * count here rather than let scratch_ensure see a wrapped-small need. */
+     * count here rather than let sg_scratch_ensure see a wrapped-small need. */
     uint64_t need_scratch = 0;
     if (!mul_ck((uint64_t)n_heads * seq, 4, &need_scratch)) {
         return (sg_err){"gpu: k_attn_decode_f16 score-scratch size overflows 64 bits"};
     }
-    sg_err e = scratch_ensure(g, need_scratch);
+    sg_err e = sg_scratch_ensure(g, need_scratch);
     if (sg_failed(e)) return e;
 
     __block sg_err rc = SG_OK;
@@ -1107,8 +1107,8 @@ sg_err sg_gpu_run_attn_decode_f16(sg_gpu *g, void *q, void *k, void *v, void *ou
             [cb commit];
             [cb waitUntilCompleted];
             if ([cb error]) {
-                rc = gpu_errf("gpu: k_attn_decode_f16 failed: %s",
-                              [[[cb error] localizedDescription] UTF8String]);
+                rc = sg_gpu_errf("gpu: k_attn_decode_f16 failed: %s",
+                                 [[[cb error] localizedDescription] UTF8String]);
             }
         }
     }
@@ -1137,12 +1137,12 @@ sg_err sg_gpu_run_attn_prefill(sg_gpu *g, void *q, void *k, void *v, void *out,
     uint32_t n_heads = params[0], n_kv = params[1], hd = params[2], base = params[3];
     uint32_t n = params[4], q_stride = params[5];
     if (n_kv == 0 || n_heads % n_kv != 0) {
-        return gpu_errf("gpu: k_attn_prefill n_heads %u is not a multiple of n_kv_heads %u",
-                        n_heads, n_kv);
+        return sg_gpu_errf("gpu: k_attn_prefill n_heads %u is not a multiple of n_kv_heads %u",
+                           n_heads, n_kv);
     }
     if (q_stride < hd) {
-        return gpu_errf("gpu: k_attn_prefill q_stride %u is smaller than head_dim %u",
-                        q_stride, hd);
+        return sg_gpu_errf("gpu: k_attn_prefill q_stride %u is smaller than head_dim %u",
+                           q_stride, hd);
     }
     if (n_heads == 0 || hd == 0 || n == 0) {
         return (sg_err){"gpu: k_attn_prefill dispatched with a zero dimension"};
@@ -1182,26 +1182,26 @@ sg_err sg_gpu_run_attn_prefill(sg_gpu *g, void *q, void *k, void *v, void *out,
         return (sg_err){"gpu: k_attn_prefill params describe a region that overflows 64 bits"};
     }
     if (!buf_big_enough(qb, need_q)) {
-        return gpu_errf("gpu: k_attn_prefill q is %llu bytes, needs %llu",
-                        (unsigned long long)(qb ? qb->nbytes : 0), (unsigned long long)need_q);
+        return sg_gpu_errf("gpu: k_attn_prefill q is %llu bytes, needs %llu",
+                           (unsigned long long)(qb ? qb->nbytes : 0), (unsigned long long)need_q);
     }
     if (!buf_big_enough(kb, need_kv)) {
-        return gpu_errf("gpu: k_attn_prefill k is %llu bytes, needs %llu",
-                        (unsigned long long)(kb ? kb->nbytes : 0), (unsigned long long)need_kv);
+        return sg_gpu_errf("gpu: k_attn_prefill k is %llu bytes, needs %llu",
+                           (unsigned long long)(kb ? kb->nbytes : 0), (unsigned long long)need_kv);
     }
     if (!buf_big_enough(vb, need_kv)) {
-        return gpu_errf("gpu: k_attn_prefill v is %llu bytes, needs %llu",
-                        (unsigned long long)(vb ? vb->nbytes : 0), (unsigned long long)need_kv);
+        return sg_gpu_errf("gpu: k_attn_prefill v is %llu bytes, needs %llu",
+                           (unsigned long long)(vb ? vb->nbytes : 0), (unsigned long long)need_kv);
     }
     if (!buf_big_enough(ob, need_o)) {
-        return gpu_errf("gpu: k_attn_prefill out is %llu bytes, needs %llu",
-                        (unsigned long long)(ob ? ob->nbytes : 0), (unsigned long long)need_o);
+        return sg_gpu_errf("gpu: k_attn_prefill out is %llu bytes, needs %llu",
+                           (unsigned long long)(ob ? ob->nbytes : 0), (unsigned long long)need_o);
     }
     if (bufs_overlap(qb, ob) || bufs_overlap(kb, ob) || bufs_overlap(vb, ob)) {
         return (sg_err){"gpu: k_attn_prefill output overlaps an input buffer"};
     }
 
-    sg_err e = scratch_ensure(g, need_scratch);
+    sg_err e = sg_scratch_ensure(g, need_scratch);
     if (sg_failed(e)) return e;
 
     __block sg_err rc = SG_OK;
@@ -1226,8 +1226,8 @@ sg_err sg_gpu_run_attn_prefill(sg_gpu *g, void *q, void *k, void *v, void *out,
             [cb commit];
             [cb waitUntilCompleted];
             if ([cb error]) {
-                rc = gpu_errf("gpu: k_attn_prefill failed: %s",
-                              [[[cb error] localizedDescription] UTF8String]);
+                rc = sg_gpu_errf("gpu: k_attn_prefill failed: %s",
+                                 [[[cb error] localizedDescription] UTF8String]);
             }
         }
     }
@@ -1249,12 +1249,12 @@ sg_err sg_gpu_run_attn_prefill(sg_gpu *g, void *q, void *k, void *v, void *out,
 
 /* One buffer-size check with the standard message. Factored out because the
  * partial dispatch below has six of them and the combine four, and six
- * copy-pasted gpu_errf calls are six chances to name the wrong buffer. */
+ * copy-pasted sg_gpu_errf calls are six chances to name the wrong buffer. */
 static sg_err splitk_need(const char *kernel, const char *what,
                           const sg_gpu_buf *b, uint64_t need) {
     if (buf_big_enough(b, need)) return SG_OK;
-    return gpu_errf("gpu: %s %s is %llu bytes, needs %llu", kernel, what,
-                    (unsigned long long)(b ? b->nbytes : 0), (unsigned long long)need);
+    return sg_gpu_errf("gpu: %s %s is %llu bytes, needs %llu", kernel, what,
+                       (unsigned long long)(b ? b->nbytes : 0), (unsigned long long)need);
 }
 
 /* Every byte count the split-K pair needs, from the shared params array.
@@ -1284,7 +1284,7 @@ static bool splitk_sizes(const uint32_t *p, uint64_t *need_q, uint64_t *need_kv,
     uint64_t q_stride = p[4], n_splits = p[6];
     uint64_t q = 0, kv = 0, ms = 0, acc = 0, out = 0, scratch = 0, parts = 0, t = 0;
 
-    /* check_params (src/metal_validate.m) rejects this first; guarded again
+    /* sg_check_params (src/metal_validate.m) rejects this first; guarded again
      * here because the span
      * division below would be a divide by zero. */
     if (n_splits == 0) return false;
@@ -1331,11 +1331,11 @@ static sg_err splitk_partial_run(sg_gpu *g, const char *kn, int ki, bool gqa,
                                  bool scratch, void *q, void *k, void *v,
                                  void *m, void *s, void *acc,
                                  const uint32_t params[8]) {
-    sg_err e = check_params(kn, params);
+    sg_err e = sg_check_params(kn, params);
     if (sg_failed(e)) return e;
 
     /* The grid's y extent: one threadgroup per QUERY head for the per-head
-     * partial, per KV head (i.e. per GQA group) for the GQA one. check_params
+     * partial, per KV head (i.e. per GQA group) for the GQA one. sg_check_params
      * (src/metal_validate.m) has already rejected n_kv_heads == 0 and
      * n_heads % n_kv_heads != 0, so
      * the groups tile the query heads exactly. */
@@ -1343,7 +1343,7 @@ static sg_err splitk_partial_run(sg_gpu *g, const char *kn, int ki, bool gqa,
     uint32_t n_rows = gqa ? params[1] : params[0];
     uint64_t need_q = 0, need_kv = 0, need_ms = 0, need_acc = 0, need_scratch = 0;
     if (!splitk_sizes(params, &need_q, &need_kv, &need_ms, &need_acc, NULL, &need_scratch)) {
-        return gpu_errf("gpu: %s params describe a region that overflows 64 bits", kn);
+        return sg_gpu_errf("gpu: %s params describe a region that overflows 64 bits", kn);
     }
 
     sg_gpu_buf *ins[3] = {(sg_gpu_buf *)q, (sg_gpu_buf *)k, (sg_gpu_buf *)v};
@@ -1371,16 +1371,16 @@ static sg_err splitk_partial_run(sg_gpu *g, const char *kn, int ki, bool gqa,
     for (int i = 0; i < 3; i++) {
         for (int j = 0; j < 3; j++) {
             if (bufs_overlap(ins[i], outs[j])) {
-                return gpu_errf("gpu: %s output %s overlaps input %s", kn,
-                                out_name[j], in_name[i]);
+                return sg_gpu_errf("gpu: %s output %s overlaps input %s", kn,
+                                   out_name[j], in_name[i]);
             }
         }
     }
     for (int i = 0; i < 3; i++) {
         for (int j = i + 1; j < 3; j++) {
             if (bufs_overlap(outs[i], outs[j])) {
-                return gpu_errf("gpu: %s outputs %s and %s overlap", kn,
-                                out_name[i], out_name[j]);
+                return sg_gpu_errf("gpu: %s outputs %s and %s overlap", kn,
+                                   out_name[i], out_name[j]);
             }
         }
     }
@@ -1437,8 +1437,8 @@ static sg_err splitk_partial_run(sg_gpu *g, const char *kn, int ki, bool gqa,
             [cb commit];
             [cb waitUntilCompleted];
             if ([cb error]) {
-                rc = gpu_errf("gpu: %s failed: %s", kn,
-                              [[[cb error] localizedDescription] UTF8String]);
+                rc = sg_gpu_errf("gpu: %s failed: %s", kn,
+                                 [[[cb error] localizedDescription] UTF8String]);
             }
         }
     }
@@ -1500,13 +1500,13 @@ sg_err sg_gpu_run_attn_splitk_combine(sg_gpu *g, void *m, void *s, void *acc,
     if (!g || !m || !s || !acc || !out || !params) {
         return (sg_err){"gpu: sg_gpu_run_attn_splitk_combine got a NULL argument"};
     }
-    sg_err e = check_params(kn, params);
+    sg_err e = sg_check_params(kn, params);
     if (sg_failed(e)) return e;
 
     uint32_t n_heads = params[0];
     uint64_t need_ms = 0, need_acc = 0, need_out = 0;
     if (!splitk_sizes(params, NULL, NULL, &need_ms, &need_acc, &need_out, NULL)) {
-        return gpu_errf("gpu: %s params describe a region that overflows 64 bits", kn);
+        return sg_gpu_errf("gpu: %s params describe a region that overflows 64 bits", kn);
     }
 
     sg_gpu_buf *ins[3] = {(sg_gpu_buf *)m, (sg_gpu_buf *)s, (sg_gpu_buf *)acc};
@@ -1523,7 +1523,7 @@ sg_err sg_gpu_run_attn_splitk_combine(sg_gpu *g, void *m, void *s, void *acc,
 
     for (int i = 0; i < 3; i++) {
         if (bufs_overlap(ins[i], ob)) {
-            return gpu_errf("gpu: %s output overlaps input %s", kn, in_name[i]);
+            return sg_gpu_errf("gpu: %s output overlaps input %s", kn, in_name[i]);
         }
     }
 
@@ -1549,8 +1549,8 @@ sg_err sg_gpu_run_attn_splitk_combine(sg_gpu *g, void *m, void *s, void *acc,
             [cb commit];
             [cb waitUntilCompleted];
             if ([cb error]) {
-                rc = gpu_errf("gpu: %s failed: %s", kn,
-                              [[[cb error] localizedDescription] UTF8String]);
+                rc = sg_gpu_errf("gpu: %s failed: %s", kn,
+                                 [[[cb error] localizedDescription] UTF8String]);
             }
         }
     }
@@ -1571,7 +1571,7 @@ sg_err sg_gpu_run_attn_splitk_combine(sg_gpu *g, void *m, void *s, void *acc,
 
 /* One dispatch of an elementwise (no-reduction) kernel over `elems` threads,
  * threadgroup width clamped to the pipeline max, SG_TG and `elems`. */
-NSUInteger gpu_elem_width(sg_gpu *g, int ki, uint64_t elems) {
+NSUInteger sg_gpu_elem_width(sg_gpu *g, int ki, uint64_t elems) {
     NSUInteger w = [g->pipes[ki] maxTotalThreadsPerThreadgroup];
     if (w > SG_TG) w = SG_TG;
     if (w > elems) w = (NSUInteger)elems;
@@ -1599,13 +1599,13 @@ sg_err sg_gpu_run_conv1d_chunk(sg_gpu *g, void *x, void *w, void *out, void *sta
            && mul_ck((uint64_t)(ksize - 1u) * channels, f, &need_s);
     if (!ok) return (sg_err){"gpu: k_conv1d_chunk params describe a region that overflows 64 bits"};
     uint64_t need_o = need_x;
-    if (!buf_big_enough(xb, need_x)) return gpu_errf("gpu: k_conv1d_chunk x is %llu bytes, needs %llu",
+    if (!buf_big_enough(xb, need_x)) return sg_gpu_errf("gpu: k_conv1d_chunk x is %llu bytes, needs %llu",
         (unsigned long long)(xb ? xb->nbytes : 0), (unsigned long long)need_x);
-    if (!buf_big_enough(wb, need_w)) return gpu_errf("gpu: k_conv1d_chunk w is %llu bytes, needs %llu",
+    if (!buf_big_enough(wb, need_w)) return sg_gpu_errf("gpu: k_conv1d_chunk w is %llu bytes, needs %llu",
         (unsigned long long)(wb ? wb->nbytes : 0), (unsigned long long)need_w);
-    if (!buf_big_enough(ob, need_o)) return gpu_errf("gpu: k_conv1d_chunk out is %llu bytes, needs %llu",
+    if (!buf_big_enough(ob, need_o)) return sg_gpu_errf("gpu: k_conv1d_chunk out is %llu bytes, needs %llu",
         (unsigned long long)(ob ? ob->nbytes : 0), (unsigned long long)need_o);
-    if (need_s > 0 && !buf_big_enough(sb, need_s)) return gpu_errf("gpu: k_conv1d_chunk state is %llu bytes, needs %llu",
+    if (need_s > 0 && !buf_big_enough(sb, need_s)) return sg_gpu_errf("gpu: k_conv1d_chunk state is %llu bytes, needs %llu",
         (unsigned long long)(sb ? sb->nbytes : 0), (unsigned long long)need_s);
     /* out must not alias any input; state is written in place (thread c owns
      * column c of it), so it must not overlap out NOR either read-only input --
@@ -1628,14 +1628,14 @@ sg_err sg_gpu_run_conv1d_chunk(sg_gpu *g, void *x, void *w, void *out, void *sta
             [enc setBuffer:ob->buf offset:(NSUInteger)ob->offset atIndex:2];
             [enc setBytes:params length:8 * sizeof(uint32_t) atIndex:3];
             [enc setBuffer:sb->buf offset:(NSUInteger)sb->offset atIndex:4];
-            NSUInteger wdt = gpu_elem_width(g, KI_CONV1D_CHUNK, channels);
+            NSUInteger wdt = sg_gpu_elem_width(g, KI_CONV1D_CHUNK, channels);
             [enc dispatchThreads:MTLSizeMake(channels, 1, 1)
             threadsPerThreadgroup:MTLSizeMake(wdt, 1, 1)];
             [enc endEncoding];
             [cb commit];
             [cb waitUntilCompleted];
-            if ([cb error]) rc = gpu_errf("gpu: k_conv1d_chunk failed: %s",
-                                          [[[cb error] localizedDescription] UTF8String]);
+            if ([cb error]) rc = sg_gpu_errf("gpu: k_conv1d_chunk failed: %s",
+                                             [[[cb error] localizedDescription] UTF8String]);
         }
     }
     return rc;
@@ -1665,13 +1665,13 @@ sg_err sg_gpu_run_delta_gates_chunk(sg_gpu *g, void *a, void *b, void *gates, vo
            && mul_ck(2ull * (uint64_t)n_tok * n, f, &need_g)
            && mul_ck(2ull * n, f, &need_adt);
     if (!ok) return (sg_err){"gpu: k_delta_gates_chunk params describe a region that overflows 64 bits"};
-    if (!buf_big_enough(ab, need_ab)) return gpu_errf("gpu: k_delta_gates_chunk a is %llu bytes, needs %llu",
+    if (!buf_big_enough(ab, need_ab)) return sg_gpu_errf("gpu: k_delta_gates_chunk a is %llu bytes, needs %llu",
         (unsigned long long)(ab ? ab->nbytes : 0), (unsigned long long)need_ab);
-    if (!buf_big_enough(bb, need_ab)) return gpu_errf("gpu: k_delta_gates_chunk b is %llu bytes, needs %llu",
+    if (!buf_big_enough(bb, need_ab)) return sg_gpu_errf("gpu: k_delta_gates_chunk b is %llu bytes, needs %llu",
         (unsigned long long)(bb ? bb->nbytes : 0), (unsigned long long)need_ab);
-    if (!buf_big_enough(gb, need_g)) return gpu_errf("gpu: k_delta_gates_chunk gates is %llu bytes, needs %llu",
+    if (!buf_big_enough(gb, need_g)) return sg_gpu_errf("gpu: k_delta_gates_chunk gates is %llu bytes, needs %llu",
         (unsigned long long)(gb ? gb->nbytes : 0), (unsigned long long)need_g);
-    if (!buf_big_enough(db, need_adt)) return gpu_errf("gpu: k_delta_gates_chunk adt is %llu bytes, needs %llu",
+    if (!buf_big_enough(db, need_adt)) return sg_gpu_errf("gpu: k_delta_gates_chunk adt is %llu bytes, needs %llu",
         (unsigned long long)(db ? db->nbytes : 0), (unsigned long long)need_adt);
     if (bufs_overlap(gb, ab) || bufs_overlap(gb, bb) || bufs_overlap(gb, db)) {
         return (sg_err){"gpu: k_delta_gates_chunk output overlaps an input buffer"};
@@ -1690,14 +1690,14 @@ sg_err sg_gpu_run_delta_gates_chunk(sg_gpu *g, void *a, void *b, void *gates, vo
             [enc setBuffer:gb->buf offset:(NSUInteger)gb->offset atIndex:2];
             [enc setBytes:params length:8 * sizeof(uint32_t) atIndex:3];
             [enc setBuffer:db->buf offset:(NSUInteger)db->offset atIndex:4];
-            NSUInteger wdt = gpu_elem_width(g, KI_DELTA_GATES_CHUNK, elems);
+            NSUInteger wdt = sg_gpu_elem_width(g, KI_DELTA_GATES_CHUNK, elems);
             [enc dispatchThreads:MTLSizeMake((NSUInteger)elems, 1, 1)
             threadsPerThreadgroup:MTLSizeMake(wdt, 1, 1)];
             [enc endEncoding];
             [cb commit];
             [cb waitUntilCompleted];
-            if ([cb error]) rc = gpu_errf("gpu: k_delta_gates_chunk failed: %s",
-                                          [[[cb error] localizedDescription] UTF8String]);
+            if ([cb error]) rc = sg_gpu_errf("gpu: k_delta_gates_chunk failed: %s",
+                                             [[[cb error] localizedDescription] UTF8String]);
         }
     }
     return rc;
@@ -1716,20 +1716,20 @@ static sg_err gpu_run_delta_common(sg_gpu *g, int ki, void *S, void *qkv, void *
         return (sg_err){"gpu: k_delta_* dispatched with a zero dimension"};
     }
     if (n_k == 0 || n_v % n_k != 0) {
-        return gpu_errf("gpu: k_delta_* n_v %u is not a multiple of n_k %u", n_v, n_k);
+        return sg_gpu_errf("gpu: k_delta_* n_v %u is not a multiple of n_k %u", n_v, n_k);
     }
     /* The kernel reads q at qkv+hk*dk and k at qkv+key_dim+hk*dk with hk < n_k,
      * so the q/k regions run up to n_k*dk and key_dim+n_k*dk; key_dim must be at
      * least n_k*dk or an inconsistent public param would index a k slice past
      * the region the conv_dim size rule guarantees. */
     if (key_dim < (uint64_t)n_k * dk) {
-        return gpu_errf("gpu: k_delta_* key_dim %u is smaller than n_k*dk %llu",
-                        key_dim, (unsigned long long)((uint64_t)n_k * dk));
+        return sg_gpu_errf("gpu: k_delta_* key_dim %u is smaller than n_k*dk %llu",
+                           key_dim, (unsigned long long)((uint64_t)n_k * dk));
     }
     uint64_t value_dim = (uint64_t)n_v * dv;
     if (conv_dim < 2ull * key_dim + value_dim) {
-        return gpu_errf("gpu: k_delta_* conv_dim %u is smaller than 2*key_dim + value_dim %llu",
-                        conv_dim, (unsigned long long)(2ull * key_dim + value_dim));
+        return sg_gpu_errf("gpu: k_delta_* conv_dim %u is smaller than 2*key_dim + value_dim %llu",
+                           conv_dim, (unsigned long long)(2ull * key_dim + value_dim));
     }
 
     sg_gpu_buf *Sb = (sg_gpu_buf *)S, *qb = (sg_gpu_buf *)qkv, *ob = (sg_gpu_buf *)out,
@@ -1742,13 +1742,13 @@ static sg_err gpu_run_delta_common(sg_gpu *g, int ki, void *S, void *qkv, void *
            && mul_ck((uint64_t)n_tok, value_dim, &t0) && mul_ck(t0, f, &need_o)
            && mul_ck((uint64_t)n_tok, n_v, &t0) && mul_ck(t0, 2, &t0) && mul_ck(t0, f, &need_g);
     if (!ok) return (sg_err){"gpu: k_delta_* params describe a region that overflows 64 bits"};
-    if (!buf_big_enough(Sb, need_s)) return gpu_errf("gpu: k_delta_* S is %llu bytes, needs %llu",
+    if (!buf_big_enough(Sb, need_s)) return sg_gpu_errf("gpu: k_delta_* S is %llu bytes, needs %llu",
         (unsigned long long)(Sb ? Sb->nbytes : 0), (unsigned long long)need_s);
-    if (!buf_big_enough(qb, need_q)) return gpu_errf("gpu: k_delta_* qkv is %llu bytes, needs %llu",
+    if (!buf_big_enough(qb, need_q)) return sg_gpu_errf("gpu: k_delta_* qkv is %llu bytes, needs %llu",
         (unsigned long long)(qb ? qb->nbytes : 0), (unsigned long long)need_q);
-    if (!buf_big_enough(ob, need_o)) return gpu_errf("gpu: k_delta_* out is %llu bytes, needs %llu",
+    if (!buf_big_enough(ob, need_o)) return sg_gpu_errf("gpu: k_delta_* out is %llu bytes, needs %llu",
         (unsigned long long)(ob ? ob->nbytes : 0), (unsigned long long)need_o);
-    if (!buf_big_enough(gb, need_g)) return gpu_errf("gpu: k_delta_* gates is %llu bytes, needs %llu",
+    if (!buf_big_enough(gb, need_g)) return sg_gpu_errf("gpu: k_delta_* gates is %llu bytes, needs %llu",
         (unsigned long long)(gb ? gb->nbytes : 0), (unsigned long long)need_g);
     /* out must not alias any input; S is read+written in place (row-private per
      * thread), so it must not overlap out NOR the read-only qkv/gates a thread
@@ -1775,8 +1775,8 @@ static sg_err gpu_run_delta_common(sg_gpu *g, int ki, void *S, void *qkv, void *
             [enc endEncoding];
             [cb commit];
             [cb waitUntilCompleted];
-            if ([cb error]) rc = gpu_errf("gpu: %s failed: %s", SG_KERNELS[ki].name,
-                                          [[[cb error] localizedDescription] UTF8String]);
+            if ([cb error]) rc = sg_gpu_errf("gpu: %s failed: %s", SG_KERNELS[ki].name,
+                                             [[[cb error] localizedDescription] UTF8String]);
         }
     }
     return rc;
@@ -1837,13 +1837,13 @@ sg_err sg_gpu_run_rmsnorm_gated_chunk(sg_gpu *g, void *y, void *z, void *out, vo
     bool ok = mul_ck((uint64_t)n_tok * heads, dv, &t0) && mul_ck(t0, f, &need_yzo)
            && mul_ck((uint64_t)dv, f, &need_w);
     if (!ok) return (sg_err){"gpu: k_rmsnorm_gated_chunk params describe a region that overflows 64 bits"};
-    if (!buf_big_enough(yb, need_yzo)) return gpu_errf("gpu: k_rmsnorm_gated_chunk y is %llu bytes, needs %llu",
+    if (!buf_big_enough(yb, need_yzo)) return sg_gpu_errf("gpu: k_rmsnorm_gated_chunk y is %llu bytes, needs %llu",
         (unsigned long long)(yb ? yb->nbytes : 0), (unsigned long long)need_yzo);
-    if (!buf_big_enough(zb, need_yzo)) return gpu_errf("gpu: k_rmsnorm_gated_chunk z is %llu bytes, needs %llu",
+    if (!buf_big_enough(zb, need_yzo)) return sg_gpu_errf("gpu: k_rmsnorm_gated_chunk z is %llu bytes, needs %llu",
         (unsigned long long)(zb ? zb->nbytes : 0), (unsigned long long)need_yzo);
-    if (!buf_big_enough(ob, need_yzo)) return gpu_errf("gpu: k_rmsnorm_gated_chunk out is %llu bytes, needs %llu",
+    if (!buf_big_enough(ob, need_yzo)) return sg_gpu_errf("gpu: k_rmsnorm_gated_chunk out is %llu bytes, needs %llu",
         (unsigned long long)(ob ? ob->nbytes : 0), (unsigned long long)need_yzo);
-    if (!buf_big_enough(wb, need_w)) return gpu_errf("gpu: k_rmsnorm_gated_chunk w is %llu bytes, needs %llu",
+    if (!buf_big_enough(wb, need_w)) return sg_gpu_errf("gpu: k_rmsnorm_gated_chunk w is %llu bytes, needs %llu",
         (unsigned long long)(wb ? wb->nbytes : 0), (unsigned long long)need_w);
     /* out may alias y (each thread rewrites only the elements it read, after
      * tg_sum's trailing barrier), exactly as k_rmsnorm_gated is used in place in
@@ -1870,8 +1870,8 @@ sg_err sg_gpu_run_rmsnorm_gated_chunk(sg_gpu *g, void *y, void *z, void *out, vo
             [enc endEncoding];
             [cb commit];
             [cb waitUntilCompleted];
-            if ([cb error]) rc = gpu_errf("gpu: k_rmsnorm_gated_chunk failed: %s",
-                                          [[[cb error] localizedDescription] UTF8String]);
+            if ([cb error]) rc = sg_gpu_errf("gpu: k_rmsnorm_gated_chunk failed: %s",
+                                             [[[cb error] localizedDescription] UTF8String]);
         }
     }
     return rc;
@@ -1977,7 +1977,7 @@ static int matmul_kernel_for(sg_tensor_type t) {
  * per-tensor dtype dispatch, same one-selection-per-model reasoning as
  * matmul_kernel_for (the loader guarantees the matmul weights are
  * dtype-uniform), just the batched kernel family. */
-int gemm_kernel_for(sg_tensor_type t) {
+int sg_gemm_kernel_for(sg_tensor_type t) {
     switch (t) {
     case SG_T_Q8_0: return KI_MATMUL_Q8;
     case SG_T_BF16: return KI_MATMUL_BF16;
@@ -2002,7 +2002,7 @@ static void gpu_widen(const void *w, sg_tensor_type t, float *out, uint64_t n, f
 /* ref.c's wrow for the three dtypes this path accepts. The Q8_0 branch
  * mirrors ref.c's wrow exactly (same f16 scale decode, same scale*int8 in
  * f32), so the embedding row is bit-identical to the CPU reference. */
-void gpu_embed_row(const void *w, sg_tensor_type t, uint64_t row,
+void sg_gpu_embed_row(const void *w, sg_tensor_type t, uint64_t row,
                           uint32_t cols, float *out) {
     if (t == SG_T_BF16) {
         const uint16_t *b = (const uint16_t *)w + row * cols;
@@ -2035,7 +2035,7 @@ void gpu_embed_row(const void *w, sg_tensor_type t, uint64_t row,
  * the decode path is made of; the wrapped bf16 weights are always bound at
  * 0. `aux` is buffer(4): k_attn_decode's score scratch or k_delta_multi's
  * gate vector, nil for everything else. */
-void enc_op(sg_enc *E, int ki, void *a, uint64_t ao, void *b, uint64_t bo,
+void sg_enc_op(sg_enc *E, int ki, void *a, uint64_t ao, void *b, uint64_t bo,
                    void *o, uint64_t oo, id<MTLBuffer> aux, uint64_t auxoff,
                    const uint32_t *p) {
     sg_gpu *g = E->g;
@@ -2055,7 +2055,7 @@ void enc_op(sg_enc *E, int ki, void *a, uint64_t ao, void *b, uint64_t bo,
     if (aux) [e setBuffer:aux offset:(NSUInteger)auxoff atIndex:4];
 
     uint64_t groups = 1, elems = 0;
-    gpu_grid(SG_KERNELS[ki].kind, p, &groups, &elems);
+    sg_gpu_grid(SG_KERNELS[ki].kind, p, &groups, &elems);
     if (elems != 0) {
         NSUInteger w = [g->pipes[ki] maxTotalThreadsPerThreadgroup];
         if (w > SG_TG) w = SG_TG;
@@ -2071,9 +2071,9 @@ void enc_op(sg_enc *E, int ki, void *a, uint64_t ao, void *b, uint64_t bo,
 /* Casts n f32 values out of `src` (offset 0, always a whole small scratch
  * buffer here) into `dst` (an sg_kv K or V buffer) at element offset
  * `dst_off`. dst is HALF-typed storage, so its byte offset is dst_off * 2,
- * not the *4 enc_op assumes for its all-f32 buffers -- that mismatch is
- * exactly why this is a standalone dispatch rather than a call to enc_op. */
-void enc_kv_store(sg_enc *E, void *src, void *dst, uint64_t dst_off, uint32_t n) {
+ * not the *4 sg_enc_op assumes for its all-f32 buffers -- that mismatch is
+ * exactly why this is a standalone dispatch rather than a call to sg_enc_op. */
+void sg_enc_kv_store(sg_enc *E, void *src, void *dst, uint64_t dst_off, uint32_t n) {
     sg_gpu *g = E->g;
     id<MTLComputeCommandEncoder> e = E->enc;
     const uint32_t p[8] = { n, 0, 0, 0, 0, 0, 0, 0 };
@@ -2093,7 +2093,7 @@ void enc_kv_store(sg_enc *E, void *src, void *dst, uint64_t dst_off, uint32_t n)
 
 /* k_attn_decode_f16's dispatch: THREE device buffer inputs (q, separate k,
  * separate v) where every other kernel in this file needs at most two, so it
- * cannot go through enc_op's (a, b, out) shape. Buffer indices follow the
+ * cannot go through sg_enc_op's (a, b, out) shape. Buffer indices follow the
  * kernel's own signature in kernels.metal: q=0, k=1, v=2, out=3, params=4,
  * scores=5. p must supply exactly k_attn_decode_f16's six params. */
 static void enc_attn_f16(sg_enc *E, void *q, void *k, void *v, void *out,
@@ -2258,10 +2258,10 @@ static void enc_attn_splitk(sg_enc *E, void *q, void *k, void *v, void *out,
      * it; see the note in surge.h on what dropping it would save). */
     if (!online) [e setBuffer:g->splitk_scratch offset:0 atIndex:7];
     /* SG_K_HEADS2D: x = split, y = query head (per-head partial) or KV head
-     * (GQA partial), matching the kernel's tg.x / tg.y. gpu_grid's (groups,
+     * (GQA partial), matching the kernel's tg.x / tg.y. sg_gpu_grid's (groups,
      * elems) pair (src/metal_validate.m) cannot carry two group dimensions (it
      * says so at its default
-     * case), so this is computed here by hand, the same way enc_matmul does it
+     * case), so this is computed here by hand, the same way sg_enc_matmul does it
      * for SG_K_TILES2D and the one-shots do it for these kernels. Threads per
      * threadgroup stay exactly SG_TG, which is the width the fixed
      * tg_max/tg_sum fold trees are shaped for. */
@@ -2283,15 +2283,15 @@ static void enc_attn_splitk(sg_enc *E, void *q, void *k, void *v, void *out,
 }
 
 /* One tiled-GEMM (M5.3) dispatch into an already-open encoder, the batched
- * analog of enc_op for a KI_MATMUL_* kernel. Buffer order is (X, W, Y) -- the
- * REVERSE of the matvec kernels enc_op drives -- so `x` is the [N, K]
+ * analog of sg_enc_op for a KI_MATMUL_* kernel. Buffer order is (X, W, Y) -- the
+ * REVERSE of the matvec kernels sg_enc_op drives -- so `x` is the [N, K]
  * activation chunk, `w` a wrapped [M, K] weight (bound at its own base, like
  * every wrapped weight), `y` the [N, M] output. `xoff`/`yoff` are element
  * offsets in FLOATS. The 2D tile grid (ceil(M/TN) x ceil(N/TM) threadgroups of
  * SG_GEMM_TN x SG_GEMM_TM threads) matches sg_gpu_run_op's SG_K_TILES2D branch
- * exactly; gpu_grid (src/metal_validate.m) cannot express two group
+ * exactly; sg_gpu_grid (src/metal_validate.m) cannot express two group
  * dimensions, so this is by hand. */
-void enc_matmul(sg_enc *E, int ki, void *x, uint64_t xoff, void *w,
+void sg_enc_matmul(sg_enc *E, int ki, void *x, uint64_t xoff, void *w,
                        void *y, uint64_t yoff, uint32_t nn, uint32_t mm, uint32_t kk) {
     sg_gpu *g = E->g;
     id<MTLComputeCommandEncoder> e = E->enc;
@@ -2335,7 +2335,7 @@ void enc_matmul(sg_enc *E, int ki, void *x, uint64_t xoff, void *w,
  * f16 path (default): k_proj and v_proj cannot write directly into the half
  * cache (a matvec kernel only ever produces f32), so they land in the f32
  * scratch b_k32/b_v32 instead; k-norm and RoPE run there in place exactly as
- * they did on the f32 cache slot; then enc_kv_store casts the finished K and
+ * they did on the f32 cache slot; then sg_enc_kv_store casts the finished K and
  * V into g->kv's per-layer half buffers at this position, and enc_attn_f16
  * reads them back widened to f32 for the dot products and softmax. */
 static void enc_attn(sg_enc *E, sg_gpu_layer *L, uint32_t layer_idx, uint32_t pos) {
@@ -2349,47 +2349,47 @@ static void enc_attn(sg_enc *E, sg_gpu_layer *L, uint32_t layer_idx, uint32_t po
      * with g->q_width == c->n_heads * q_stride, set at load time. */
     uint32_t q_stride = c->attn_output_gate ? 2 * hd : hd;
 
-    enc_op(E, g->mat_kernel, L->w_q, 0, g->b_h, 0, g->b_qg, 0, nil, 0,
-           PARAMS(g->q_width, c->hidden));
+    sg_enc_op(E, g->mat_kernel, L->w_q, 0, g->b_h, 0, g->b_qg, 0, nil, 0,
+              PARAMS(g->q_width, c->hidden));
     /* q_norm applies to the queries only, never to the gate. */
-    enc_op(E, KI_RMSNORM_HEADS, g->b_qg, 0, L->qk_norm, 0, g->b_qg, 0, nil, 0,
-           PARAMS(hd, c->n_heads, fbits(c->rms_eps), 1, q_stride));
-    enc_op(E, KI_ROPE_HEADS, g->b_qg, 0, g->b_cs, 0, g->b_qg, 0, nil, 0,
-           PARAMS(hd, c->rope_dim, c->n_heads, q_stride));
+    sg_enc_op(E, KI_RMSNORM_HEADS, g->b_qg, 0, L->qk_norm, 0, g->b_qg, 0, nil, 0,
+              PARAMS(hd, c->n_heads, fbits(c->rms_eps), 1, q_stride));
+    sg_enc_op(E, KI_ROPE_HEADS, g->b_qg, 0, g->b_cs, 0, g->b_qg, 0, nil, 0,
+              PARAMS(hd, c->rope_dim, c->n_heads, q_stride));
 
     if (g->kv_dtype == SG_T_F32) {
         uint64_t koff = (uint64_t)pos * g->kv_width;
         uint64_t vbase = (uint64_t)g->max_ctx * g->kv_width;
 
-        enc_op(E, g->mat_kernel, L->w_k, 0, g->b_h, 0, L->kv, koff, nil, 0,
-               PARAMS(g->kv_width, c->hidden));
-        enc_op(E, g->mat_kernel, L->w_v, 0, g->b_h, 0, L->kv, vbase + koff, nil, 0,
-               PARAMS(g->kv_width, c->hidden));
+        sg_enc_op(E, g->mat_kernel, L->w_k, 0, g->b_h, 0, L->kv, koff, nil, 0,
+                  PARAMS(g->kv_width, c->hidden));
+        sg_enc_op(E, g->mat_kernel, L->w_v, 0, g->b_h, 0, L->kv, vbase + koff, nil, 0,
+                  PARAMS(g->kv_width, c->hidden));
 
-        enc_op(E, KI_RMSNORM_HEADS, L->kv, koff, L->qk_norm, hd, L->kv, koff, nil, 0,
-               PARAMS(hd, c->n_kv_heads, fbits(c->rms_eps), 1, hd));
-        enc_op(E, KI_ROPE_HEADS, L->kv, koff, g->b_cs, 0, L->kv, koff, nil, 0,
-               PARAMS(hd, c->rope_dim, c->n_kv_heads, hd));
+        sg_enc_op(E, KI_RMSNORM_HEADS, L->kv, koff, L->qk_norm, hd, L->kv, koff, nil, 0,
+                  PARAMS(hd, c->n_kv_heads, fbits(c->rms_eps), 1, hd));
+        sg_enc_op(E, KI_ROPE_HEADS, L->kv, koff, g->b_cs, 0, L->kv, koff, nil, 0,
+                  PARAMS(hd, c->rope_dim, c->n_kv_heads, hd));
 
-        enc_op(E, KI_ATTN, g->b_qg, 0, L->kv, 0, g->b_ctx, 0, g->scratch, 0,
-               PARAMS(c->n_heads, c->n_kv_heads, hd, used, q_stride,
-                      (uint32_t)vbase, fbits(scale)));
+        sg_enc_op(E, KI_ATTN, g->b_qg, 0, L->kv, 0, g->b_ctx, 0, g->scratch, 0,
+                  PARAMS(c->n_heads, c->n_kv_heads, hd, used, q_stride,
+                         (uint32_t)vbase, fbits(scale)));
     } else {
         void *kbuf = sg_kv_k(g->kv, layer_idx);
         void *vbuf = sg_kv_v(g->kv, layer_idx);
 
-        enc_op(E, g->mat_kernel, L->w_k, 0, g->b_h, 0, g->b_k32, 0, nil, 0,
-               PARAMS(g->kv_width, c->hidden));
-        enc_op(E, g->mat_kernel, L->w_v, 0, g->b_h, 0, g->b_v32, 0, nil, 0,
-               PARAMS(g->kv_width, c->hidden));
+        sg_enc_op(E, g->mat_kernel, L->w_k, 0, g->b_h, 0, g->b_k32, 0, nil, 0,
+                  PARAMS(g->kv_width, c->hidden));
+        sg_enc_op(E, g->mat_kernel, L->w_v, 0, g->b_h, 0, g->b_v32, 0, nil, 0,
+                  PARAMS(g->kv_width, c->hidden));
 
-        enc_op(E, KI_RMSNORM_HEADS, g->b_k32, 0, L->qk_norm, hd, g->b_k32, 0, nil, 0,
-               PARAMS(hd, c->n_kv_heads, fbits(c->rms_eps), 1, hd));
-        enc_op(E, KI_ROPE_HEADS, g->b_k32, 0, g->b_cs, 0, g->b_k32, 0, nil, 0,
-               PARAMS(hd, c->rope_dim, c->n_kv_heads, hd));
+        sg_enc_op(E, KI_RMSNORM_HEADS, g->b_k32, 0, L->qk_norm, hd, g->b_k32, 0, nil, 0,
+                  PARAMS(hd, c->n_kv_heads, fbits(c->rms_eps), 1, hd));
+        sg_enc_op(E, KI_ROPE_HEADS, g->b_k32, 0, g->b_cs, 0, g->b_k32, 0, nil, 0,
+                  PARAMS(hd, c->rope_dim, c->n_kv_heads, hd));
 
-        enc_kv_store(E, g->b_k32, kbuf, (uint64_t)pos * g->kv_width, g->kv_width);
-        enc_kv_store(E, g->b_v32, vbuf, (uint64_t)pos * g->kv_width, g->kv_width);
+        sg_enc_kv_store(E, g->b_k32, kbuf, (uint64_t)pos * g->kv_width, g->kv_width);
+        sg_enc_kv_store(E, g->b_v32, vbuf, (uint64_t)pos * g->kv_width, g->kv_width);
 
         /* Task P2.3: the split-K pair when the sequence is long enough for it
          * (splitk_use returns the measured n_splits, or 0), the incumbent
@@ -2414,11 +2414,11 @@ static void enc_attn(sg_enc *E, sg_gpu_layer *L, uint32_t layer_idx, uint32_t po
      * qwen3 has no gate: g->b_ctx already holds the raw attention output, so
      * o_proj below reads it unmodified. */
     if (c->attn_output_gate) {
-        enc_op(E, KI_GATE_STRIDED, g->b_ctx, 0, g->b_qg, 0, g->b_ctx, 0, nil, 0,
-               PARAMS(hd, c->n_heads, 2 * hd, hd));
+        sg_enc_op(E, KI_GATE_STRIDED, g->b_ctx, 0, g->b_qg, 0, g->b_ctx, 0, nil, 0,
+                  PARAMS(hd, c->n_heads, 2 * hd, hd));
     }
-    enc_op(E, g->mat_kernel, L->w_o, 0, g->b_ctx, 0, g->b_r, 0, nil, 0,
-           PARAMS(c->hidden, g->attn_width));
+    sg_enc_op(E, g->mat_kernel, L->w_o, 0, g->b_ctx, 0, g->b_r, 0, nil, 0,
+              PARAMS(c->hidden, g->attn_width));
 }
 
 /* GatedDeltaNet for one token, mirroring ref.c's gdn_layer. The conv output
@@ -2433,19 +2433,19 @@ static void enc_gdn(sg_enc *E, sg_gpu_layer *L) {
     uint32_t neg_exp = (g->model->ssm_a_form == SG_SSM_A_NEG_EXP) ? 1u : 0u;
     uint32_t tiled = g->model->v_heads_tiled ? 1u : 0u;
 
-    enc_op(E, g->mat_kernel, L->w_qkv, 0, g->b_h, 0, g->b_qkv, 0, nil, 0,
-           PARAMS(g->conv_dim, c->hidden));
-    enc_op(E, g->mat_kernel, L->w_z, 0, g->b_h, 0, L->zw, 0, nil, 0,
-           PARAMS(g->value_dim, c->hidden));
-    enc_op(E, g->mat_kernel, L->w_b, 0, g->b_h, 0, g->b_ab, c->n_v_heads, nil, 0,
-           PARAMS(c->n_v_heads, c->hidden));
-    enc_op(E, g->mat_kernel, L->w_a, 0, g->b_h, 0, g->b_ab, 0, nil, 0,
-           PARAMS(c->n_v_heads, c->hidden));
+    sg_enc_op(E, g->mat_kernel, L->w_qkv, 0, g->b_h, 0, g->b_qkv, 0, nil, 0,
+              PARAMS(g->conv_dim, c->hidden));
+    sg_enc_op(E, g->mat_kernel, L->w_z, 0, g->b_h, 0, L->zw, 0, nil, 0,
+              PARAMS(g->value_dim, c->hidden));
+    sg_enc_op(E, g->mat_kernel, L->w_b, 0, g->b_h, 0, g->b_ab, c->n_v_heads, nil, 0,
+              PARAMS(c->n_v_heads, c->hidden));
+    sg_enc_op(E, g->mat_kernel, L->w_a, 0, g->b_h, 0, g->b_ab, 0, nil, 0,
+              PARAMS(c->n_v_heads, c->hidden));
 
-    enc_op(E, KI_CONV1D, g->b_qkv, 0, L->conv_w, 0, L->conv_buf, 0, nil, 0,
-           PARAMS(g->conv_dim, c->conv_kernel));
-    enc_op(E, KI_SILU, L->conv_buf, 0, NULL, 0, L->conv_buf, 0, nil, 0,
-           PARAMS(g->conv_dim));
+    sg_enc_op(E, KI_CONV1D, g->b_qkv, 0, L->conv_w, 0, L->conv_buf, 0, nil, 0,
+              PARAMS(g->conv_dim, c->conv_kernel));
+    sg_enc_op(E, KI_SILU, L->conv_buf, 0, NULL, 0, L->conv_buf, 0, nil, 0,
+              PARAMS(g->conv_dim));
 
     /* q and k are RMS-normed per key head with NO weight and a HARDCODED eps
      * of 1e-6 (qwen3_5.py, not the config's rms_norm_eps), then scaled: q by
@@ -2453,30 +2453,30 @@ static void enc_gdn(sg_enc *E, sg_gpu_layer *L) {
      * factors in double and rounds once, so the host passes the rounded
      * product and k_scale does a single multiply -- exact for the query
      * scale, one ulp for the key scale; see the note on k_scale. */
-    enc_op(E, KI_RMSNORM_HEADS, L->conv_buf, 0, NULL, 0, L->conv_buf, 0, nil, 0,
-           PARAMS(dk, c->n_k_heads, fbits(1e-6f), 0, dk));
-    enc_op(E, KI_RMSNORM_HEADS, L->conv_buf, g->key_dim, NULL, 0,
-           L->conv_buf, g->key_dim, nil, 0,
-           PARAMS(dk, c->n_k_heads, fbits(1e-6f), 0, dk));
-    enc_op(E, KI_SCALE, L->conv_buf, 0, NULL, 0, L->conv_buf, 0, nil, 0,
-           PARAMS(g->key_dim, fbits((float)(inv * inv))));
-    enc_op(E, KI_SCALE, L->conv_buf, g->key_dim, NULL, 0,
-           L->conv_buf, g->key_dim, nil, 0,
-           PARAMS(g->key_dim, fbits((float)inv)));
+    sg_enc_op(E, KI_RMSNORM_HEADS, L->conv_buf, 0, NULL, 0, L->conv_buf, 0, nil, 0,
+              PARAMS(dk, c->n_k_heads, fbits(1e-6f), 0, dk));
+    sg_enc_op(E, KI_RMSNORM_HEADS, L->conv_buf, g->key_dim, NULL, 0,
+              L->conv_buf, g->key_dim, nil, 0,
+              PARAMS(dk, c->n_k_heads, fbits(1e-6f), 0, dk));
+    sg_enc_op(E, KI_SCALE, L->conv_buf, 0, NULL, 0, L->conv_buf, 0, nil, 0,
+              PARAMS(g->key_dim, fbits((float)(inv * inv))));
+    sg_enc_op(E, KI_SCALE, L->conv_buf, g->key_dim, NULL, 0,
+              L->conv_buf, g->key_dim, nil, 0,
+              PARAMS(g->key_dim, fbits((float)inv)));
 
-    enc_op(E, KI_DELTA_GATES, g->b_ab, 0, L->a_dt, 0, g->b_gates, 0, nil, 0,
-           PARAMS(c->n_v_heads, neg_exp));
-    enc_op(E, KI_DELTA_MULTI, L->ssm, 0, L->conv_buf, 0, g->b_y, 0,
-           bufof(g->b_gates), offof(g->b_gates),
-           PARAMS(dk, dv, c->n_v_heads, c->n_k_heads, g->key_dim, tiled));
+    sg_enc_op(E, KI_DELTA_GATES, g->b_ab, 0, L->a_dt, 0, g->b_gates, 0, nil, 0,
+              PARAMS(c->n_v_heads, neg_exp));
+    sg_enc_op(E, KI_DELTA_MULTI, L->ssm, 0, L->conv_buf, 0, g->b_y, 0,
+              bufof(g->b_gates), offof(g->b_gates),
+              PARAMS(dk, dv, c->n_v_heads, c->n_k_heads, g->key_dim, tiled));
 
     /* RMSNormGated: silu(z) * rms_norm(y, ssm_norm), the gate taken from the
      * UNNORMALIZED z. zw holds z then the layer's ssm_norm weight, which is
      * the single-buffer layout k_rmsnorm_gated wants. */
-    enc_op(E, KI_RMSNORM_GATED, g->b_y, 0, L->zw, 0, g->b_y, 0, nil, 0,
-           PARAMS(dv, c->n_v_heads, fbits(c->rms_eps)));
-    enc_op(E, g->mat_kernel, L->w_out, 0, g->b_y, 0, g->b_r, 0, nil, 0,
-           PARAMS(c->hidden, g->value_dim));
+    sg_enc_op(E, KI_RMSNORM_GATED, g->b_y, 0, L->zw, 0, g->b_y, 0, nil, 0,
+              PARAMS(dv, c->n_v_heads, fbits(c->rms_eps)));
+    sg_enc_op(E, g->mat_kernel, L->w_out, 0, g->b_y, 0, g->b_r, 0, nil, 0,
+              PARAMS(c->hidden, g->value_dim));
 }
 
 /* --------------------------------------------------------------------
@@ -2593,7 +2593,7 @@ static sg_err gpu_wrap_w(sg_gpu *g, const void *p, uint64_t rows, uint64_t cols,
     return sg_gpu_wrap(g, p, nbytes, out);
 }
 
-sg_err gpu_alloc_f32(sg_gpu *g, uint64_t n, void **buf, float **host) {
+sg_err sg_gpu_alloc_f32(sg_gpu *g, uint64_t n, void **buf, float **host) {
     void *h = NULL;
     sg_err e = sg_gpu_alloc(g, n * 4, buf, &h);
     if (host) *host = (float *)h;
@@ -2726,7 +2726,7 @@ sg_err sg_gpu_load_model(sg_gpu *g, const sg_model *m) {
     float shift = m->norms_are_residual ? 1.0f : 0.0f;
     float *host = NULL;
 
-    e = gpu_alloc_f32(g, c->hidden, &g->out_norm, &host);
+    e = sg_gpu_alloc_f32(g, c->hidden, &g->out_norm, &host);
     if (sg_failed(e)) { gpu_unload(g); return e; }
     gpu_widen(m->out_norm, m->dense_type, host, c->hidden, shift);
 
@@ -2743,7 +2743,7 @@ sg_err sg_gpu_load_model(sg_gpu *g, const sg_model *m) {
             if (sg_failed(e)) { gpu_unload(g); return e; } \
         } while (0)
 #define SMALL(field, n) do { \
-            e = gpu_alloc_f32(g, (n), &L->field, &host); \
+            e = sg_gpu_alloc_f32(g, (n), &L->field, &host); \
             if (sg_failed(e)) { gpu_unload(g); return e; } \
         } while (0)
 
@@ -2896,10 +2896,10 @@ sg_err sg_gpu_state_new(sg_gpu *g, const sg_model *m, uint32_t max_ctx) {
             online_on = true;
         } else if (strcmp(on_env, "0") != 0) {
             gpu_free_state(g);
-            return gpu_errf("gpu: SURGE_ATTN_SPLITK_ONLINE='%s' must be exactly 0 or 1 "
-                            "(default 0; it selects the online-softmax split-K partial, "
-                            "and a silently ignored value would make its A/B vacuous)",
-                            on_env);
+            return sg_gpu_errf("gpu: SURGE_ATTN_SPLITK_ONLINE='%s' must be exactly 0 or 1 "
+                               "(default 0; it selects the online-softmax split-K partial, "
+                               "and a silently ignored value would make its A/B vacuous)",
+                               on_env);
         }
     }
     g->attn_splitk_online = online_on && g->attn_splitk;
@@ -2943,11 +2943,11 @@ sg_err sg_gpu_state_new(sg_gpu *g, const sg_model *m, uint32_t max_ctx) {
             || !cap_end || *cap_end != '\0'
             || cap_v < (long)SG_SPLITK_MIN || cap_v > (long)SG_SPLITK_MAX) {
             gpu_free_state(g);
-            return gpu_errf("gpu: SURGE_SPLITK_GQA_CAP='%s' is not an integer in "
-                            "[%u, %u] (default %u; this override exists for the "
-                            "P2.6 greedy-token gate, not for tuning a run)",
-                            cap_env, SG_SPLITK_MIN, SG_SPLITK_MAX,
-                            SG_SPLITK_GQA_N_SPLITS_CAP);
+            return sg_gpu_errf("gpu: SURGE_SPLITK_GQA_CAP='%s' is not an integer in "
+                               "[%u, %u] (default %u; this override exists for the "
+                               "P2.6 greedy-token gate, not for tuning a run)",
+                               cap_env, SG_SPLITK_MIN, SG_SPLITK_MAX,
+                               SG_SPLITK_GQA_N_SPLITS_CAP);
         }
         g->splitk_gqa_cap = (uint32_t)cap_v;
         fprintf(stderr, "gpu: SURGE_SPLITK_GQA_CAP = %u (default %u); the GQA and "
@@ -2985,26 +2985,26 @@ sg_err sg_gpu_state_new(sg_gpu *g, const sg_model *m, uint32_t max_ctx) {
     }
 
 #define SHARED(field, n) do { \
-        e = gpu_alloc_f32(g, (n), &g->field, NULL); \
+        e = sg_gpu_alloc_f32(g, (n), &g->field, NULL); \
         if (sg_failed(e)) { gpu_free_state(g); return e; } \
     } while (0)
 
-    e = gpu_alloc_f32(g, c->hidden, &g->b_x, &g->h_x);
+    e = sg_gpu_alloc_f32(g, c->hidden, &g->b_x, &g->h_x);
     if (sg_failed(e)) { gpu_free_state(g); return e; }
     SHARED(b_h, c->hidden);
     SHARED(b_r, c->hidden);
     SHARED(b_ffg, c->ffn_hidden);
     SHARED(b_ffu, c->ffn_hidden);
-    e = gpu_alloc_f32(g, c->vocab, &g->b_logits, &g->h_logits);
+    e = sg_gpu_alloc_f32(g, c->vocab, &g->b_logits, &g->h_logits);
     if (sg_failed(e)) { gpu_free_state(g); return e; }
 
     if (n_attn > 0) {
         SHARED(b_qg, g->q_width);
         SHARED(b_ctx, g->attn_width);
-        e = gpu_alloc_f32(g, c->rope_dim, &g->b_cs, &g->h_cs);
+        e = sg_gpu_alloc_f32(g, c->rope_dim, &g->b_cs, &g->h_cs);
         if (sg_failed(e)) { gpu_free_state(g); return e; }
         /* One private score row per query head, the full context long. */
-        e = scratch_ensure(g, (uint64_t)c->n_heads * max_ctx * 4);
+        e = sg_scratch_ensure(g, (uint64_t)c->n_heads * max_ctx * 4);
         if (sg_failed(e)) { gpu_free_state(g); return e; }
         if (kv_dtype == SG_T_F16) {
             /* fp16 path: this token's freshly computed K and V land here in
@@ -3026,7 +3026,7 @@ sg_err sg_gpu_state_new(sg_gpu *g, const sg_model *m, uint32_t max_ctx) {
              * seq, so n_heads * (max_ctx + splitk_max_splits) floats covers
              * every step at this max_ctx with room to spare. It is asked for
              * through splitk_scratch_ensure, the DEDICATED allocator (P2.2
-             * review finding 1), never scratch_ensure. */
+             * review finding 1), never sg_scratch_ensure. */
             g->splitk_max_splits = splitk_n_splits(max_ctx);
             SHARED(b_sk_m, (uint64_t)c->n_heads * g->splitk_max_splits);
             SHARED(b_sk_s, (uint64_t)c->n_heads * g->splitk_max_splits);
@@ -3048,17 +3048,17 @@ sg_err sg_gpu_state_new(sg_gpu *g, const sg_model *m, uint32_t max_ctx) {
         sg_gpu_layer *L = &g->ls[i];
         if (L->is_attn) {
             if (kv_dtype == SG_T_F32) {
-                e = gpu_alloc_f32(g, SG_KV_GROUPS * half, &L->kv, NULL);
+                e = sg_gpu_alloc_f32(g, SG_KV_GROUPS * half, &L->kv, NULL);
                 if (sg_failed(e)) { gpu_free_state(g); return e; }
             }
             /* kv_dtype == SG_T_F16: nothing per-layer here. g->kv (below)
              * owns every full-attention layer's K and V buffer at once. */
         } else {
-            e = gpu_alloc_f32(g, (uint64_t)g->conv_dim * c->conv_kernel,
-                              &L->conv_buf, NULL);
+            e = sg_gpu_alloc_f32(g, (uint64_t)g->conv_dim * c->conv_kernel,
+                                 &L->conv_buf, NULL);
             if (sg_failed(e)) { gpu_free_state(g); return e; }
-            e = gpu_alloc_f32(g, (uint64_t)c->n_v_heads * c->head_v_dim * c->head_k_dim,
-                              &L->ssm, NULL);
+            e = sg_gpu_alloc_f32(g, (uint64_t)c->n_v_heads * c->head_v_dim * c->head_k_dim,
+                                 &L->ssm, NULL);
             if (sg_failed(e)) { gpu_free_state(g); return e; }
         }
     }
@@ -3129,7 +3129,7 @@ sg_err sg_gpu_forward(sg_gpu *g, const sg_model *m, int32_t token, uint32_t pos,
     if (pos != g->used) return (sg_err){"gpu: positions must be presented in order"};
 
     /* No embedding scale: qwen3_5.py returns embed_tokens(inputs) untouched. */
-    gpu_embed_row(m->tok_emb, m->wtype, (uint64_t)token, c->hidden, g->h_x);
+    sg_gpu_embed_row(m->tok_emb, m->wtype, (uint64_t)token, c->hidden, g->h_x);
 
     /* The RoPE angle and its sine/cosine in DOUBLE, uploaded as f32. See the
      * note on sg_ref_rope_partial: at this checkpoint's parameters the f32
@@ -3162,40 +3162,40 @@ sg_err sg_gpu_forward(sg_gpu *g, const sg_model *m, int32_t token, uint32_t pos,
             for (uint32_t i = 0; i < c->n_layers; i++) {
                 sg_gpu_layer *L = &g->ls[i];
 
-                enc_op(&E, KI_RMSNORM, g->b_x, 0, L->ln1, 0, g->b_h, 0, nil, 0,
-                       PARAMS(c->hidden, eps, 1));
+                sg_enc_op(&E, KI_RMSNORM, g->b_x, 0, L->ln1, 0, g->b_h, 0, nil, 0,
+                          PARAMS(c->hidden, eps, 1));
                 if (L->is_attn) enc_attn(&E, L, i, pos);
                 else            enc_gdn(&E, L);
-                enc_op(&E, KI_ADD, g->b_x, 0, g->b_r, 0, g->b_x, 0, nil, 0,
-                       PARAMS(c->hidden));
+                sg_enc_op(&E, KI_ADD, g->b_x, 0, g->b_r, 0, g->b_x, 0, nil, 0,
+                          PARAMS(c->hidden));
 
-                enc_op(&E, KI_RMSNORM, g->b_x, 0, L->ln2, 0, g->b_h, 0, nil, 0,
-                       PARAMS(c->hidden, eps, 1));
-                enc_op(&E, g->mat_kernel, L->w_gate, 0, g->b_h, 0, g->b_ffg, 0, nil, 0,
-                       PARAMS(c->ffn_hidden, c->hidden));
-                enc_op(&E, g->mat_kernel, L->w_up, 0, g->b_h, 0, g->b_ffu, 0, nil, 0,
-                       PARAMS(c->ffn_hidden, c->hidden));
-                enc_op(&E, KI_SWIGLU, g->b_ffg, 0, g->b_ffu, 0, g->b_ffg, 0, nil, 0,
-                       PARAMS(c->ffn_hidden));
-                enc_op(&E, g->mat_kernel, L->w_down, 0, g->b_ffg, 0, g->b_r, 0, nil, 0,
-                       PARAMS(c->hidden, c->ffn_hidden));
-                enc_op(&E, KI_ADD, g->b_x, 0, g->b_r, 0, g->b_x, 0, nil, 0,
-                       PARAMS(c->hidden));
+                sg_enc_op(&E, KI_RMSNORM, g->b_x, 0, L->ln2, 0, g->b_h, 0, nil, 0,
+                          PARAMS(c->hidden, eps, 1));
+                sg_enc_op(&E, g->mat_kernel, L->w_gate, 0, g->b_h, 0, g->b_ffg, 0, nil, 0,
+                          PARAMS(c->ffn_hidden, c->hidden));
+                sg_enc_op(&E, g->mat_kernel, L->w_up, 0, g->b_h, 0, g->b_ffu, 0, nil, 0,
+                          PARAMS(c->ffn_hidden, c->hidden));
+                sg_enc_op(&E, KI_SWIGLU, g->b_ffg, 0, g->b_ffu, 0, g->b_ffg, 0, nil, 0,
+                          PARAMS(c->ffn_hidden));
+                sg_enc_op(&E, g->mat_kernel, L->w_down, 0, g->b_ffg, 0, g->b_r, 0, nil, 0,
+                          PARAMS(c->hidden, c->ffn_hidden));
+                sg_enc_op(&E, KI_ADD, g->b_x, 0, g->b_r, 0, g->b_x, 0, nil, 0,
+                          PARAMS(c->hidden));
             }
 
-            enc_op(&E, KI_RMSNORM, g->b_x, 0, g->out_norm, 0, g->b_h, 0, nil, 0,
-                   PARAMS(c->hidden, eps, 1));
+            sg_enc_op(&E, KI_RMSNORM, g->b_x, 0, g->out_norm, 0, g->b_h, 0, nil, 0,
+                      PARAMS(c->hidden, eps, 1));
             /* lm_head aliases tok_emb when the embeddings are tied, which is
              * exactly mlx's embed_tokens.as_linear(out). */
-            enc_op(&E, g->mat_kernel, g->lm_head, 0, g->b_h, 0, g->b_logits, 0, nil, 0,
-                   PARAMS(c->vocab, c->hidden));
+            sg_enc_op(&E, g->mat_kernel, g->lm_head, 0, g->b_h, 0, g->b_logits, 0, nil, 0,
+                      PARAMS(c->vocab, c->hidden));
 
             [e endEncoding];
             [cb commit];
             [cb waitUntilCompleted];
             if ([cb error]) {
-                rc = gpu_errf("gpu: decode step failed: %s",
-                              [[[cb error] localizedDescription] UTF8String]);
+                rc = sg_gpu_errf("gpu: decode step failed: %s",
+                                 [[[cb error] localizedDescription] UTF8String]);
             }
         }
     }

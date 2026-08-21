@@ -14,8 +14,8 @@ since Task P2.2; this task is the wiring, the split-count policy, and the gates.
 
 New encoder helper `enc_attn_splitk` (`src/metal.m`). It has to encode the partial's grid
 by hand: that grid is 2D (x = split, y = query head) and `gpu_grid`'s (groups, elems) pair
-(`src/metal_validate.m` since task R3, `src/metal.m` when this was written)
-deliberately cannot express two group dimensions. There is no wait between the two
+(`sg_gpu_grid` in `src/metal_validate.m` since tasks R3 and R4; `gpu_grid` in
+`src/metal.m` when this was written) deliberately cannot express two group dimensions. There is no wait between the two
 dispatches; the default `MTLDispatchTypeSerial` gives an implicit barrier, which is
 exactly the property the one-shot entry points had to buy with a commit-and-wait.
 

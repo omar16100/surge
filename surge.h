@@ -831,7 +831,7 @@ sg_err sg_gpu_run_attn_prefill(sg_gpu *g, void *q, void *k, void *v, void *out,
  * two agree; on the shapes only the oracle accepts, there is nothing to compare
  * because the dispatch is refused up front, not silently computed differently.
  * k_attn_decode_splitk_partial does carry the same `repeat == 0` fallback the
- * oracle has, so the kernel would compute the oracle's answer, but check_params
+ * oracle has, so the kernel would compute the oracle's answer, but sg_check_params
  * makes that branch unreachable through these entry points and it must not be
  * read as a promise that the shape is supported.
  *

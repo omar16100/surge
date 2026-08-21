@@ -777,7 +777,7 @@ static void metal_matmul_q8_matches_ref_looped(void) {
     free(w); free(x); free(want);
 }
 
-/* check_params/check_sizes argument checking for the three new kernels,
+/* sg_check_params/sg_check_sizes argument checking for the three new kernels,
  * mirroring metal_rejects_bad_arguments's style below for the existing
  * kernels. */
 static void metal_matmul_rejects_bad_params(void) {
@@ -796,7 +796,7 @@ static void metal_matmul_rejects_bad_params(void) {
     tt_assert(sg_failed(e), "k_matmul_bf16 K=0 should be rejected");
 
     /* Q8_0 rows are whole 32-element blocks; K not a multiple of 32 must be
-     * rejected before check_sizes truncates the block count (the same
+     * rejected before sg_check_sizes truncates the block count (the same
      * ordering k_matvec_q8 relies on, tested above for that kernel). */
     uint32_t q8_odd_k[8] = {2, 2, 40, 0, 0, 0, 0, 0};
     e = sg_gpu_run_op(g_gpu, "k_matmul_q8", a.b, b.b, o.b, q8_odd_k);
@@ -1315,7 +1315,7 @@ static void metal_kv_store_f16_roundtrips(void) {
 
     /* Also store at a NONZERO destination offset, into the middle of a
      * larger buffer, poisoning the surrounding halves first: the batched
-     * decode path (enc_kv_store) always stores at pos*kv_width, never at
+     * decode path (sg_enc_kv_store) always stores at pos*kv_width, never at
      * offset 0 past the very first position, and *2-vs-*4 byte-offset
      * mistakes are exactly the kind of bug that would only show up once the
      * offset is nonzero. */
@@ -1323,7 +1323,7 @@ static void metal_kv_store_f16_roundtrips(void) {
     gbuf a2 = gb_from(src, n2);   /* reuse the first n2 rounded values */
 
     /* sg_gpu_run_op has no offset concept of its own (it always binds a
-     * handle at ITS OWN base); drive the nonzero offset the way enc_kv_store
+     * handle at ITS OWN base); drive the nonzero offset the way sg_enc_kv_store
      * does, by binding a handle whose contents start `off` halves into a
      * larger buffer. sg_gpu_wrap gives that (page-aligned base, arbitrary
      * byte offset from there), which also cross-checks the offset math
@@ -2766,7 +2766,7 @@ static void splitk_determinism(void) {
 }
 
 /* The host-side contract: every documented rejection actually rejects. These
- * need no correct kernel at all (check_params and the size rules run before
+ * need no correct kernel at all (sg_check_params and the size rules run before
  * anything is encoded), so they are the one part of this subtest that does
  * not depend on the deferred numeric gates. */
 static void splitk_rejects_bad_arguments(void) {

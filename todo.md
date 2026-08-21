@@ -684,6 +684,13 @@ was unenforced -- `run_op` now rejects an output whose buffer and byte range
 intersect an input's; `sg_gpu_wrap` accepted pointers it could not bind --
 now requires 4-byte alignment and checks both length steps for wraparound.
 Suite went 60 -> 75 checks, no measured error changed.
+(`check_sizes` here, and every other bare Metal host global name in this entry
+and in the M3, P2.x, R2 and R3 entries below it, are AS OF THE DAY EACH ENTRY
+WAS WRITTEN. Task R4 (2026-08-21) renamed twelve of them to `sg_<name>`, so
+`git grep check_sizes src/` now returns nothing; the entry "Task R4 Results:
+sg_ prefix the twelve promoted Metal host globals" at the end of this file
+carries the full old-to-new mapping. The dated entries are deliberately not
+rewritten, following the policy R3 fixed on.)
 
 ## Task 10 Results (full Metal decode path, M2 gate)
 
@@ -4314,3 +4321,177 @@ Line counts touched by this round: `Makefile` 201 -> 210, `src/sched.c` 332 -> 3
 
 Full write-up: the FIX ROUND 1 section of
 `.superpowers/sdd/2026-08-09-surge-m3-m5/task-R3-report.md`.
+
+## Task R4 Results: sg_ prefix the twelve promoted Metal host globals (2026-08-21)
+
+DONE, and it is a pure rename in the strongest available sense. (CORRECTED IN FIX ROUND 1,
+2026-08-21: this paragraph originally named a `__const` and a `__data` section, and 412 changed
+lines. `__DATA __data` and `__TEXT __const` exist in NONE of the three objects and `__DATA
+__const` in only one, so those cells were empty-versus-empty; and the 412 silently dropped
+8 Makefile lines and 4 `src/kernels_splitk.metal` lines. What follows is what was measured.)
+EVERY section of all three Metal objects is BYTE-IDENTICAL to the parent's, 20 of 20 with the
+inventory enumerated from `otool -l` rather than assumed (`metal.o` 10 sections, including
+`__literal16`, `__literal8`, `__bss`, `__objc_classrefs`, `__cfstring`, `__DATA __const` and
+`__compact_unwind`; `metal_prefill.o` 6; `metal_validate.o` 4), each compared with an emptiness
+guard so an absent section cannot pass as a match. EVERY RELOCATION RECORD IS IDENTICAL TOO,
+1212 + 225 + 178 = 1615 after un-prefixing the twelve, and that is the half that carries the
+proof: identical `__text` bytes do NOT establish equivalence on arm64, because a `bl` is emitted
+with a zero displacement and its target lives in the relocation entry, so a retargeted call
+would be invisible to a byte comparison. All 61 functions across the three are instruction-for-
+instruction identical, `nm -a` on the linked `surge` matches the parent ADDRESS FOR ADDRESS once
+the twelve are un-prefixed (298 symbols both sides), all 13 sections of that binary and its
+149-entry export trie match, `src/kernels.metallib` is byte-identical (`cmp` rc 0), and both
+check counts are unmoved. `git diff` changes 424 lines ACROSS THE EIGHT SOURCE FILES IT TOUCHES:
+276 are rename-only, 140 are a rename plus a continuation line shifted by the three columns the
+prefix added (every one of the 140 is exactly +3), and 8 are the comment block at `Makefile:9-16`
+describing the guard, rewritten because the guard's semantics changed from "interim, freezes
+twelve" to "freezes the empty set". Both Makefile hunks are comment-only: no rule, recipe line
+or variable changed, and `METAL_M` is untouched. No file's line count changed.
+
+THE TWELVE, all `sg_<name>`, no exceptions and no re-spellings: `gpu_errf` -> `sg_gpu_errf`,
+`enc_op` -> `sg_enc_op`, `check_params` -> `sg_check_params`, `gpu_grid` -> `sg_gpu_grid`,
+`enc_matmul` -> `sg_enc_matmul`, `check_sizes` -> `sg_check_sizes`, `gpu_alloc_f32` ->
+`sg_gpu_alloc_f32`, `scratch_ensure` -> `sg_scratch_ensure`, `enc_kv_store` ->
+`sg_enc_kv_store`, `gpu_elem_width` -> `sg_gpu_elem_width`, `gemm_kernel_for` ->
+`sg_gemm_kernel_for`, `gpu_embed_row` -> `sg_gpu_embed_row`. All twelve `sg_` names were
+checked for collisions with `surge.h`'s public API first: zero hits for all twelve, so nothing
+is shadowed. Reference counts verified before starting rather than taken from the brief, and
+they matched exactly: 94, 67, 27, 19, 17, 17, 14, 13, 11, 8, 7, 6 across `src`, `tests`,
+`tools` and `surge.h`.
+
+WHOLE-WORD REPLACEMENT, WHICH MATTERED ONCE. `splitk_scratch_ensure` (a separate `static` in
+`src/metal.m`, 5 references) CONTAINS `scratch_ensure` and must not be touched; a substring
+`sed` would have produced `splitk_sg_scratch_ensure`. It is untouched, and it is the only such
+case in the tree. The Mach-O symbol spellings `_enc_op` / `_check_params` / `_gpu_grid` /
+`_check_sizes` that appear in the R3 report are also substring-safe for the same reason.
+
+CONTINUATION ALIGNMENT PRESERVED, not merely left alone. Adding three characters to a call or
+prototype moves the open paren, so 140 continuation lines that were aligned under it stopped
+being aligned. All 140 were shifted by exactly three columns. Proved rather than eyeballed: the
+count of aligned continuation lines is 215 / 40 / 24 / 5 in `metal.m` / `metal_prefill.m` /
+`metal_validate.m` / `metal_internal.h` BOTH before and after, with zero lost and zero gained.
+Pre-existing deliberate non-alignments (the long `buf_big_enough(...) return sg_gpu_errf(...)`
+one-liners) were left exactly as they were.
+
+THE GUARD IS NOW EMPTY AND STILL HAS TEETH. `tools/check_metal_globals.sh`'s `FROZEN` list goes
+from the twelve to `""`. A DEFECT IN THE GUARD WAS FOUND AND FIXED IN THE PROCESS: the R3
+report asserted that "after R4 lands, FROZEN becomes empty and both checks still pass", and
+that was FALSE. With an empty `FROZEN`, CHECK 2 builds the alternation `\b()[[:space:]]*\(`,
+which matches the empty string before any `(` and reports every declaration in the tree; run as
+written it fails on `src/bench.c` and everything after it. CHECK 2 is now skipped wholesale
+when `FROZEN` is empty, and comes back automatically if a name is ever re-frozen. CHECK 1, the
+one with teeth now, is what stops the next `src/metal.m` cut landing its own dozen bare names.
+Mutation-proved on a scratch copy at `/tmp/r4guard2`, eight cases: clean PASSES; a bare
+`sg_err frobnicate(const char *kernel, const uint32_t *p);` FAILS; the same name `sg_`-prefixed
+PASSES; removal returns to PASS; an OLD name coming back bare (`gpu_grid`) FAILS, which is a
+regression guard on R4 itself; with one name re-frozen, a rogue declaration in `tests/` FAILS
+while a comment mentioning it on the line above does not trip it; the `removed` arm of CHECK 1
+fires for a frozen name the header no longer declares; and the tree returns to PASS.
+
+CHECK 1 WAS HARDENED IN FIX ROUND 1 (2026-08-21), because the R4 report described it as
+"unchanged in behaviour" when its CONSEQUENCE had changed: before R4, CHECK 2 was a second
+independent net over `src`, `tests`, `tools` and `surge.h`; after R4 that net is off by design
+and CHECK 1 is alone. The review drove fifteen unprefixed declaration shapes at it and SIX
+EVADED with rc 0: `char **f(int);` and `const char **f(int);` (the extractor's `[ *]` allowed
+exactly one pointer character), a prototype whose return type sits on its own line, a function
+pointer `sg_err (*f)(int);`, and worst, `extern int g;` and `int g;`, so a promoted global
+VARIABLE was invisible to a script called check_metal_globals.sh. The single-`sed` extractor is
+replaced by an awk pass that joins each column-1 declaration up to its `;` or `{` and then
+parses it, skipping `static`, `typedef`, directives, `extern "C"`, `__attribute__` decorators
+and struct/union/enum definitions and forward declarations. All fifteen shapes are now caught
+(15 of 15, against 9 of 15 before) and eight negatives stay silent (`sg_`-prefixed forms
+including `char **sg_f(int);`, `static`, `typedef`, a comment mention of a bare name, a struct
+forward declaration). What it still cannot see is written into the script header: any header
+OTHER than `src/metal_internal.h`, anything not at column 1, anything inside a `#if`, and a
+column-1 macro INVOCATION is reported under the macro's own name, a loud false positive that is
+the deliberate trade. `make check` 87604 / 0 and `make debug` 83614 / 0 are unmoved by the
+hardening.
+
+GATES, all six, deliberately stronger than R2's and R3's because a rename must prove more than
+a move. (1) `make check` 87604 checks, 0 failures, 19 count blocks, per-block identical block
+for block to the pre-rename baseline measured in this same worktree. (2) `make debug` 83614
+checks, 0 failures, 16 blocks, rc 0, 0 sanitizer diagnostics. (3) `nm -a` on `surge`: 298
+symbols before, 298 after, identical address for address after un-prefixing; zero unprefixed
+survivors from the twelve. (4) Codegen: 49 + 9 + 3 = 61 of 61 functions instruction-for-
+instruction identical, none added, none lost, and every section digest equal, so the usual
+"modulo symbol names" caveat is not even needed for the section bytes. (5)
+`clang -fsyntax-only -std=c11 -Wall -Wextra -Werror` CLEAN on all three `.m` files in both the
+Metal and `-DSURGE_NO_METAL` configurations. (6) `xcrun dyld_info -exports ./surge`: ZERO
+unprefixed entries from the twelve, all twelve present `sg_`-prefixed at the same addresses,
+export trie 149 entries before and after. The metallib is byte-identical (this task edited four
+comments in `src/kernels_splitk.metal`), and `tests/bench_splitk.bin`, the one Metal target not
+in `check`, still links with three sources on the line.
+
+ONE GATE-1 FLAKE, REPORTED RATHER THAN QUIETLY RE-RUN. The first post-rename `make check`
+failed `test_cli_bench`'s `b6 check2`: `rel_diff 0.0351 >= 0.03` between the reported decode
+slope (1063.42 tok/s) and the reported average (1102.12). It is a live wall-clock assertion
+that two throughput statistics of the SAME 1024-token run agree within 3 percent, so it is a
+property of this box's timing, not of any code. The proof it is not the rename: the `./surge`
+that failed it has a `__text` section BYTE-IDENTICAL to the pre-rename baseline binary, and the
+check's own math sub-assertion (reported vs offline recomputation) passed at rel_err 3.17945e-06.
+After 120 s of GPU idle the rerun gave `rel_diff 0.0224` and the full 87604 / 0. This box has a
+documented 2.4x throughput spread across identical arms and a firmware power clamp, both
+already recorded in the P2.9 and P3.0 entries.
+
+OPEN RECOMMENDATION ON `b6 check2`, RAISED BY THE R4 REVIEW, NOT IMPLEMENTED, FOR THE USER TO
+RULE ON. Nothing was changed in `tests/test_cli_bench.sh` and the tolerance is still 3 percent.
+The argument: `check2` is two assertions and only one is hermetic. Its avg-sanity half
+(`:498-509`) recomputes `decode_tps_avg` offline from the same timeseries at 0.5 percent and
+passed at 3.17945e-06, and `check1` (`:455-462`) does the identical thing for the slope against
+an offline mean-centered OLS refit, also at 0.5 percent, and passed. Once both pass, the
+slope-versus-average comparison at `:511-516` is a deterministic function of the emitted
+timeseries alone, so no code path can move it that is not already pinned at 0.5 percent by the
+other two: it carries zero code-correctness information and degenerates into a gate on whether
+this machine ran 1024 decode steps evenly. Its own rationale block (`:272-286`) calibrated the
+3 percent against a measured 1 percent ceiling for `-n 1024`, and the observed 3.51 percent is
+3.5x that ceiling, so this was not a marginal miss. On a box with a documented 2.4x run-to-run
+spread and a firmware power clamp, a hard wall-clock equality gate inside the project's primary
+87604-check gate teaches its readers to re-run rather than investigate, which is the habit that
+would let a real regression through. The three options, in the review's order of preference:
+(1) demote it to a printed warning that does not set `ok = False`; (2) keep it failing but make
+it best-of-two, sleeping a fixed idle period and taking one more steady run, failing only if
+both miss; (3) if it must stay a single-shot hard gate, widen it to at least 6 percent, which is
+above the 5.7 percent post-churn maximum the rationale block itself records, and say in that
+block that the tolerance is set against the post-churn maximum. Whichever is chosen, the
+3.51 percent observation of 2026-08-21 on byte-identical code should go into the rationale block
+so the next person to tune this has the datapoint.
+
+PROSE SWEPT, WITH A STATED POLICY FOR HISTORY. Renamed in everything that describes the code as
+it is now: the four Metal host files, `surge.h`'s one mention, `tests/test_metal_ops.c`'s five,
+`src/kernels_splitk.metal`'s four comments, the `Makefile`'s two, `docs/c4model.md` throughout
+plus a new R4 sentence in the Level 2 Metal bullet and the `src/metal_internal.h` row, and
+`docs/index.md`'s c4model hook. `tools/prefill_longctx_gate.sh` was checked and contains none
+of the twelve. DELIBERATELY NOT REWRITTEN, because they are dated records of what was true when
+written, following the policy R3 fixed on: this file's own pre-R4 entries, and
+`docs/superpowers/plans/2026-08-09-surge-m3-m5.md:23`'s historical file list. This entry is the
+signpost for those; the mapping above is the whole of it.
+`docs/16082026_splitk_decode_gate.md` is a dated gate doc and got the navigation annotation
+rather than a rewrite: its `gpu_grid` sentence now names `sg_gpu_grid` in
+`src/metal_validate.m` since R3 and R4, and `gpu_grid` in `src/metal.m` when it was written.
+`tools/check_metal_globals.sh`'s own header keeps the bare names where it explains what the
+hole WAS.
+
+WHAT THIS DOES AND DOES NOT CLOSE. It closes the R3 review's Important 2 (finding G): the quiet
+risk was a future translation unit declaring `sg_err check_params(...)` itself, without the
+header, and binding silently, and the export-trie evidence showed the surface was
+`dlsym(RTLD_DEFAULT, ...)`-wide rather than repo-wide. Twelve generic names are gone from that
+trie. It does NOT touch `src/metal.m`'s 3207 lines, which is still 1.6x the guideline; the
+redrawn cut two (716 lines, landing at 2491, `enc_attn_splitk` and the two `*_use` predicates
+EXCLUDED so `sg_gpu_forward` stays bit-identical) is the next enumerated step, and it was
+DECLINED by the user for now. No performance measurement was taken and none is needed: the
+machine code is byte-identical, so there is nothing to measure.
+
+FIX ROUND 1 (2026-08-21) closed all six review findings and touched no `.c`, `.h`, `.m` or
+`.metal` file. The rename itself was re-derived a third time from objects built in this fix
+round and is clean. Corrected: the false `__data` / `__const` section claim in `docs/c4model.md`
+and in this entry, and the scope-narrowed 412-line arithmetic. Hardened: CHECK 1 in
+`tools/check_metal_globals.sh`, which had six evasions, now 15 of 15 caught with its remaining
+blind spots written into the script header. Recorded: the `b6 check2` recommendation above, as a
+recommendation only. Annotated: `todo.md`'s first stale name in place, and
+`docs/superpowers/plans/2026-08-09-surge-m3-m5.md:23` the way its sibling dated doc was.
+Gates re-run: `make check` 87604 / 0 and `make debug` 83614 / 0 / 0 sanitizer diagnostics, both
+per-block identical to the R4 figures, and `b6 check2` passed first time at `rel_diff 0.0134254`
+so the flake did not fire.
+
+Full report: `.superpowers/sdd/2026-08-09-surge-m3-m5/task-R4-report.md`, including its FIX
+ROUND 1 section.

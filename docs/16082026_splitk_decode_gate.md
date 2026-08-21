@@ -25,9 +25,9 @@ exactly the property the one-shot entry points had to buy with a commit-and-wait
 MEASURED, not chosen. `make bench-splitk` (Task P2.3a's harness) swept
 `n_splits` over {1..1024} at seq 8192 / 32768 / 131072 / 262144 on the real 27B decode
 shape (24 heads, 4 kv, head_dim 256) and the real 4B dense shape (32 heads, 8 kv, head_dim
-128); the fastest value was exactly `seq / SG_TG` in the cells that matter, which is the
-top of the occupancy band documented on the kernel: give every split exactly SG_TG keys so
-no lane of the threadgroup idles. At 262144 the pair beat the incumbent by 15.9x (27B
+128); the fastest value was exactly `seq / SG_TG` in seven of those eight cells, which is
+the top of the occupancy band documented on the kernel: give every split exactly SG_TG keys
+so no lane of the threadgroup idles. At 262144 the pair beat the incumbent by 15.9x (27B
 shape) and 21.9x (4B shape).
 
 A re-measurement on 2026-08-16 at seq 32768 confirms both the ratio and the optimum:
@@ -40,9 +40,22 @@ A re-measurement on 2026-08-16 at seq 32768 confirms both the ratio and the opti
 128 is `32768 / 256`, i.e. the closed form, and it was the best of {4, 8, 16, 32, 64, 128}
 for both shapes in that run.
 
-One honest deviation: in a fresh sweep at seq 8192 the 27B shape's best was n_splits 16
-(5.226x) against the closed form's 32 (4.965x), a 5 percent difference at the shallow end
-where attention is not the decode bottleneck. The closed form remains the policy.
+The eighth cell is a real counterexample, now reproduced twice. In a fresh P2.3 sweep at seq
+8192 the 27B shape's best was n_splits 16 (5.226x) against the closed form's 32 (4.965x),
+and the P2.3 reviewer's independent sweep (`--reps 20`, fans on firmware auto) read 16 at
+5.447x against 32 at 5.180x. Two runs agreeing on a roughly 5 percent gap in the same
+direction is not run-to-run noise, so P2.3a's "optimum at every measured cell" is wrong as
+written. The same reviewer saw the 27B curve go non-monotonic at 32768 as well (16 at
+9.699x above 32 at 9.129x and 64 at 9.123x, before 128 at 10.783x wins the cell); the 4B
+dense shape at 8192 does peak at the closed form.
+
+The closed form remains the policy, and that is a decision rather than an oversight. It is
+the TOP OF THE OCCUPANCY BAND the kernel header derives, not a constant fitted to this
+table, so it extrapolates to shapes and depths nobody swept. The curve is shallow near the
+optimum, so being one power of two off costs single-digit percent. And a single 5 percent
+outlier at one shape at one depth, where attention is not the decode bottleneck, does not
+pay for a shape-specific special case that would need its own sweep and its own regression
+gate to stay true. Anyone extending the policy re-measures rather than assuming.
 
 ## The fallback, and why the threshold is 1024
 
@@ -60,8 +73,12 @@ so splits come out shorter than SG_TG keys and lanes start idling. Decode keeps
 | 4096 | 3.434x | 3.226x |
 | 8192 | 5.226x | 5.222x |
 
-Split-K is a REGRESSION at 256 keys (about 1.4x slower), a wash at 512, and a clear win
-from 1024 up. The threshold therefore sits exactly where the policy's own clamp stops
+Split-K is a REGRESSION at 256 keys (about 1.4x slower), roughly break-even to slightly
+slower at 512, and a clear win from 1024 up. The P2.3 reviewer re-measured the 512 row at
+0.924x / 0.948x, i.e. a small regression on BOTH shapes rather than the wash this doc first
+called it; that run had fans on firmware auto, so limiter shape versus a real measurement
+disagreement is unresolved, and either way it justifies the 1024 threshold slightly better
+rather than worse. The threshold therefore sits exactly where the policy's own clamp stops
 binding, and no configuration is used outside the range where it was measured.
 
 `SURGE_ATTN_SPLITK=0` pins the incumbent for every step. That is what makes an A/B

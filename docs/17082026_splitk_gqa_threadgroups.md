@@ -217,7 +217,9 @@ everywhere tested.
 
 ### The shipped split policy WAS wrong for this kernel (FIXED by task P2.5)
 
-`n_splits = clamp(seq / SG_TG, 4, 1024)` was measured optimal for the per-head partial. **GQA's
+`n_splits = clamp(seq / SG_TG, 4, 1024)` was measured optimal for the per-head partial in seven
+of P2.3a's eight cells (the 27B shape at seq 8192 prefers 16 over 32 by about 5 percent, a
+counterexample reproduced twice; see `docs/16082026_splitk_decode_gate.md`). **GQA's
 optimum is consistently lower**, so reusing that policy costs real throughput:
 
 | shape | seq | policy picks | policy time | GQA optimum | best time | left on the table |

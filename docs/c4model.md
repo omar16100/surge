@@ -480,9 +480,23 @@ optionally Accelerate for the CPU reference path. No third-party libraries.
     DECODE PATH's attention. The P2.3a sweep ran once the GPU freed and settled the
     decision: at seq 262144 the pair beats `k_attn_decode_f16` by 15.9x on the 27B decode
     shape and 21.9x on the 4B dense shape, and the fastest `n_splits` was exactly
-    `seq / SG_TG` at every measured cell, so the wired default is the closed form
-    `n_splits = clamp(seq / SG_TG, 4, 1024)` (the top of the occupancy band: every split
-    gets exactly SG_TG keys). `enc_attn`'s fp16 branch calls the new `enc_attn_splitk`,
+    `seq / SG_TG` in seven of the eight cells P2.3a swept, so the wired default is the
+    closed form `n_splits = clamp(seq / SG_TG, 4, 1024)` (the top of the occupancy band:
+    every split gets exactly SG_TG keys). THE EIGHTH CELL IS A KNOWN COUNTEREXAMPLE and is
+    recorded here rather than smoothed over: on the 27B decode shape at seq 8192 the
+    fastest value is `n_splits` 16, not the closed form's 32. Two independent re-sweeps
+    agree (P2.3's own: 16 at 5.226x vs 32 at 4.965x; the P2.3 review's, `--reps 20`,
+    fans on firmware auto: 16 at 5.447x vs 32 at 5.180x), so the roughly 5 percent gap is
+    reproducible, not run-to-run noise, and that review also saw the 27B curve go
+    non-monotonic at 32768 (16 at 9.699x above 32 at 9.129x, before 128 at 10.783x wins
+    the cell). The 4B dense shape at 8192 does peak at the closed form. THE POLICY DOES
+    NOT CHANGE, deliberately: the closed form is the top of the occupancy band the kernel
+    header derives rather than a fitted constant, the curve is shallow near the optimum,
+    and one 5 percent outlier at one shape and one depth (where attention is not the
+    decode bottleneck) does not pay for a shape-specific special case that would need its
+    own sweep and its own gate to stay honest. Anyone extending the policy must re-measure
+    rather than assume the closed form is optimal everywhere.
+    `enc_attn`'s fp16 branch calls the new `enc_attn_splitk`,
     which encodes the partial (hand-rolled 2D grid, x = split, y = head, since `gpu_grid`
     cannot carry two group dimensions) and then the combine into the SAME open command
     buffer, relying on `MTLDispatchTypeSerial`'s implicit inter-dispatch barrier instead
@@ -490,7 +504,11 @@ optionally Accelerate for the CPU reference path. No third-party libraries.
     where the clamp's floor starts binding and splits fall under SG_TG keys) decode keeps
     `k_attn_decode_f16`, and a `--seqs` sweep added to `tests/bench_splitk.c` MEASURED that
     crossover rather than assuming it (at seq 256 split-K is 0.69-0.71x, i.e. slower; at
-    512 it is 0.95-1.02x; at 1024 it is 1.27-1.88x and rising). `SURGE_ATTN_SPLITK=0` pins
+    512 it is 0.95-1.02x; at 1024 it is 1.27-1.88x and rising). The P2.3 review re-measured
+    512 at 0.924x / 0.948x, i.e. a small REGRESSION on both shapes rather than a wash,
+    which makes the 1024 threshold better justified, not worse (its run was fans-auto, so
+    the cause, limiter shape or a real disagreement, is unresolved).
+    `SURGE_ATTN_SPLITK=0` pins
     the incumbent, which is what makes the A/B measurable and why that kernel stays
     reachable; the f32-KV path always uses it (the split-K kernels read half-typed K/V).
     THE SCRATCH HAZARD IS STRUCTURALLY CLOSED: the partial binds the DEDICATED

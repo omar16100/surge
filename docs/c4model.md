@@ -46,14 +46,23 @@ optionally Accelerate for the CPU reference path. No third-party libraries.
   optional. The twelve promoted helpers were UNPREFIXED globals, all of them in the
   `surge` binary's dynamic export trie; task R4 (2026-08-21) renamed every one to
   `sg_<name>`, landing BEFORE the next `src/metal.m` cut as planned, so the export trie now
-  carries no unprefixed entry from that set. R4 was a PURE RENAME and is gated as one: the
-  `__text`, `__cstring`, `__const` and `__data` sections of all three objects are
-  byte-identical to the parent's, all 61 functions are instruction-for-instruction
-  identical, `nm -a` matches address for address once the twelve are un-prefixed, and both
-  check counts are unmoved. `tools/check_metal_globals.sh` (run from the `check` recipe,
-  pure grep, no compiler) now freezes the unprefixed set at EMPTY and fails the build if
-  ANY unprefixed global joins `src/metal_internal.h`, which is what will keep the next cut
-  from promoting its own dozen bare names.
+  carries no unprefixed entry from that set. R4 was a PURE RENAME and is gated as one,
+  against the section inventory the objects actually have rather than an assumed list:
+  EVERY section of all three objects is byte-identical to the parent's, 20 of 20
+  (`metal.o` has 10, `metal_prefill.o` 6, `metal_validate.o` 4, enumerated from `otool -l`
+  and each compared with an emptiness guard so an absent section cannot pass as a match).
+  So is every RELOCATION record, 1212 + 225 + 178 = 1615, identical after un-prefixing the
+  twelve; that is the load-bearing half, because identical `__text` bytes alone do not
+  prove equivalence on arm64, where a `bl` is emitted with a zero displacement and its
+  target lives in the relocation entry. The linked `surge` matches across all 13 of its
+  sections, its 149-entry export trie and all 298 `nm -a` symbols address for address,
+  `src/kernels.metallib` is byte-identical (`cmp` rc 0), and both check counts are
+  unmoved. `tools/check_metal_globals.sh` (run from the `check` recipe, a text scan, no
+  compiler) now freezes the unprefixed set at EMPTY and fails the build if an unprefixed
+  external-linkage declaration joins `src/metal_internal.h` at column 1, in any of the
+  shapes a promotion takes: a prototype at any pointer depth, one whose return type wraps
+  onto the next line, a function pointer, or a global VARIABLE. It reads that ONE header,
+  so a second shared header would be unguarded.
   Only binaries that need the GPU link these.
 - **CLIs**: `surge-info` (GGUF dump), `surge-ref` (CPU-reference forward + `--logits`),
   `surge` (Metal decode), `surge-bench` (benchmark harness; B5 shipped, wires B1-B4 + the

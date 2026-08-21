@@ -8,12 +8,15 @@ TESTS = $(wildcard tests/test_*.c)
 check: $(TESTS:.c=.bin)
 # Guard on the Metal host layer's UNPREFIXED global set, which task R4 emptied
 # by sg_ prefixing the twelve the R2/R3 splits had promoted (sg_check_params,
-# sg_check_sizes, sg_gpu_grid, sg_enc_op, ...). Pure grep over source: no
-# compiler, no GPU, no model, no ordering dependence, so it is free and
-# deterministic in both `check` and `debug`'s -DSURGE_NO_METAL recursion, and it
-# asserts NOTHING about test counts. It now fails if ANY unprefixed global joins
-# src/metal_internal.h, which is what keeps the next src/metal.m cut from
-# promoting its own dozen bare names. See the script's header comment.
+# sg_check_sizes, sg_gpu_grid, sg_enc_op, ...). Pure text scan over source (grep
+# plus one awk pass): no compiler, no GPU, no model, no ordering dependence, so
+# it is free and deterministic in both `check` and `debug`'s -DSURGE_NO_METAL
+# recursion, and it asserts NOTHING about test counts. It fails if an unprefixed
+# external-linkage declaration joins src/metal_internal.h at column 1, in any of
+# the shapes a promotion takes: a prototype at any pointer depth, one whose
+# return type wraps, a function pointer, or a global VARIABLE. It reads that ONE
+# header, so a second shared header would be unguarded; the rest of the blind
+# spots are written down in the script's header comment.
 	@bash tools/check_metal_globals.sh
 	@set -e; for t in $^; do ./$$t; done
 # Gate 4 (M5.6): the `surge` CLI's prefill (default) vs --no-prefill must emit

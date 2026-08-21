@@ -28,12 +28,37 @@
 # helpers, and CHECK 1 is what stops them landing unprefixed. It does two
 # things:
 #
-#   CHECK 1  The set of UNPREFIXED external-linkage prototypes declared in
+#   CHECK 1  The set of UNPREFIXED external-linkage DECLARATIONS in
 #            src/metal_internal.h is exactly the frozen set below, which is now
 #            EMPTY. Any unprefixed global joining fails here, which forces the
 #            author to either sg_-prefix it (right answer) or edit this list
-#            deliberately. Adding an `sg_`-prefixed prototype is always fine
-#            and is invisible to this check. THIS IS THE CHECK WITH TEETH NOW.
+#            deliberately. Adding an `sg_`-prefixed declaration is always fine
+#            and is invisible to this check. THIS IS THE CHECK WITH TEETH NOW,
+#            and since the R4 FIX ROUND (2026-08-21) it recognises five shapes
+#            the single-`sed` extractor it shipped with let through:
+#              - any pointer depth in the return type, `char **f(int);` and
+#                `const char **f(int);` (the old class allowed exactly one
+#                pointer character)
+#              - a prototype whose return type sits on its own line and whose
+#                name starts the next one
+#              - a function-pointer declaration, `sg_err (*f)(int);`
+#              - an external-linkage VARIABLE, `extern int g;`
+#              - a tentative definition, `int g;`
+#            The last two mattered most: a promoted global VARIABLE was
+#            invisible to a script whose entire job is the global set. Mutation
+#            -proved on fifteen unprefixed declaration shapes (15 of 15 caught,
+#            against 9 of 15 before) plus eight negatives that must stay silent
+#            (sg_-prefixed forms, `static`, `typedef`, a comment mention, a
+#            struct forward declaration).
+#
+#            WHAT IT STILL DOES NOT SEE, written down because the author of the
+#            next cut is exactly who reads this: anything declared in a header
+#            OTHER than src/metal_internal.h, so a SECOND shared header would be
+#            entirely unguarded; anything not beginning in column 1; and
+#            anything inside a #if, since this never preprocesses. A macro
+#            INVOCATION at column 1 that expands to a declaration is reported
+#            under the macro's own name, which is a false positive and is the
+#            deliberate trade: this guard fails loud, never quiet.
 #   CHECK 2  No file outside the four that own them declares or defines a
 #            frozen name. Comment mentions are fine and are skipped; this looks
 #            only at declaration/definition context. With FROZEN empty it has
@@ -66,16 +91,70 @@ if [ ! -f "$hdr" ]; then
     exit 1
 fi
 
-# CHECK 1. Extract every external-linkage function prototype from the header:
-# a line starting in column 1 that is not `static`, `typedef` or a directive,
-# and that names an identifier immediately before a `(`. Continuation lines of
-# a multi-line prototype are indented and therefore never match. Then drop the
-# sg_-prefixed ones, which since R4 is every one of them.
-have="$(grep -E '^[A-Za-z_]' "$hdr" \
-        | grep -vE '^(static|typedef|#)' \
-        | sed -nE 's/^[A-Za-z_][A-Za-z_0-9 ]*[ *]([A-Za-z_][A-Za-z_0-9]*)[[:space:]]*\(.*/\1/p' \
-        | grep -vE '^sg_' \
-        | sort -u)"
+# CHECK 1. Extract every identifier the header gives EXTERNAL LINKAGE, then drop
+# the sg_-prefixed ones, which since R4 is every one of them. A declaration
+# starts on a line whose first column is a letter or `_` and ends at the first
+# `;` or `{`, so a prototype wrapped over several lines is joined before it is
+# parsed instead of being ignored because its tail is indented. `static`,
+# `typedef`, preprocessor lines, `extern "C"`, __attribute__ decorators, and
+# struct/union/enum definitions and forward declarations declare no linker
+# symbol and are skipped. See the CHECK 1 paragraph in the header for the five
+# shapes this added and the three it still cannot see.
+have="$(awk '
+function trim(s) { sub(/^[ \t]+/, "", s); sub(/[ \t]+$/, "", s); return s }
+function last_ident(s,   n, w) {
+    gsub(/\[[^]]*\]/, " ", s)
+    sub(/=.*/, " ", s)
+    gsub(/[^A-Za-z_0-9]/, " ", s)
+    n = split(s, w, " ")
+    while (n > 0 && w[n] == "") n--
+    return (n > 0) ? w[n] : ""
+}
+function report(name) { if (name != "" && name !~ /^sg_/) print name }
+function process(d,   head, term, p, pre, post, decl, nd, j) {
+    d = trim(d)
+    if (d == "") return
+    if (match(d, /[;{]/)) { term = substr(d, RSTART, 1); head = substr(d, 1, RSTART - 1) }
+    else                  { term = "";                   head = d }
+    head = trim(head)
+    if (head == "") return
+    if (head ~ /^(struct|union|enum)$/) return
+    if (head ~ /^(struct|union|enum)[ \t]/ && (term == "{" || head ~ /^(struct|union|enum)[ \t]+[A-Za-z_][A-Za-z_0-9]*$/)) return
+    p = index(head, "(")
+    if (p > 0) {
+        pre  = substr(head, 1, p - 1)
+        post = substr(head, p + 1)
+        if (post ~ /^[ \t]*\*/) {
+            sub(/^[ \t]*\**[ \t]*/, "", post)
+            if (match(post, /^[A-Za-z_][A-Za-z_0-9]*/)) report(substr(post, 1, RLENGTH))
+            return
+        }
+        report(last_ident(pre))
+        return
+    }
+    nd = split(head, decl, ",")
+    for (j = 1; j <= nd; j++) report(last_ident(decl[j]))
+}
+BEGIN { inc = 0; acc = ""; nacc = 0 }
+{
+    l = $0
+    while (match(l, /\/\*.*\*\//)) { l = substr(l, 1, RSTART - 1) " " substr(l, RSTART + RLENGTH) }
+    if (inc) { if (match(l, /\*\//)) { l = substr(l, RSTART + 2); inc = 0 } else next }
+    if (match(l, /\/\*/))  { l = substr(l, 1, RSTART - 1); inc = 1 }
+    sub(/\/\/.*/, "", l)
+    if (acc == "") {
+        if (l !~ /^[A-Za-z_]/) next
+        if (l ~ /^static[^A-Za-z_0-9]/ || l ~ /^typedef[^A-Za-z_0-9]/) next
+        if (l ~ /^extern[ \t]+"/) next
+        if (l ~ /^__attribute__/ || l ~ /^__asm/) next
+        acc = trim(l); nacc = 1
+    } else {
+        acc = acc " " trim(l); nacc++
+    }
+    if (acc ~ /[;{]/ || nacc > 24) { process(acc); acc = ""; nacc = 0 }
+}
+END { if (acc != "") process(acc) }
+' "$hdr" | sort -u)"
 want="$(printf '%s\n' "$FROZEN" | grep -v '^$' | sort -u || true)"
 
 added="$(comm -13 <(printf '%s\n' "$want") <(printf '%s\n' "$have"))"

@@ -310,7 +310,7 @@ static void mini_f16_kv_decode_coherent(void) {
  * list says so). At 1088 the two would both be 4 and this gate would be blind
  * to exactly the bug the hand-rolled dispatch is most likely to have. */
 #define SPLITK_GATE_N 1600u
-#define SPLITK_GATE_THRESHOLD 1024u  /* SG_TG * 4, mirrored from metal.m */
+#define SPLITK_GATE_THRESHOLD 1024u  /* SG_TG * 4, mirrored from metal_internal.h */
 #define SPLITK_CAP_GATE_TG 256u      /* SG_TG itself, mirrored (P2.6 and P2.7) */
 
 /* ---- Task P2.7: what the GQA gates below cost, and why they cannot be short.

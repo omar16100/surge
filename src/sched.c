@@ -6,13 +6,17 @@
  * translation unit, and `make debug` (-DSURGE_NO_METAL + ASan/UBSan) covers
  * all of it with no GPU present.
  *
- * WHY IT IS ITS OWN FILE. B8's prefill duty cycle had to live in src/metal.m
+ * WHY IT IS ITS OWN FILE. B8's prefill duty cycle had to live in the Metal
+ * host layer (src/metal_prefill.m since task R2, src/metal.m before it)
  * because the loop it paces (the chunk loop) is inside sg_gpu_prefill. The
  * decode loop is not inside metal.m at all -- sg_gpu_forward is ONE step and
  * the per-token loop belongs to the caller -- so nothing here needs to be
- * near Metal. Keeping it out matters: src/metal.m is already 4616 lines
- * against this project's ~2000-line guideline, and adding pacing there would
- * have made the worst offender worse.
+ * near Metal. Keeping it out matters: the Metal host layer is still the
+ * largest thing in src (task R2 split it into src/metal.m +
+ * src/metal_prefill.m, task R3 split src/metal_validate.m out as well, so it
+ * is THREE translation units now, and metal.m is STILL over this project's
+ * ~2000-line guideline), and adding pacing there would have made the worst
+ * offender worse.
  *
  * WHAT IS DELIBERATELY NOT HERE. No fan control, no power management, no
  * shelling out to any external daemon. surge is a public engine; driving a
@@ -87,7 +91,7 @@ static void pace_detector_clear(sg_decode_pacer *p) {
 
 /* Restarted on EINTR so a signal cannot cut the rest short and leave
  * rest_total_ms overstating the idle time actually taken. Same shape as
- * src/metal.m's pf_sleep_ms, deliberately not shared with it: that one is a
+ * src/metal_prefill.m's pf_sleep_ms, deliberately not shared with it: that one is a
  * file-static in an Objective-C translation unit this file must not depend
  * on, and duplicating six lines is cheaper than coupling the pure-C
  * scheduler to the Metal backend. */

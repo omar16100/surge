@@ -24,7 +24,8 @@
  * before it can size an allocation from a wrapped product. */
 #define KV_WIDTH_MAX ((uint64_t)1u << 24)
 
-/* u64 overflow-checked mul/add, mirroring metal.m's mul_ck/add_ck. */
+/* u64 overflow-checked mul/add, mirroring the Metal host layer's mul_ck/add_ck
+ * (src/metal_internal.h since task R2). */
 static bool kv_mul(uint64_t a, uint64_t b, uint64_t *out) {
     if (a != 0 && b > UINT64_MAX / a) return false;
     *out = a * b;

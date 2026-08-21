@@ -6,6 +6,15 @@ LDLIBS = -lm
 FRAMEWORKS = -framework Metal -framework Foundation
 TESTS = $(wildcard tests/test_*.c)
 check: $(TESTS:.c=.bin)
+# Interim guard for the twelve UNPREFIXED globals the R2/R3 host-layer splits
+# promoted (check_params, check_sizes, gpu_grid, enc_op, ...). Pure grep over
+# source: no compiler, no GPU, no model, no ordering dependence, so it is free
+# and deterministic in both `check` and `debug`'s -DSURGE_NO_METAL recursion,
+# and it asserts NOTHING about test counts. It fails if a NEW unprefixed
+# global joins the set, or if any file outside src/metal*.m + metal_internal.h
+# declares one of them. The real fix is task R4 (sg_ prefix all twelve), which
+# must land before the next src/metal.m cut. See the script's header comment.
+	@bash tools/check_metal_globals.sh
 	@set -e; for t in $^; do ./$$t; done
 # Gate 4 (M5.6): the `surge` CLI's prefill (default) vs --no-prefill must emit
 # byte-identical gen_ids. This drives the real binary, so it is skipped under
@@ -34,6 +43,25 @@ surge-ref: src/cli_ref.c $(LIB_SRC)
 # -fno-fast-math is not optional. The default enables reassociation and the
 # fast transcendentals, and the kernels are checked against ref.c's double
 # accumulators to 1e-4 relative with precise::exp / precise::sqrt.
+# THREE OBJECTIVE-C SOURCES, ONE HOST LAYER (tasks R2 and R3). src/metal.m
+# passed the ~2000-line guideline, so the chunked-prefill half moved to
+# src/metal_prefill.m and the per-dispatch validation trio to
+# src/metal_validate.m; all three share src/metal_internal.h (struct sg_gpu,
+# the KI_ and SG_K_ enums, sg_enc, the helpers that cross the seams). Unlike
+# the .metal sources these are REAL translation units that link, so all three
+# must appear on every link line that used to name src/metal.m and none may be
+# dropped -- the link would fail loudly (undefined sg_gpu_prefill, undefined
+# check_params), which is the point.
+#
+# metal_internal.h is listed as a prerequisite for the same reason
+# kernels_common.metal.h is below: make does not scan #include lines, so
+# without it an edit to the shared struct sg_gpu would leave every Metal
+# binary stale while still passing every test. THAT LIST IS HAND-MAINTAINED
+# and is exhaustive today (metal_internal.h and surge.h; the system and
+# framework headers are not tracked, as everywhere else in this Makefile).
+METAL_M = src/metal.m src/metal_prefill.m src/metal_validate.m
+METAL_M_DEPS = $(METAL_M) src/metal_internal.h surge.h
+
 METALLIB = src/kernels.metallib
 METAL_DEFS = -DSG_METALLIB_PATH='"$(CURDIR)/src/kernels.metallib"'
 #
@@ -60,7 +88,7 @@ src/%.air: src/%.metal src/kernels_common.metal.h
 $(METALLIB): $(METAL_AIR)
 	xcrun -sdk macosx metallib $^ -o $@
 
-# The tests that link src/metal.m need the frameworks and the metallib, so
+# The tests that link $(METAL_M) need the frameworks and the metallib, so
 # they get a static pattern rule instead of the generic one above (an
 # explicit rule wins). Under -DSURGE_NO_METAL -- which is how `debug` runs --
 # these sources compile down to a skip notice, so nothing Metal is built or
@@ -76,8 +104,8 @@ METAL_TESTS = tests/test_metal_ops.bin tests/test_gpu_fwd.bin tests/test_gpu_pre
 # but NOT metal.m/the frameworks, so Metal still stays out of the ASan run.
 METAL_HYBRID_TESTS = tests/test_gpu_mem.bin
 ifeq (,$(findstring SURGE_NO_METAL,$(CFLAGS)))
-$(METAL_TESTS) $(METAL_HYBRID_TESTS): tests/%.bin: tests/%.c $(LIB_SRC) src/metal.m $(METALLIB)
-	$(CC) $(CFLAGS) $(METAL_DEFS) -o $@ src/metal.m $< \
+$(METAL_TESTS) $(METAL_HYBRID_TESTS): tests/%.bin: tests/%.c $(LIB_SRC) $(METAL_M_DEPS) $(METALLIB)
+	$(CC) $(CFLAGS) $(METAL_DEFS) -o $@ $(METAL_M) $< \
 	  $(LIB_SRC) $(FRAMEWORKS) $(LDLIBS)
 else
 $(METAL_TESTS): tests/%.bin: tests/%.c
@@ -88,16 +116,16 @@ endif
 
 # `surge` (Task 10): the Metal decode path, with --ref selecting the scalar
 # CPU forward for an A/B against the identical driver loop.
-surge: src/cli_metal.c $(LIB_SRC) src/metal.m $(METALLIB)
-	$(CC) $(CFLAGS) $(METAL_DEFS) -o $@ src/cli_metal.c src/metal.m \
+surge: src/cli_metal.c $(LIB_SRC) $(METAL_M_DEPS) $(METALLIB)
+	$(CC) $(CFLAGS) $(METAL_DEFS) -o $@ src/cli_metal.c $(METAL_M) \
 	  $(LIB_SRC) $(FRAMEWORKS) $(LDLIBS)
 
 # `surge-bench` (Task B5): the benchmark harness. Wires src/bench.c's B1-B4
 # math + the B2 peak-memory probe to the M5 tiled prefill + the shared greedy
 # driver (src/greedy.c's sg_argmax_f32, the SAME argmax `surge` uses, so their
 # gen_ids cannot drift). Same link shape as `surge`.
-surge-bench: src/cli_bench.c $(LIB_SRC) src/metal.m $(METALLIB)
-	$(CC) $(CFLAGS) $(METAL_DEFS) -o $@ src/cli_bench.c src/metal.m \
+surge-bench: src/cli_bench.c $(LIB_SRC) $(METAL_M_DEPS) $(METALLIB)
+	$(CC) $(CFLAGS) $(METAL_DEFS) -o $@ src/cli_bench.c $(METAL_M) \
 	  $(LIB_SRC) $(FRAMEWORKS) $(LDLIBS)
 
 # `make bench-check` (Task B5 gate, mirrors test_cli_prefill's pattern): builds
@@ -126,8 +154,8 @@ bench-check: surge surge-bench
 # accurate for every file in it -- this one is not a per-op correctness gate.
 BENCH_SPLITK = tests/bench_splitk.bin
 ifeq (,$(findstring SURGE_NO_METAL,$(CFLAGS)))
-$(BENCH_SPLITK): tests/%.bin: tests/%.c $(LIB_SRC) src/metal.m $(METALLIB)
-	$(CC) $(CFLAGS) $(METAL_DEFS) -o $@ src/metal.m $< \
+$(BENCH_SPLITK): tests/%.bin: tests/%.c $(LIB_SRC) $(METAL_M_DEPS) $(METALLIB)
+	$(CC) $(CFLAGS) $(METAL_DEFS) -o $@ $(METAL_M) $< \
 	  $(LIB_SRC) $(FRAMEWORKS) $(LDLIBS)
 else
 $(BENCH_SPLITK): tests/%.bin: tests/%.c

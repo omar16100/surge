@@ -4,6 +4,18 @@
  * The public contract (buffer layouts, params[] per kernel, aliasing rules)
  * lives in surge.h next to sg_gpu_run_op and is not repeated here.
  *
+ * THREE TRANSLATION UNITS, AFTER TASKS R2 AND R3. The chunked prompt prefill
+ * (Task M5.6's sg_gpu_prefill, its B8 duty-cycle controls, and the M5.4/M5.5
+ * per-layer chunk encoders enc_attn_prefill / enc_gdn_prefill) is in
+ * src/metal_prefill.m; the per-dispatch validation and grid geometry
+ * (check_sizes, check_params, gpu_grid) is in src/metal_validate.m. What the
+ * three share -- struct sg_gpu, the KI_ kernel index enum, the SG_K_* grid-kind
+ * enum, sg_enc, and the helpers listed at the bottom of it -- is declared once
+ * in src/metal_internal.h. Decode never calls prefill, so the traffic across
+ * the R2 seam is one-way; the R3 seam runs the other way, since all six call
+ * sites of the validation trio are in this file. All three files are on every
+ * link line that used to name this one; see the Makefile's METAL_M.
+ *
  * Objective-C, MANUAL retain/release (no ARC): the file is compiled in the
  * same clang invocation as the C sources, and -fobjc-arc there would either
  * be rejected for the C translation units or need a second, differently
@@ -18,6 +30,12 @@
  * whole layer into one command buffer; it does not make this concurrent.
  */
 #include "surge.h"
+/* struct sg_gpu, the KI_ kernel index enum, sg_enc and the handful of helpers
+ * this file shares with src/metal_prefill.m (task R2). It pulls in surge.h and
+ * the two frameworks itself; they are repeated above and below because this
+ * file's own #includes should not depend on what an internal header happens to
+ * need today. */
+#include "metal_internal.h"
 
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
@@ -39,7 +57,7 @@
 static char g_errbuf[512];
 
 __attribute__((format(printf, 1, 2)))
-static sg_err gpu_errf(const char *fmt, ...) {
+sg_err gpu_errf(const char *fmt, ...) {
     va_list ap;
     va_start(ap, fmt);
     vsnprintf(g_errbuf, sizeof g_errbuf, fmt, ap);
@@ -51,48 +69,12 @@ static sg_err gpu_errf(const char *fmt, ...) {
  * Kernel table
  * --------------------------------------------------------------------
  *
- * `kind` is how the grid is derived from params[], and it is also what
- * guarantees the reduction kernels get exactly SG_TG threads per
- * threadgroup: kernels.metal folds its trees over the compile-time constant
- * SG_TG, so dispatching a different width would silently drop lanes. */
-enum {
-    SG_K_ELEM,    /* params[0] threads, non-uniform threadgroups */
-    SG_K_ROWS,    /* params[0] threadgroups of SG_TG (one per output row) */
-    SG_K_TG1,     /* exactly one threadgroup of SG_TG */
-    SG_K_ATTN,    /* params[0] threadgroups of SG_TG, plus a scores scratch */
-    SG_K_GATED,   /* params[1] threadgroups of SG_TG (one per value head) */
-    SG_K_ELEM01,  /* params[0] * params[1] threads */
-    SG_K_ELEM02,  /* params[0] * params[2] threads */
-    SG_K_GROUPS2, /* params[2] threadgroups of SG_TG */
-    /* M5.3: a 2D grid of ceil(params[1]/SG_GEMM_TN) x ceil(params[0]/SG_GEMM_TM)
-     * threadgroups of SG_TG, one per GEMM output tile. Computed by hand in
-     * sg_gpu_run_op (not by gpu_grid, which only returns a 1D count) because
-     * this is the only kind whose group count needs two dimensions. */
-    SG_K_TILES2D,
-    /* M5.4: k_rope_chunk, one thread per (token, head, element) of the chunk,
-     * params[0]*params[2]*params[4] = head_dim*heads*n_tok threads, non-uniform
-     * threadgroups. An elementwise kernel with no reduction, dispatched through
-     * gpu_grid's *elems path like SG_K_ELEM but with a 3-factor count. */
-    SG_K_ROPE_CHUNK,
-    /* P2.2: the split-K decode-attention partial kernel's grid, a 2D
-     * params[6] x params[0] (split, query head) block of threadgroups of
-     * SG_TG. The SECOND kind after SG_K_TILES2D that needs two group
-     * dimensions and for the same reason SG_K_ATTN cannot be reused: that
-     * class carries exactly one *groups count (see gpu_grid below), so it can
-     * express "one threadgroup per head" and nothing wider. Computed by hand
-     * in sg_gpu_run_attn_splitk_partial, which is the only path that reaches
-     * the kernel at all (it takes six device buffers, so sg_gpu_run_op's
-     * (a, b, out) shape cannot).
-     *
-     * P2.4's k_attn_decode_splitk_partial_gqa shares this kind with a params[6]
-     * x params[1] (split, KV head) grid: one threadgroup per GQA GROUP rather
-     * than per query head. Same class because the dispatchers compute both
-     * extents by hand anyway; the `kind` column is only read by sg_gpu_init's
-     * threadgroup-width check. */
-    SG_K_HEADS2D
-};
-
-#define SG_TG 256u
+ * The SG_K_* grid-kind enum this table's `kind` column is drawn from moved to
+ * src/metal_internal.h in task R3, with gpu_grid (the switch that reads it,
+ * now in src/metal_validate.m). The table itself, SG_N_KERNELS and the
+ * _Static_assert below stayed here, because five functions in this file read
+ * them: sg_gpu_free, sg_gpu_init, sg_gpu_run_op, gpu_run_delta_common and
+ * enc_op. */
 
 /* The largest GQA group (n_heads / n_kv_heads) k_attn_decode_splitk_partial_gqa
  * keeps in registers, mirroring kernels.metal's SG_SPLITK_GQA_MAX constant of
@@ -112,27 +94,6 @@ typedef struct {
     const char *name;
     int kind;
 } sg_kernel_desc;
-
-/* sg_gpu.pipes is indexed by position here, so the enum and the table must
- * stay in lockstep; the static assert below is what enforces that. The first
- * thirteen are Task 9 / M3.1's per-op kernels, reachable through
- * sg_gpu_run_op; the rest are Task 10's fused/strided variants, which take
- * buffer layouts sg_gpu_run_op has no size rule for and are therefore encoded
- * only by sg_gpu_forward. */
-enum {
-    KI_RMSNORM = 0, KI_RMSNORM_GATED, KI_ROPE, KI_MATVEC_BF16, KI_MATVEC_F32,
-    KI_MATVEC_Q8, KI_SOFTMAX, KI_SWIGLU, KI_SILU, KI_GATE_SIGMOID, KI_ATTN,
-    KI_CONV1D, KI_DELTA, KI_RMSNORM_HEADS, KI_ROPE_HEADS, KI_GATE_STRIDED,
-    KI_SCALE, KI_ADD, KI_DELTA_GATES, KI_DELTA_MULTI,
-    KI_KV_STORE_F16, KI_ATTN_F16,
-    KI_MATMUL_BF16, KI_MATMUL_F32, KI_MATMUL_Q8,
-    KI_ROPE_CHUNK, KI_ATTN_PREFILL,
-    KI_CONV1D_CHUNK, KI_DELTA_GATES_CHUNK, KI_DELTA_CHUNK, KI_RMSNORM_GATED_CHUNK,
-    KI_ATTN_SPLITK_PARTIAL, KI_ATTN_SPLITK_COMBINE,
-    KI_ATTN_SPLITK_PARTIAL_GQA,
-    KI_ATTN_SPLITK_PARTIAL_GQA_ONLINE,
-    KI_COUNT
-};
 
 static const sg_kernel_desc SG_KERNELS[] = {
     { "k_rmsnorm",             SG_K_TG1     },
@@ -173,7 +134,8 @@ static const sg_kernel_desc SG_KERNELS[] = {
      * kernel dispatched through the generic sg_gpu_run_op path (a=x, b=cs,
      * out); k_attn_prefill takes THREE device buffer inputs (Q, separate K,
      * separate V) like k_attn_decode_f16, so it is dispatched by hand (see
-     * sg_gpu_run_attn_prefill and enc_attn_prefill) and is listed here only so
+     * sg_gpu_run_attn_prefill here and enc_attn_prefill in src/metal_prefill.m)
+     * and is listed here only so
      * sg_gpu_init builds its pipeline and checks its threadgroup width. */
     { "k_rope_chunk",          SG_K_ROPE_CHUNK },
     { "k_attn_prefill",        SG_K_ATTN       },
@@ -181,7 +143,8 @@ static const sg_kernel_desc SG_KERNELS[] = {
      * (conv tail + S) across chunks and take an extra device buffer (the state
      * carrier or the shared weight) beyond sg_gpu_run_op's (a, b, out) shape,
      * so each is dispatched by hand -- through a dedicated public one-shot for
-     * the per-op tests, and inside enc_gdn_prefill for the batched path -- and
+     * the per-op tests, and inside enc_gdn_prefill (src/metal_prefill.m) for the
+     * batched path -- and
      * is listed here only so sg_gpu_init builds its pipeline and (for the two
      * reduction/threadgroup kernels) checks its threadgroup width. The `kind`
      * column is the closest existing grid class and is used ONLY by that init
@@ -220,277 +183,6 @@ static const sg_kernel_desc SG_KERNELS[] = {
 };
 #define SG_N_KERNELS ((int)(sizeof SG_KERNELS / sizeof SG_KERNELS[0]))
 _Static_assert(SG_N_KERNELS == KI_COUNT, "SG_KERNELS and the KI_ enum disagree");
-
-/* A wrapped or allocated buffer. The offset is what makes sg_gpu_wrap
- * possible at all: Metal demands a page-aligned base and a tensor inside a
- * checkpoint mmap never is one, so the handle remembers how far into the
- * page its data starts and every bind adds it. */
-typedef struct {
-    id<MTLBuffer> buf;
-    uint64_t offset;
-    uint64_t nbytes;
-} sg_gpu_buf;
-
-/* Per-layer weights and state for the full decode path (Task 10). Exactly
- * one of the two attention groups is populated, by the same tensor-presence
- * rule sg_ref_state_new uses. The `w_*` handles wrap checkpoint memory with
- * no copy; everything else is surge-owned and zero-filled at allocation. */
-typedef struct {
-    bool is_attn;
-    /* wrapped matmul weights */
-    void *w_q, *w_k, *w_v, *w_o;                       /* full attention */
-    void *w_qkv, *w_z, *w_a, *w_b, *w_out;             /* gated DeltaNet */
-    void *w_gate, *w_up, *w_down;                      /* shared MLP */
-    /* owned f32 copies of the small tensors, norm shift already applied */
-    void *ln1, *ln2;        /* [hidden] */
-    void *qk_norm;          /* [2*head_dim]: q_norm then k_norm */
-    void *conv_w;           /* [conv_dim, conv_kernel] */
-    void *a_dt;             /* [2*n_v_heads]: ssm_a then dt_bias */
-    /* [value_dim + head_v_dim]: the in_proj_z output, with this layer's
-     * ssm_norm weight parked immediately after it, because k_rmsnorm_gated
-     * reads z and w out of ONE buffer. Per layer rather than shared for
-     * exactly that reason. */
-    void *zw;
-    /* state */
-    /* [2, max_ctx, n_kv_heads, head_dim]: K then V, f32. Populated ONLY when
-     * SURGE_KV_DTYPE selects f32 (sg_gpu.kv_dtype == SG_T_F32): that path is
-     * kept byte-for-bit as it was before M5.2, combined buffer and all, so
-     * the pre-existing M2 gate never sees a numerical or allocation change.
-     * The default fp16 path does not use this field at all; its K/V live in
-     * sg_gpu.kv (a separate-buffer sg_kv object, indexed by layer). */
-    void *kv;
-    void *conv_buf;   /* [conv_kernel, conv_dim]: output row then carried tail */
-    void *ssm;        /* [n_v_heads, head_v_dim, head_k_dim] */
-} sg_gpu_layer;
-
-struct sg_gpu {
-    id<MTLDevice> dev;
-    id<MTLCommandQueue> queue;
-    id<MTLLibrary> lib;
-    id<MTLComputePipelineState> pipes[SG_N_KERNELS];
-    /* k_attn_decode's per-head score row. Owned and grown on demand rather
-     * than living in threadgroup memory, which caps out at 32 KB and would
-     * put a ceiling of ~8k tokens on the context length.
-     *
-     * ONE ALLOCATION, SHARED BY EVERY USER, ALWAYS BOUND AT OFFSET 0:
-     * k_attn_decode, k_attn_decode_f16, k_attn_prefill and sg_gpu_forward's
-     * encoder all point at these same bytes. scratch_ensure only ever GROWS
-     * it; it never partitions it and hands nobody a private range. That is
-     * safe today because each of those is either its own commit-and-wait or
-     * the only scratch user in the command buffer it is encoded into, and it
-     * is a real constraint on anything that batches two DIFFERENT scratch
-     * users into ONE open command buffer: their rows would be the same bytes.
-     * The split-K partial (P2.2) therefore does NOT use this buffer, see
-     * splitk_scratch below. */
-    id<MTLBuffer> scratch;
-    uint64_t scratch_bytes;
-
-    /* k_attn_decode_splitk_partial's per-(head, split) score row (P2.2 review
-     * finding 1). A SEPARATE allocation from `scratch` above, on purpose: the
-     * split-K pair is meant to be dispatched from the batched decode encoder
-     * next to kernels that use `scratch`, and sharing one grown-not-
-     * partitioned buffer between two users in one open command buffer is the
-     * kind of hazard that has to be structural rather than a comment somebody
-     * remembers. Costs one extra device allocation, sized
-     * n_heads * n_splits * ceil(seq/n_splits) floats, which is the same order
-     * as `scratch`'s own n_heads * seq. */
-    id<MTLBuffer> splitk_scratch;
-    uint64_t splitk_scratch_bytes;
-
-    /* --- the loaded model (sg_gpu_load_model) --- */
-    const sg_model *model;
-    sg_cfg cfg;
-    uint32_t key_dim, value_dim, conv_dim, q_width, kv_width, attn_width;
-    int mat_kernel;            /* KI_MATVEC_BF16, KI_MATVEC_F32 or KI_MATVEC_Q8 */
-    sg_gpu_layer *ls;          /* cfg.n_layers */
-    void *lm_head;             /* wrapped [vocab, hidden] */
-    void *out_norm;            /* owned [hidden] f32, shift applied */
-
-    /* --- the decode state (sg_gpu_state_new) --- */
-    uint32_t max_ctx, used;
-    bool have_state;
-    void *b_x, *b_h, *b_r;             /* [hidden] */
-    void *b_qg;                        /* [n_heads, 2*head_dim] */
-    void *b_ctx;                       /* [n_heads, head_dim] */
-    void *b_ffg, *b_ffu;               /* [ffn_hidden] */
-    void *b_qkv;                       /* [conv_dim] */
-    void *b_ab, *b_gates;              /* [2*n_v_heads] */
-    void *b_y;                         /* [value_dim] */
-    void *b_cs;                        /* [rope_dim]: cos half then sin half */
-    void *b_logits;                    /* [vocab] */
-    float *h_x, *h_cs, *h_logits;      /* host views of the three above */
-
-    /* --- M5.2: fp16 KV cache --- */
-    /* SURGE_KV_DTYPE at the last sg_gpu_state_new call: SG_T_F16 (default) or
-     * SG_T_F32. Decides which of {g->kv, per-layer L->kv} is live. */
-    sg_tensor_type kv_dtype;
-    /* Full-attention K/V, SEPARATE per-layer buffers, allocated through
-     * sg_kv (Task M5.1) ONLY on the fp16 path; NULL on the f32 path, where
-     * L->kv (the pre-M5.2 combined buffer) is used instead. */
-    sg_kv *kv;
-    /* [kv_width] f32 landing spots for this token's freshly computed K and V,
-     * fp16 path only: q/k-norm and RoPE run here in f32 exactly as they did
-     * on the old combined buffer, and k_kv_store_f16 then casts the result
-     * into g->kv's per-layer half buffers. NULL on the f32 path (matvec
-     * writes straight into L->kv there, as before). */
-    void *b_k32, *b_v32;
-
-    /* --- Task P2.3: split-K decode attention ---
-     * Read from SURGE_ATTN_SPLITK at the last sg_gpu_state_new call. true (the
-     * default) makes enc_attn's fp16 branch dispatch the
-     * k_attn_decode_splitk_partial + _combine PAIR instead of the incumbent
-     * single-threadgroup-per-head k_attn_decode_f16, once the sequence is long
-     * enough (see splitk_n_splits). false pins the incumbent, which is what the
-     * A/B measurement needs and why the incumbent stays reachable rather than
-     * being deleted. Always false on the f32 KV path: the split-K kernels read
-     * half-typed separate K and V buffers, which only the fp16 cache has. */
-    bool attn_splitk;
-    /* --- Task P2.4: GQA-shared split-K threadgroups ---
-     * Read from SURGE_ATTN_SPLITK_GQA at the last sg_gpu_state_new call, and
-     * only consulted when attn_splitk above is already true. true makes
-     * enc_attn_splitk dispatch k_attn_decode_splitk_partial_gqa (one
-     * threadgroup per GQA GROUP, each K/V element read once for all the query
-     * heads that share it) instead of the per-head
-     * k_attn_decode_splitk_partial; the two write the same bytes, so this
-     * changes memory traffic and grid shape, never the answer. DEFAULT TRUE
-     * SINCE TASK P4.0 (2026-08-18): this is the shipped decode partial, and
-     * SURGE_ATTN_SPLITK_GQA=0 is what pins the per-head one. See
-     * splitk_gqa_use for the shape and occupancy conditions that still apply. */
-    bool attn_splitk_gqa;
-    /* --- Task P2.8: online (streaming) softmax in the GQA partial ---
-     * Read from SURGE_ATTN_SPLITK_ONLINE at the last sg_gpu_state_new call, and
-     * only consulted when attn_splitk above is already true. true makes
-     * enc_attn_splitk dispatch k_attn_decode_splitk_partial_gqa_online, which
-     * keeps a running (m, s, acc) per head instead of writing a score row into
-     * splitk_scratch and walking it three more times.
-     *
-     * IT IS A SEPARATE SWITCH FROM attn_splitk_gqa, not a modifier of it: the
-     * online kernel IS a GQA-shared kernel (same grid, same group-size band,
-     * same threadgroup floor, same split policy), so requiring both switches
-     * would only mean two ways to spell one choice. When both are set the online
-     * kernel wins, because it is the more specific request; see
-     * splitk_online_use.
-     *
-     * UNLIKE THE OTHER TWO KERNEL SWITCHES, THIS ONE CHANGES THE ANSWER'S LAST
-     * BITS. Streaming reorders the exponential sums, so the online arm is NOT
-     * byte-identical to the four-pass arm at a fixed n_splits (only `m` is
-     * exact, and the whole triple happens to be exact when a split fits one
-     * SG_TG-wide tile). The bar is accuracy against sg_ref_attn_decode_splitk
-     * plus determinism plus byte-exact greedy tokens, the P2.2 standard, not the
-     * memcmp P2.4 could claim.
-     *
-     * DEFAULT FALSE, and for the same evidence reason P2.4's switch is: written
-     * and compiled with the GPU held by a 256K benchmark, so no timing and no
-     * accuracy number for it had been observed when it landed. */
-    bool attn_splitk_online;
-    /* --- Task P2.6: the GQA split policy's saturation cap, overridable ---
-     * Read from SURGE_SPLITK_GQA_CAP at the last sg_gpu_state_new call. 0 means
-     * "never set on this state", which splitk_gqa_cap_of resolves to the
-     * measured default SG_SPLITK_GQA_N_SPLITS_CAP == 256; it is deliberately
-     * NOT a cap of 0, because a literal 0 reaching splitk_gqa_n_splits would
-     * silently clamp every step down to SG_SPLITK_MIN.
-     *
-     * IT EXISTS FOR THE P2.6 GATE, not for users. The cap is what makes
-     * splitk_gqa_n_splits diverge from splitk_n_splits, and at the shipped 256
-     * that divergence only starts at seq 65792 (SG_TG * 257), a depth no test
-     * can reach in a `make check`. Lowering the cap moves the SAME divergence
-     * mechanism down to SG_TG * (cap + 1), so the greedy-token gate can run in
-     * seconds instead of hours. Its second use is retuning the cap without a
-     * recompile if a future GPU moves the saturation point.
-     *
-     * Validated at parse time and REJECTED (sg_gpu_state_new returns an error)
-     * outside [SG_SPLITK_MIN, SG_SPLITK_MAX], because a silently ignored value
-     * here would make the gate that depends on it pass vacuously. */
-    uint32_t splitk_gqa_cap;
-    /* WHICH PARTIAL enc_attn_splitk ACTUALLY ENCODED, counted per dispatch
-     * (P2.4 fix round 1, review finding I1). Pure diagnostics: nothing reads
-     * them inside a kernel, no buffer size or dispatch shape depends on them,
-     * so they cannot change computed output.
-     *
-     * THEY EXIST BECAUSE THE END-TO-END A/B IS VACUOUS WITHOUT THEM. The two
-     * partials are contracted to produce the SAME bytes, so
-     * "SURGE_ATTN_SPLITK_GQA=0 and =1 give byte-identical logits" is exactly
-     * what you also see when the GQA kernel is never selected at all (a
-     * narrowed band in splitk_gqa_use, an unset attn_splitk_gqa, a lost
-     * dispatch). A gate that cannot tell those two apart would stay green while
-     * the whole point of the task silently disappeared. sg_gpu_splitk_dispatch_
-     * counts exposes them so the gate can assert WHICH kernel ran, the way
-     * P2.3's wiring subtest asserted the threshold. Reset by sg_gpu_state_new
-     * and by gpu_free_state; they count ENCODER dispatches only, never the
-     * one-shot entry points.
-     *
-     * P2.7: with the switch ON, BOTH counters are expected to be nonzero over a
-     * run that starts short, because the threadgroup floor in splitk_gqa_use
-     * declines the GQA kernel until the grid is big enough. The split between
-     * them is exactly where that floor sits, which is what makes them a
-     * two-sided gate on the floor itself and not only on the selection. */
-    uint64_t splitk_partial_dispatches;
-    uint64_t splitk_gqa_dispatches;
-    /* P2.8's third arm, counted separately rather than folded into
-     * splitk_gqa_dispatches. Two reasons: the P2.4/P2.6/P2.7 gates assert EXACT
-     * values of the two counters above and must keep their meaning ("the
-     * four-pass GQA partial"), and the online arm's own A/B needs to distinguish
-     * "the online kernel ran" from "some GQA kernel ran", which is the same
-     * vacuity argument that put the first two counters here. Read through
-     * sg_gpu_splitk_online_dispatches. */
-    uint64_t splitk_online_dispatches;
-    /* The largest n_splits any decode step at this max_ctx can ask for, i.e.
-     * splitk_n_splits(max_ctx). n_splits is nondecreasing in seq and seq is
-     * capped at max_ctx, so the three buffers below and g->splitk_scratch can
-     * be sized ONCE here and never grown from inside an open command buffer. */
-    uint32_t splitk_max_splits;
-    /* The per-(head, split) partial triples: m, s are [n_heads, n_splits] and
-     * acc is [n_heads, n_splits, head_dim], all f32, allocated for
-     * splitk_max_splits. One set is shared by every full-attention layer in a
-     * forward, the same way g->b_ctx and g->scratch already are: dispatches in
-     * one encoder run in encode order with an implicit barrier between them
-     * (MTLDispatchTypeSerial), so a layer's combine has consumed these before
-     * the next layer's partial overwrites them. NULL unless the fp16 path
-     * allocated them. */
-    void *b_sk_m, *b_sk_s, *b_sk_acc;
-
-    /* --- Task B8: prefill duty-cycle (yields the GPU between chunks) ---
-     * Set by sg_gpu_set_prefill_rest; both 0 (the calloc default in
-     * sg_gpu_init) means DISABLED, i.e. sg_gpu_prefill never sleeps and its
-     * OUTPUT (gen_ids, logits, KV/decode state, g->used) is byte-identical to
-     * before this task -- the chunk loop still takes two extra clock_gettime
-     * reads per chunk either way, but they feed only rest accounting, never
-     * anything output-affecting. prefill_rest_total_ms is reset to 0 at the
-     * start of every sg_gpu_prefill call (whether or not the feature is
-     * enabled, and even one that fails validation) and accumulates the wall
-     * time actually slept during that call; read it back with
-     * sg_gpu_prefill_rest_ms after the call returns. */
-    uint32_t prefill_work_budget_ms;
-    uint32_t prefill_rest_ms;
-    uint64_t prefill_rest_total_ms;
-
-    /* --- prefill command-buffer segmentation -------------------------
-     * Set by sg_gpu_set_prefill_max_burst; 0 (the calloc default) means
-     * DISABLED, i.e. one command buffer per chunk exactly as before.
-     *
-     * The duty-cycle rest above can only yield the GPU BETWEEN chunks, so it
-     * cannot help once a single chunk's command buffer runs longer than the
-     * macOS userspace watchdog allows WindowServer to go without rendering
-     * (80 s; measured ~130 s for one 256-token chunk at 220k context on
-     * 2026-08-14, which killed WindowServer twice). Splitting a chunk's layer
-     * sweep across several command buffers bounds how long the GPU is held by
-     * any one submission.
-     *
-     * This is safe in a way that changing `chunk` would not be: command buffer
-     * boundaries carry no state. The same kernels are dispatched with the same
-     * arguments in the same order, and buffers committed in sequence on one
-     * queue execute in order, so segmentation cannot change a single output
-     * value. That is why the segment count may also adapt mid-run.
-     *
-     * prefill_seg_layers is the live, adapting value; it is reset from
-     * n_layers at the start of every sg_gpu_prefill call. */
-    uint32_t prefill_max_burst_ms;
-    uint32_t prefill_seg_layers;
-    /* Command buffers submitted by the most recent sg_gpu_prefill call. Equals
-     * the chunk count when segmentation is off. Exposed so a parity test can
-     * prove segmentation actually engaged rather than passing vacuously. */
-    uint64_t prefill_segments;
-};
 
 /* --------------------------------------------------------------------
  * Init
@@ -773,15 +465,6 @@ uint64_t sg_gpu_current_alloc_bytes(const sg_gpu *g) {
  * Dispatch
  * -------------------------------------------------------------------- */
 
-/* Every kernel reads its inputs from indices computed out of params[], so a
- * params/buffer mismatch is an out-of-bounds DEVICE read: not a crash the
- * process can catch, but a GPU fault that takes down the whole context (and
- * on a bad day the display driver). Hence a size precondition per kernel,
- * checked here, before anything is encoded. */
-static bool buf_big_enough(const sg_gpu_buf *b, uint64_t need) {
-    return b != NULL && b->nbytes >= need;
-}
-
 /* Two handles collide when the HOST BYTE RANGES they describe intersect.
  *
  * Comparing MTLBuffer identity plus offsets is not enough, and the case it
@@ -805,334 +488,10 @@ static bool bufs_overlap(const sg_gpu_buf *x, const sg_gpu_buf *y) {
     return xb < yb + y->nbytes && yb < xb + x->nbytes;
 }
 
-/* The byte counts below are products of up to three caller-supplied uint32
- * params, and (uint64)p[0] * p[1] * 4 genuinely wraps for large ones. A
- * wrapped `need` is worse than no check at all: it would be SMALL, so an
- * undersized buffer would sail through and the kernel would index with the
- * original, unwrapped dimensions. Everything therefore goes through these,
- * and an overflow is an error rather than a number. */
-static bool mul_ck(uint64_t a, uint64_t b, uint64_t *out) {
-    if (a != 0 && b > UINT64_MAX / a) return false;
-    *out = a * b;
-    return true;
-}
-
-static bool add_ck(uint64_t a, uint64_t b, uint64_t *out) {
-    if (a > UINT64_MAX - b) return false;
-    *out = a + b;
-    return true;
-}
-
-static sg_err check_sizes(const char *kernel, const sg_gpu_buf *a, const sg_gpu_buf *b,
-                          const sg_gpu_buf *o, const uint32_t *p) {
-    uint64_t f = 4;  /* sizeof(float) */
-    uint64_t need_a = 0, need_b = 0, need_o = 0;
-    uint64_t t0 = 0, t1 = 0, t2 = 0;
-    bool want_b = true;
-    bool ok = true;
-
-    if (strcmp(kernel, "k_rmsnorm") == 0) {
-        ok = mul_ck(p[0], f, &need_a);
-        need_o = need_a;
-        want_b = p[2] != 0;
-        need_b = want_b ? need_a : 0;
-    } else if (strcmp(kernel, "k_rmsnorm_gated") == 0) {
-        ok = mul_ck(p[0], p[1], &t0) && mul_ck(t0, f, &need_a) &&
-             add_ck(t0, p[0], &t1) && mul_ck(t1, f, &need_b);
-        need_o = need_a;
-    } else if (strcmp(kernel, "k_rope") == 0) {
-        ok = mul_ck(p[0], f, &need_a) && mul_ck(p[1], f, &need_b);
-        need_o = need_a;                  /* b is cos[rope_dim/2] then sin[..] */
-    } else if (strcmp(kernel, "k_rope_heads") == 0) {
-        /* a = out = [heads, stride] f32 (a head's rotated tail stays inside its
-         * own stride, guaranteed by check_params' stride>=head_dim); b is the
-         * single-token cos/sin table [rope_dim] f32. p[0]=head_dim p[1]=rope_dim
-         * p[2]=heads p[3]=stride. */
-        ok = mul_ck(p[2], p[3], &t0) && mul_ck(t0, f, &need_a) && mul_ck(p[1], f, &need_b);
-        need_o = need_a;
-    } else if (strcmp(kernel, "k_matvec_bf16") == 0) {
-        ok = mul_ck(p[0], p[1], &t0) && mul_ck(t0, 2, &need_a) &&
-             mul_ck(p[1], f, &need_b) && mul_ck(p[0], f, &need_o);
-    } else if (strcmp(kernel, "k_matvec_f32") == 0) {
-        ok = mul_ck(p[0], p[1], &t0) && mul_ck(t0, f, &need_a) &&
-             mul_ck(p[1], f, &need_b) && mul_ck(p[0], f, &need_o);
-    } else if (strcmp(kernel, "k_matvec_q8") == 0) {
-        /* Weight is rows * (cols/32) Q8_0 blocks of 34 bytes each; x is cols
-         * floats, y is rows floats. cols is a nonzero multiple of 32, which
-         * check_params enforces before this runs, so p[1]/32 is the exact
-         * block count and does not truncate. */
-        ok = mul_ck(p[0], p[1] / 32u, &t0) && mul_ck(t0, 34, &need_a) &&
-             mul_ck(p[1], f, &need_b) && mul_ck(p[0], f, &need_o);
-    } else if (strcmp(kernel, "k_softmax") == 0 || strcmp(kernel, "k_silu") == 0) {
-        ok = mul_ck(p[0], f, &need_a);
-        need_o = need_a;
-        want_b = false;
-    } else if (strcmp(kernel, "k_swiglu") == 0 || strcmp(kernel, "k_gate_sigmoid") == 0) {
-        ok = mul_ck(p[0], f, &need_a);
-        need_b = need_o = need_a;
-    } else if (strcmp(kernel, "k_attn_decode") == 0) {
-        ok = mul_ck(p[0], p[4], &t0) && mul_ck(t0, f, &need_a) &&
-             mul_ck((uint64_t)p[3] * p[1], p[2], &t1) && add_ck(t1, p[5], &t1) &&
-             mul_ck(t1, f, &need_b) &&
-             mul_ck((uint64_t)p[0] * p[2], f, &need_o);
-        /* p[3]*p[1] and p[0]*p[2] are each two uint32 params, so at most
-         * 2^64-2^33; only the third factor can wrap, and that is checked. */
-    } else if (strcmp(kernel, "k_conv1d_step") == 0) {
-        ok = mul_ck(p[0], f, &need_a) && mul_ck((uint64_t)p[0] * p[1], f, &need_b);
-        need_o = need_b;                  /* out[C] then state[(K-1)*C] */
-    } else if (strcmp(kernel, "k_delta_step") == 0) {
-        ok = mul_ck((uint64_t)p[0] * p[1], f, &need_a) &&
-             add_ck(2ull * p[0], p[1], &t0) && mul_ck(t0, f, &need_b) &&
-             mul_ck(p[1], f, &need_o);
-    } else if (strcmp(kernel, "k_delta_gates") == 0) {
-        /* ab = [a(n), b(n)], adt = [ssm_a(n), dt_bias(n)], gates = [beta(n),
-         * decay(n)]; each is 2*n floats. p[0]=n. Made reachable through
-         * sg_gpu_run_op so the M5.5 per-op test can use k_delta_gates as the
-         * bit-identical oracle for k_delta_gates_chunk. */
-        ok = mul_ck(2ull * p[0], f, &need_a);
-        need_b = need_o = need_a;
-    } else if (strcmp(kernel, "k_kv_store_f16") == 0) {
-        /* a is p[0] f32 floats in; out is p[0] half (2-byte) elements out. */
-        ok = mul_ck(p[0], f, &need_a) && mul_ck(p[0], 2, &need_o);
-        want_b = false;
-    } else if (strcmp(kernel, "k_matmul_bf16") == 0) {
-        /* a = X [N, K] f32, b = W [M, K] bf16, o = Y [N, M] f32. p[0]=N
-         * p[1]=M p[2]=K. */
-        ok = mul_ck(p[0], p[2], &t0) && mul_ck(t0, f, &need_a) &&
-             mul_ck(p[1], p[2], &t1) && mul_ck(t1, 2, &need_b) &&
-             mul_ck(p[0], p[1], &t2) && mul_ck(t2, f, &need_o);
-    } else if (strcmp(kernel, "k_matmul_f32") == 0) {
-        ok = mul_ck(p[0], p[2], &t0) && mul_ck(t0, f, &need_a) &&
-             mul_ck(p[1], p[2], &t1) && mul_ck(t1, f, &need_b) &&
-             mul_ck(p[0], p[1], &t2) && mul_ck(t2, f, &need_o);
-    } else if (strcmp(kernel, "k_matmul_q8") == 0) {
-        /* b is M rows of (K/32) Q8_0 blocks of 34 bytes each. K is a nonzero
-         * multiple of 32, which check_params enforces before this runs (the
-         * same ordering k_matvec_q8 relies on), so p[2]/32 is the exact
-         * block count and does not truncate. */
-        ok = mul_ck(p[0], p[2], &t0) && mul_ck(t0, f, &need_a) &&
-             mul_ck(p[1], p[2] / 32u, &t1) && mul_ck(t1, 34, &need_b) &&
-             mul_ck(p[0], p[1], &t2) && mul_ck(t2, f, &need_o);
-    } else if (strcmp(kernel, "k_rope_chunk") == 0) {
-        /* a = out = [n_tok*heads, stride] f32 (a slice's rotated tail stays
-         * inside its own stride, guaranteed by check_params' stride>=head_dim,
-         * so n_tok*heads*stride is a safe cover); b = cos/sin table
-         * [n_tok, rope_dim] f32. p[0]=head_dim p[1]=rope_dim p[2]=heads
-         * p[3]=stride p[4]=n_tok. */
-        ok = mul_ck((uint64_t)p[4], p[2], &t0) && mul_ck(t0, p[3], &t1) &&
-             mul_ck(t1, f, &need_a) &&
-             mul_ck((uint64_t)p[4], p[1], &t2) && mul_ck(t2, f, &need_b);
-        need_o = need_a;
-    } else if (strcmp(kernel, "k_attn_decode_splitk_partial") == 0 ||
-               strcmp(kernel, "k_attn_decode_splitk_combine") == 0 ||
-               strcmp(kernel, "k_attn_decode_splitk_partial_gqa") == 0 ||
-               strcmp(kernel, "k_attn_decode_splitk_partial_gqa_online") == 0) {
-        /* P2.2 (and P2.4's GQA partial, which binds exactly the same eight,
-         * and P2.8's online partial, which binds seven of them).
-         * A ROUTING rule rather than a size rule: the partial kernels bind six
-         * device buffers (q, k, v, m, s, acc) plus a score scratch and the
-         * combine four (m, s, acc, out), so the (a, b, o) triple this
-         * function is handed cannot describe either and sg_gpu_run_op has no
-         * way to dispatch them. Named here rather than left to the generic
-         * fall-through below so the error points at the entry points that do
-         * work. Their real byte counts go through splitk_sizes(), which the
-         * one-shots call and which guards every product with mul_ck exactly
-         * as the rules above do. */
-        return gpu_errf("gpu: %s binds more device buffers than sg_gpu_run_op's "
-                        "(a, b, out); use sg_gpu_run_attn_splitk_partial/_gqa/"
-                        "_gqa_online/_combine", kernel);
-    } else {
-        return gpu_errf("gpu: no size rule for kernel '%s'", kernel);
-    }
-
-    if (!ok) {
-        return gpu_errf("gpu: %s params describe a region that overflows 64 bits", kernel);
-    }
-
-    if (!buf_big_enough(a, need_a)) {
-        return gpu_errf("gpu: %s input a is %llu bytes, needs %llu", kernel,
-                        (unsigned long long)(a ? a->nbytes : 0),
-                        (unsigned long long)need_a);
-    }
-    if (want_b && !buf_big_enough(b, need_b)) {
-        return gpu_errf("gpu: %s input b is %llu bytes, needs %llu", kernel,
-                        (unsigned long long)(b ? b->nbytes : 0),
-                        (unsigned long long)need_b);
-    }
-    if (!buf_big_enough(o, need_o)) {
-        return gpu_errf("gpu: %s output is %llu bytes, needs %llu", kernel,
-                        (unsigned long long)(o ? o->nbytes : 0),
-                        (unsigned long long)need_o);
-    }
-    return SG_OK;
-}
-
-/* Per-kernel preconditions that are not about buffer sizes. */
-static sg_err check_params(const char *kernel, const uint32_t *p) {
-    if (strcmp(kernel, "k_matvec_q8") == 0) {
-        /* Q8_0 rows are whole 32-element blocks, so a cols that is not a
-         * multiple of 32 has no valid byte layout; ref.c returns without
-         * touching y in that case, and the kernel would index a truncated
-         * block count. Reject it loudly instead. */
-        if (p[1] == 0 || p[1] % 32 != 0) {
-            return gpu_errf("gpu: k_matvec_q8 cols %u must be a nonzero multiple of 32", p[1]);
-        }
-    } else if (strcmp(kernel, "k_rope") == 0) {
-        if (p[1] < 2 || p[1] > p[0] || p[1] % 2 != 0) {
-            return gpu_errf("gpu: k_rope rope_dim %u must be even and in [2, head_dim %u]",
-                            p[1], p[0]);
-        }
-    } else if (strcmp(kernel, "k_rope_heads") == 0) {
-        /* Same rope_dim rule as k_rope; stride (p[3]) must be at least head_dim
-         * or a head's rotated tail would spill into the next head's slice.
-         * (This kernel is normally dispatched by the decode encoder, which
-         * always passes valid values; the rule lets sg_gpu_run_op reach it too,
-         * which the M5.4 per-op test uses as the k_rope_chunk oracle.) */
-        if (p[0] == 0) return (sg_err){"gpu: k_rope_heads head_dim must be nonzero"};
-        if (p[1] < 2 || p[1] > p[0] || p[1] % 2 != 0) {
-            return gpu_errf("gpu: k_rope_heads rope_dim %u must be even and in [2, head_dim %u]",
-                            p[1], p[0]);
-        }
-        if (p[3] < p[0]) {
-            return gpu_errf("gpu: k_rope_heads stride %u is smaller than head_dim %u",
-                            p[3], p[0]);
-        }
-    } else if (strcmp(kernel, "k_attn_decode") == 0) {
-        if (p[1] == 0 || p[0] % p[1] != 0) {
-            return gpu_errf("gpu: k_attn_decode n_heads %u is not a multiple of n_kv_heads %u",
-                            p[0], p[1]);
-        }
-        if (p[4] < p[2]) {
-            return gpu_errf("gpu: k_attn_decode q_stride %u is smaller than head_dim %u",
-                            p[4], p[2]);
-        }
-    } else if (strcmp(kernel, "k_conv1d_step") == 0) {
-        if (p[1] == 0) return (sg_err){"gpu: k_conv1d_step ksize must be nonzero"};
-    } else if (strcmp(kernel, "k_matmul_bf16") == 0 || strcmp(kernel, "k_matmul_f32") == 0) {
-        if (p[0] == 0) return gpu_errf("gpu: %s N must be nonzero", kernel);
-        if (p[1] == 0) return gpu_errf("gpu: %s M must be nonzero", kernel);
-        if (p[2] == 0) return gpu_errf("gpu: %s K must be nonzero", kernel);
-    } else if (strcmp(kernel, "k_matmul_q8") == 0) {
-        if (p[0] == 0) return (sg_err){"gpu: k_matmul_q8 N must be nonzero"};
-        if (p[1] == 0) return (sg_err){"gpu: k_matmul_q8 M must be nonzero"};
-        /* Q8_0 rows are whole 32-element blocks, exactly k_matvec_q8's rule,
-         * checked here (before check_sizes divides by 32) for the same
-         * reason: a truncated block count would silently undersize need_b. */
-        if (p[2] == 0 || p[2] % 32 != 0) {
-            return gpu_errf("gpu: k_matmul_q8 K %u must be a nonzero multiple of 32", p[2]);
-        }
-    } else if (strcmp(kernel, "k_rope_chunk") == 0) {
-        /* Same rope_dim rule as k_rope. stride must be at least head_dim, or a
-         * slice's rotated tail would spill into the next slice; heads and n_tok
-         * must be nonzero or the dispatch is empty. */
-        if (p[0] == 0) return (sg_err){"gpu: k_rope_chunk head_dim must be nonzero"};
-        if (p[1] < 2 || p[1] > p[0] || p[1] % 2 != 0) {
-            return gpu_errf("gpu: k_rope_chunk rope_dim %u must be even and in [2, head_dim %u]",
-                            p[1], p[0]);
-        }
-        if (p[2] == 0) return (sg_err){"gpu: k_rope_chunk heads must be nonzero"};
-        if (p[3] < p[0]) {
-            return gpu_errf("gpu: k_rope_chunk stride %u is smaller than head_dim %u",
-                            p[3], p[0]);
-        }
-        if (p[4] == 0) return (sg_err){"gpu: k_rope_chunk n_tok must be nonzero"};
-        /* The kernel carries slices = n_tok*heads and slices*head_dim (the grid
-         * element count, and thread_position_in_grid) in 32-bit uint, so the
-         * total must fit u32 or those wrap in-kernel even though the byte sizes
-         * in check_sizes are u64-guarded. Reject rather than truncate. */
-        uint64_t rc_slices = (uint64_t)p[4] * p[2];
-        if (rc_slices > UINT32_MAX || rc_slices * p[0] > UINT32_MAX) {
-            return (sg_err){"gpu: k_rope_chunk head_dim*heads*n_tok exceeds the 32-bit grid range"};
-        }
-    } else if (strcmp(kernel, "k_attn_decode_splitk_partial") == 0 ||
-               strcmp(kernel, "k_attn_decode_splitk_combine") == 0 ||
-               strcmp(kernel, "k_attn_decode_splitk_partial_gqa") == 0 ||
-               strcmp(kernel, "k_attn_decode_splitk_partial_gqa_online") == 0) {
-        /* P2.2. ONE params array serves both dispatches (surge.h documents it
-         * that way, and the test fills it once), so both kernels get ONE rule:
-         * a caller must not be able to get an array past the partial only to
-         * have the combine reject it, or the pair would be dispatchable
-         * half-way. The combine ignores n_kv_heads and q_stride, but they are
-         * still validated here for that reason.
-         * [0]=n_heads [1]=n_kv_heads [2]=head_dim [3]=seq [4]=q_stride
-         * [5]=scale bits [6]=n_splits.
-         *
-         * seq (p[3]) is deliberately NOT required to be nonzero, unlike
-         * sg_gpu_run_attn_decode_f16's own guard: seq == 0 makes every split
-         * empty, and these two kernels DEFINE that case (every triple is the
-         * m=-INFINITY/s=0/acc=0 encoding and the combine writes out[d] = 0.0,
-         * matching sg_ref_attn_decode_splitk) instead of leaving `out`
-         * unwritten the way k_attn_decode_f16 does. */
-        if (p[0] == 0) return gpu_errf("gpu: %s n_heads must be nonzero", kernel);
-        if (p[1] == 0 || p[0] % p[1] != 0) {
-            return gpu_errf("gpu: %s n_heads %u is not a multiple of n_kv_heads %u",
-                            kernel, p[0], p[1]);
-        }
-        if (p[2] == 0) return gpu_errf("gpu: %s head_dim must be nonzero", kernel);
-        if (p[4] < p[2]) {
-            return gpu_errf("gpu: %s q_stride %u is smaller than head_dim %u",
-                            kernel, p[4], p[2]);
-        }
-        /* Zero splits would be a zero-length grid dimension (a Metal API
-         * violation that aborts the process) and, on the combine side, the
-         * oracle's n_parts == 0 case, which has no partial triples to fold at
-         * all. Rejected rather than improvised. */
-        if (p[6] == 0) return gpu_errf("gpu: %s n_splits must be nonzero", kernel);
-        /* P2.4's GQA partial shares this rule and needs no extra one. The
-         * divisibility check above is exactly what makes its (n_splits, n_kv)
-         * grid tile the query heads: group hk covers hk*repeat .. +repeat-1
-         * with n_kv*repeat == n_heads, so no group runs off the end and none
-         * is skipped. A group WIDER than SG_SPLITK_GQA_MAX is still answered
-         * correctly (the kernel's default arm walks it one head at a time), so
-         * it is a policy question for splitk_gqa_use, not a validity one.
-         *
-         * P2.8's online partial shares it too, and adds NO head_dim ceiling
-         * here on purpose: head_dim > SG_TG makes that kernel re-stream the
-         * split once per SG_TG-wide band of output dims, which is slower than
-         * the four-pass kernel but still exactly correct, so it is the same
-         * kind of policy question (splitk_online_use declines it) rather than a
-         * validity one. A rejection here would instead break the one-shot for a
-         * shape the kernel answers correctly. */
-    }
-    return SG_OK;
-}
-
-/* Grid geometry from the kernel's kind and its params. Split out of
- * sg_gpu_run_op because sg_gpu_forward's encoder needs exactly the same
- * mapping and a second copy of it would be a silent way for the batched path
- * to dispatch a different shape than the one-shot path. Products are u64:
- * both factors are u32 params, so they cannot wrap. */
-static void gpu_grid(int kind, const uint32_t *p, uint64_t *groups, uint64_t *elems) {
-    *groups = 1;
-    *elems = 0;
-    switch (kind) {
-    case SG_K_ELEM:    *elems = p[0]; break;
-    case SG_K_ELEM01:  *elems = (uint64_t)p[0] * p[1]; break;
-    case SG_K_ELEM02:  *elems = (uint64_t)p[0] * p[2]; break;
-    case SG_K_ROWS:    *groups = p[0]; break;
-    case SG_K_ATTN:    *groups = p[0]; break;
-    case SG_K_GATED:   *groups = p[1]; break;
-    case SG_K_GROUPS2: *groups = p[2]; break;
-    /* M5.4 k_rope_chunk: one thread per (token, head, element). Three u32
-     * factors; the (uint64)p[0]*p[2] cannot wrap (two u32) and *p[4] cannot
-     * either at any real chunk size (head_dim*heads*n_tok is far under 2^64).
-     * check_sizes re-guards the byte counts with mul_ck regardless. */
-    case SG_K_ROPE_CHUNK: *elems = (uint64_t)p[0] * p[2] * p[4]; break;
-    /* SG_K_TILES2D and SG_K_HEADS2D each need two group dimensions, which this
-     * function's (groups, elems) pair cannot carry; their dispatchers compute
-     * both by hand instead (sg_gpu_run_op's SG_K_TILES2D case, and
-     * sg_gpu_run_attn_splitk_partial for SG_K_HEADS2D). Left at the default
-     * *groups = 1 so a caller that ignored this comment gets an
-     * obviously-wrong single threadgroup rather than a plausible-looking wrong
-     * number. */
-    default:           *groups = 1; break;
-    }
-}
-
 /* k_attn_decode's scores live in device memory, one private row of seq_len
  * floats per head, so nothing about the context length is capped by the
  * 32 KB threadgroup allocation. */
-static sg_err scratch_ensure(sg_gpu *g, uint64_t nbytes) {
+sg_err scratch_ensure(sg_gpu *g, uint64_t nbytes) {
     if (g->scratch && g->scratch_bytes >= nbytes) return SG_OK;
     id<MTLBuffer> nb = nil;
     @autoreleasepool {
@@ -1386,7 +745,8 @@ static bool splitk_gqa_use(const sg_gpu *g, uint32_t n_heads, uint32_t n_kv,
  * output dim, which works while head_dim fits one SG_TG-wide band. Past that
  * the kernel re-streams the split (and re-reads K) once per band: still exactly
  * correct, which is why the one-shot entry point accepts it and check_params
- * does not reject it, but strictly more traffic than the four-pass kernel it is
+ * (src/metal_validate.m) does not reject it, but strictly more traffic than the
+ * four-pass kernel it is
  * supposed to beat. Both real shapes are inside the bound (27B head_dim 256 ==
  * SG_TG, 4B dense 128), so the decline costs surge nothing today.
  *
@@ -1603,7 +963,8 @@ sg_err sg_gpu_run_op(sg_gpu *g, const char *kernel, void *a, void *b, void *out,
         if (elems == 0) return gpu_errf("gpu: %s dispatched with zero elements", kernel);
     } else if (kind == SG_K_TILES2D) {
         /* Two group dimensions: params[0]=N tiles vertically, params[1]=M
-         * tiles horizontally. check_params has already rejected N == 0 and
+         * tiles horizontally. check_params (src/metal_validate.m) has already
+         * rejected N == 0 and
          * M == 0 for every k_matmul_* kernel, so both ceil-divisions here are
          * already known nonzero; the explicit check below is a second,
          * cheap guard rather than trust across a function boundary. */
@@ -1784,7 +1145,8 @@ sg_err sg_gpu_run_attn_decode_f16(sg_gpu *g, void *q, void *k, void *v, void *ou
  * by the caller before this runs); out is f32 [n, n_heads, head_dim]. Each of
  * the n*n_heads threadgroups attends causally over the first base+t+1 cache
  * positions for its token t. Used by the per-op test; enc_attn_prefill
- * dispatches the same kernel by hand inside an open command buffer.
+ * (src/metal_prefill.m) dispatches the same kernel by hand inside an open
+ * command buffer.
  *
  * params: [0]=n_heads [1]=n_kv_heads [2]=head_dim [3]=base [4]=n
  * [5]=q_stride [6]=softmax scale bits (params[7] unused). */
@@ -1923,7 +1285,8 @@ static sg_err splitk_need(const char *kernel, const char *what,
  * params array is contracted (surge.h) to be valid for BOTH dispatches, so a
  * q/k/v extent that cannot exist is a bad array rather than a bad question.
  *
- * Guarded end to end with mul_ck for the reason stated above it: these are
+ * Guarded end to end with mul_ck for the reason stated at its definition in
+ * src/metal_internal.h: these are
  * products of up to three caller uint32 params (n_heads * n_splits * head_dim
  * is the largest), and a wrapped `need` would be SMALL, so an undersized
  * buffer would pass the checks below and the kernel would then index with the
@@ -1942,7 +1305,8 @@ static bool splitk_sizes(const uint32_t *p, uint64_t *need_q, uint64_t *need_kv,
     uint64_t q_stride = p[4], n_splits = p[6];
     uint64_t q = 0, kv = 0, ms = 0, acc = 0, out = 0, scratch = 0, parts = 0, t = 0;
 
-    /* check_params rejects this first; guarded again here because the span
+    /* check_params (src/metal_validate.m) rejects this first; guarded again
+     * here because the span
      * division below would be a divide by zero. */
     if (n_splits == 0) return false;
     uint64_t span = (seq + n_splits - 1) / n_splits;   /* both u32-derived, cannot wrap u64 */
@@ -1993,7 +1357,8 @@ static sg_err splitk_partial_run(sg_gpu *g, const char *kn, int ki, bool gqa,
 
     /* The grid's y extent: one threadgroup per QUERY head for the per-head
      * partial, per KV head (i.e. per GQA group) for the GQA one. check_params
-     * has already rejected n_kv_heads == 0 and n_heads % n_kv_heads != 0, so
+     * (src/metal_validate.m) has already rejected n_kv_heads == 0 and
+     * n_heads % n_kv_heads != 0, so
      * the groups tile the query heads exactly. */
     uint32_t n_splits = params[6];
     uint32_t n_rows = gqa ? params[1] : params[0];
@@ -2220,14 +1585,14 @@ sg_err sg_gpu_run_attn_splitk_combine(sg_gpu *g, void *m, void *s, void *acc,
  * One synchronous commit-and-wait per call, the same contract as
  * sg_gpu_run_attn_prefill, extended to the extra device buffer each M5.5 kernel
  * needs (the state carrier, or the shared weight). These are the per-op test's
- * entry points; enc_gdn_prefill dispatches the same kernels by hand inside one
- * open command buffer. Every byte count is u64-guarded (mul_ck/add_ck): the
+ * entry points; enc_gdn_prefill (src/metal_prefill.m) dispatches the same
+ * kernels by hand inside one open command buffer. Every byte count is u64-guarded (mul_ck/add_ck): the
  * sizes are products of up to three caller u32s and a wrapped-small `need` would
  * let an undersized buffer through to a device-side out-of-bounds read. */
 
 /* One dispatch of an elementwise (no-reduction) kernel over `elems` threads,
  * threadgroup width clamped to the pipeline max, SG_TG and `elems`. */
-static NSUInteger gpu_elem_width(sg_gpu *g, int ki, uint64_t elems) {
+NSUInteger gpu_elem_width(sg_gpu *g, int ki, uint64_t elems) {
     NSUInteger w = [g->pipes[ki] maxTotalThreadsPerThreadgroup];
     if (w > SG_TG) w = SG_TG;
     if (w > elems) w = (NSUInteger)elems;
@@ -2577,17 +1942,6 @@ sg_err sg_gpu_run_rmsnorm_gated_chunk(sg_gpu *g, void *y, void *z, void *out, vo
 
 #define SG_KV_GROUPS 2u   /* the kv cache holds K then V in one buffer */
 
-static uint32_t fbits(float f) {
-    uint32_t u;
-    memcpy(&u, &f, sizeof u);
-    return u;
-}
-
-/* Zero-padded params array as a call argument. Every kernel reads at most
- * seven of the eight slots; the rest must still be defined, because
- * setBytes: uploads all 32 bytes. */
-#define PARAMS(...) ((const uint32_t[8]){ __VA_ARGS__ })
-
 static float gpu_bf16_to_f32(uint16_t h) {
     uint32_t bits = (uint32_t)h << 16;
     float f;
@@ -2644,7 +1998,7 @@ static int matmul_kernel_for(sg_tensor_type t) {
  * per-tensor dtype dispatch, same one-selection-per-model reasoning as
  * matmul_kernel_for (the loader guarantees the matmul weights are
  * dtype-uniform), just the batched kernel family. */
-static int gemm_kernel_for(sg_tensor_type t) {
+int gemm_kernel_for(sg_tensor_type t) {
     switch (t) {
     case SG_T_Q8_0: return KI_MATMUL_Q8;
     case SG_T_BF16: return KI_MATMUL_BF16;
@@ -2669,7 +2023,7 @@ static void gpu_widen(const void *w, sg_tensor_type t, float *out, uint64_t n, f
 /* ref.c's wrow for the three dtypes this path accepts. The Q8_0 branch
  * mirrors ref.c's wrow exactly (same f16 scale decode, same scale*int8 in
  * f32), so the embedding row is bit-identical to the CPU reference. */
-static void gpu_embed_row(const void *w, sg_tensor_type t, uint64_t row,
+void gpu_embed_row(const void *w, sg_tensor_type t, uint64_t row,
                           uint32_t cols, float *out) {
     if (t == SG_T_BF16) {
         const uint16_t *b = (const uint16_t *)w + row * cols;
@@ -2693,24 +2047,16 @@ static void gpu_embed_row(const void *w, sg_tensor_type t, uint64_t row,
     }
 }
 
-static id<MTLBuffer> bufof(void *h) { return h ? ((sg_gpu_buf *)h)->buf : nil; }
-static uint64_t offof(void *h) { return h ? ((sg_gpu_buf *)h)->offset : 0; }
-
 /* --------------------------------------------------------------------
  * Encoding
  * -------------------------------------------------------------------- */
-
-typedef struct {
-    sg_gpu *g;
-    id<MTLComputeCommandEncoder> enc;
-} sg_enc;
 
 /* One dispatch into an already-open encoder. `ao`/`bo`/`oo` are offsets in
  * FLOATS from the start of the handle's data, which is what every buffer in
  * the decode path is made of; the wrapped bf16 weights are always bound at
  * 0. `aux` is buffer(4): k_attn_decode's score scratch or k_delta_multi's
  * gate vector, nil for everything else. */
-static void enc_op(sg_enc *E, int ki, void *a, uint64_t ao, void *b, uint64_t bo,
+void enc_op(sg_enc *E, int ki, void *a, uint64_t ao, void *b, uint64_t bo,
                    void *o, uint64_t oo, id<MTLBuffer> aux, uint64_t auxoff,
                    const uint32_t *p) {
     sg_gpu *g = E->g;
@@ -2748,7 +2094,7 @@ static void enc_op(sg_enc *E, int ki, void *a, uint64_t ao, void *b, uint64_t bo
  * `dst_off`. dst is HALF-typed storage, so its byte offset is dst_off * 2,
  * not the *4 enc_op assumes for its all-f32 buffers -- that mismatch is
  * exactly why this is a standalone dispatch rather than a call to enc_op. */
-static void enc_kv_store(sg_enc *E, void *src, void *dst, uint64_t dst_off, uint32_t n) {
+void enc_kv_store(sg_enc *E, void *src, void *dst, uint64_t dst_off, uint32_t n) {
     sg_gpu *g = E->g;
     id<MTLComputeCommandEncoder> e = E->enc;
     const uint32_t p[8] = { n, 0, 0, 0, 0, 0, 0, 0 };
@@ -2934,7 +2280,8 @@ static void enc_attn_splitk(sg_enc *E, void *q, void *k, void *v, void *out,
     if (!online) [e setBuffer:g->splitk_scratch offset:0 atIndex:7];
     /* SG_K_HEADS2D: x = split, y = query head (per-head partial) or KV head
      * (GQA partial), matching the kernel's tg.x / tg.y. gpu_grid's (groups,
-     * elems) pair cannot carry two group dimensions (it says so at its default
+     * elems) pair (src/metal_validate.m) cannot carry two group dimensions (it
+     * says so at its default
      * case), so this is computed here by hand, the same way enc_matmul does it
      * for SG_K_TILES2D and the one-shots do it for these kernels. Threads per
      * threadgroup stay exactly SG_TG, which is the width the fixed
@@ -2963,8 +2310,9 @@ static void enc_attn_splitk(sg_enc *E, void *q, void *k, void *v, void *out,
  * every wrapped weight), `y` the [N, M] output. `xoff`/`yoff` are element
  * offsets in FLOATS. The 2D tile grid (ceil(M/TN) x ceil(N/TM) threadgroups of
  * SG_GEMM_TN x SG_GEMM_TM threads) matches sg_gpu_run_op's SG_K_TILES2D branch
- * exactly; gpu_grid cannot express two group dimensions, so this is by hand. */
-static void enc_matmul(sg_enc *E, int ki, void *x, uint64_t xoff, void *w,
+ * exactly; gpu_grid (src/metal_validate.m) cannot express two group
+ * dimensions, so this is by hand. */
+void enc_matmul(sg_enc *E, int ki, void *x, uint64_t xoff, void *w,
                        void *y, uint64_t yoff, uint32_t nn, uint32_t mm, uint32_t kk) {
     sg_gpu *g = E->g;
     id<MTLComputeCommandEncoder> e = E->enc;
@@ -3092,247 +2440,6 @@ static void enc_attn(sg_enc *E, sg_gpu_layer *L, uint32_t layer_idx, uint32_t po
     }
     enc_op(E, g->mat_kernel, L->w_o, 0, g->b_ctx, 0, g->b_r, 0, nil, 0,
            PARAMS(c->hidden, g->attn_width));
-}
-
-/* Qwen3NextAttention for a CHUNK of `n` query tokens at absolute positions
- * base .. base+n-1, the chunked twin of enc_attn's fp16 path. It is the
- * single-full-attn-layer prefill encoder (Task M5.4); the whole-prompt,
- * all-layers prefill orchestration that drives it is Task M5.6, which is also
- * what sizes the buffers it reads. External linkage (rather than static) on
- * purpose: nothing in this build calls it yet, and a static uncalled function
- * would fail -Werror's -Wunused-function; M5.6's sg_gpu_prefill will call it.
- *
- * STORE-VS-ATTEND ORDER: store first, then attend. The chunk's own K and V
- * are cast into g->kv's per-layer fp16 buffers at positions base..base+n-1
- * BEFORE the attention dispatch, so at attend time the cache holds all base+n
- * positions and k_attn_prefill's threadgroup for token t attends over the
- * first base+t+1 of them (keys 0..base+t). That bound IS the causal mask: a
- * query at absolute position base+t never reads a key at a strictly-future
- * position (base+t' with t' > t is >= base+t+1, past the bound), while it does
- * read every earlier chunk token (t' < t) and all prior context.
- *
- * BUFFER SIZING (the caller's contract, since this reuses the decode field
- * names sized for one token): before calling, g->b_h must hold the chunk's
- * post-ln1 hidden [n, hidden]; g->b_qg [n, q_width] (q_width == 2*attn_width
- * when the model has an attention output gate, Task P1, else attn_width;
- * see cfg.attn_output_gate), g->b_k32/b_v32 [n, kv_width], g->b_ctx
- * [n, attn_width], g->b_r [n, hidden] must be
- * chunk-sized scratch; g->b_cs must hold the per-token RoPE table
- * [n, rope_dim] (cos half then sin half per absolute position, built in double
- * on the host exactly as sg_gpu_forward builds the one-token table); g->scratch
- * must be at least n*n_heads*(base+n) floats (ensured before the command
- * buffer opens, never mid-encode). g->kv must be the fp16 sg_kv cache.
- * Everything is left in g->b_r on exit, the same handle enc_attn writes. */
-void enc_attn_prefill(sg_enc *E, sg_gpu_layer *L, uint32_t layer_idx,
-                      uint32_t base, uint32_t n) {
-    sg_gpu *g = E->g;
-    const sg_cfg *c = &g->cfg;
-    uint32_t hd = c->head_dim;
-    uint32_t eps = fbits(c->rms_eps);
-    float scale = (float)(1.0 / sqrt((double)hd));
-    int gemm = gemm_kernel_for(g->model->wtype);
-    /* Task P1: per-head stride into g->b_qg, same rule as enc_attn's
-     * decode-step twin. */
-    uint32_t q_stride = c->attn_output_gate ? 2 * hd : hd;
-
-    /* Q/K/V projections for the whole chunk in one tiled GEMM each:
-     * Y[n, width] = b_h[n, hidden] @ W[width, hidden]^T. */
-    enc_matmul(E, gemm, g->b_h, 0, L->w_q, g->b_qg, 0, n, g->q_width, c->hidden);
-    /* q_norm on every (token, head) query slice: n*n_heads slices of head_dim
-     * at stride q_stride (2*head_dim when gated, head_dim when not), weight =
-     * qk_norm[0..head_dim). Same in-place k_rmsnorm_heads the decode path
-     * uses, applied across the chunk. */
-    enc_op(E, KI_RMSNORM_HEADS, g->b_qg, 0, L->qk_norm, 0, g->b_qg, 0, nil, 0,
-           PARAMS(hd, n * c->n_heads, eps, 1, q_stride));
-    /* Partial RoPE per token at its absolute position, from the chunk's cos/sin
-     * table in g->b_cs. */
-    enc_op(E, KI_ROPE_CHUNK, g->b_qg, 0, g->b_cs, 0, g->b_qg, 0, nil, 0,
-           PARAMS(hd, c->rope_dim, c->n_heads, q_stride, n));
-
-    enc_matmul(E, gemm, g->b_h, 0, L->w_k, g->b_k32, 0, n, g->kv_width, c->hidden);
-    enc_matmul(E, gemm, g->b_h, 0, L->w_v, g->b_v32, 0, n, g->kv_width, c->hidden);
-    enc_op(E, KI_RMSNORM_HEADS, g->b_k32, 0, L->qk_norm, hd, g->b_k32, 0, nil, 0,
-           PARAMS(hd, n * c->n_kv_heads, eps, 1, hd));
-    enc_op(E, KI_ROPE_CHUNK, g->b_k32, 0, g->b_cs, 0, g->b_k32, 0, nil, 0,
-           PARAMS(hd, c->rope_dim, c->n_kv_heads, hd, n));
-
-    /* STORE: cast the chunk's finished K and V (f32) into the fp16 cache at
-     * positions base..base+n-1. The chunk's [n, kv_width] rows map one-to-one
-     * onto cache positions base..base+n-1 (both kv_width-contiguous), so one
-     * store of n*kv_width elements at cache offset base*kv_width lands them. */
-    void *kbuf = sg_kv_k(g->kv, layer_idx);
-    void *vbuf = sg_kv_v(g->kv, layer_idx);
-    enc_kv_store(E, g->b_k32, kbuf, (uint64_t)base * g->kv_width, n * g->kv_width);
-    enc_kv_store(E, g->b_v32, vbuf, (uint64_t)base * g->kv_width, n * g->kv_width);
-
-    /* ATTEND: k_attn_prefill over the now base+n-position cache, one
-     * threadgroup per (token, head). Dispatched by hand (three device inputs),
-     * exactly as sg_gpu_run_attn_prefill does. */
-    {
-        id<MTLComputeCommandEncoder> e = E->enc;
-        const uint32_t pa[8] = { c->n_heads, c->n_kv_heads, hd, base, n,
-                                 q_stride, fbits(scale), 0 };
-        [e setComputePipelineState:g->pipes[KI_ATTN_PREFILL]];
-        [e setBuffer:bufof(g->b_qg) offset:(NSUInteger)offof(g->b_qg) atIndex:0];
-        [e setBuffer:bufof(kbuf) offset:(NSUInteger)offof(kbuf) atIndex:1];
-        [e setBuffer:bufof(vbuf) offset:(NSUInteger)offof(vbuf) atIndex:2];
-        [e setBuffer:bufof(g->b_ctx) offset:(NSUInteger)offof(g->b_ctx) atIndex:3];
-        [e setBytes:pa length:8 * sizeof(uint32_t) atIndex:4];
-        [e setBuffer:g->scratch offset:0 atIndex:5];
-        [e dispatchThreadgroups:MTLSizeMake((NSUInteger)n * c->n_heads, 1, 1)
-            threadsPerThreadgroup:MTLSizeMake(SG_TG, 1, 1)];
-    }
-
-    /* Output gate (sigmoid of the second half of each head's q_proj slice),
-     * then o_proj, both chunked -- gate only when the model has one (Task
-     * P1); dense qwen3 feeds g->b_ctx straight to o_proj unmodified. */
-    if (c->attn_output_gate) {
-        enc_op(E, KI_GATE_STRIDED, g->b_ctx, 0, g->b_qg, 0, g->b_ctx, 0, nil, 0,
-               PARAMS(hd, n * c->n_heads, 2 * hd, hd));
-    }
-    enc_matmul(E, gemm, g->b_ctx, 0, L->w_o, g->b_r, 0, n, c->hidden, g->attn_width);
-}
-
-/* GatedDeltaNet for a CHUNK of `n` tokens, the chunked twin of enc_gdn (Task
- * M5.5). It is the single-DeltaNet-layer prefill encoder; the whole-prompt,
- * all-layers prefill orchestration that drives it (and sizes the chunk buffers
- * it reuses) is Task M5.6. External linkage on purpose: nothing in this build
- * calls it yet, and a static uncalled function would trip -Werror's
- * -Wunused-function; M5.6's sg_gpu_prefill will call it. Its four DeltaNet
- * chunk kernels are each gated in isolation by the per-op test through their
- * public one-shots above.
- *
- * STATE THREADING is the point of the task: the recurrent state (the conv tail
- * and the S matrix) is carried across chunks in sg_kv's per-layer conv/S
- * buffers, NOT in the ad hoc L->conv_buf / L->ssm the decode path uses. Both are
- * read at chunk entry and rewritten in place by the sequential within-chunk
- * scan, so feeding chunk k+1 the state chunk k left behind reproduces the
- * one-token-at-a-time decode exactly. `base` is unused: unlike full attention,
- * DeltaNet has no position-indexed cache and no RoPE, so a chunk depends on the
- * prior context ONLY through the carried state.
- *
- * BUFFER SIZING (the caller's contract, since this reuses the decode field
- * names sized for one token; M5.6 sizes them for the chunk): g->b_h holds the
- * chunk's post-ln1 hidden [n, hidden] on entry; g->b_qkv [n, conv_dim] is the
- * qkv projection, then the conv output IN PLACE (safe: k_conv1d_chunk reads and
- * writes each channel-position exactly once, own thread, read before write),
- * then the q|k|v working area, then (after the delta scan consumes it) reused as
- * the z scratch [n, value_dim]; g->b_ab [2*n*n_v] holds the a-chunk then the
- * b-chunk; g->b_gates [n, 2*n_v] the per-token [beta;decay]; g->b_y [n,
- * value_dim] the delta readout then the gated-norm output in place; g->b_r [n,
- * hidden] the layer's residual contribution on exit (the handle enc_gdn writes).
- * L->zw still parks this layer's ssm_norm weight at element offset value_dim,
- * bound to k_rmsnorm_gated_chunk as its separate w buffer. */
-void enc_gdn_prefill(sg_enc *E, sg_gpu_layer *L, uint32_t layer_idx,
-                     uint32_t base, uint32_t n) {
-    sg_gpu *g = E->g;
-    const sg_cfg *c = &g->cfg;
-    uint32_t dk = c->head_k_dim, dv = c->head_v_dim;
-    uint32_t key_dim = g->key_dim, value_dim = g->value_dim, conv_dim = g->conv_dim;
-    double inv = 1.0 / sqrt((double)dk);
-    uint32_t eps6 = fbits(1e-6f);
-    uint32_t neg_exp = (g->model->ssm_a_form == SG_SSM_A_NEG_EXP) ? 1u : 0u;
-    uint32_t tiled = g->model->v_heads_tiled ? 1u : 0u;
-    int gemm = gemm_kernel_for(g->model->wtype);
-    id<MTLComputeCommandEncoder> e = E->enc;
-    (void)base;
-
-    /* in_proj: qkv, a and b for the whole chunk (z is computed later, into the
-     * b_qkv scratch the delta scan frees). a-chunk lands in b_ab[0..n*n_v), the
-     * b-chunk in b_ab[n*n_v..2*n*n_v). */
-    enc_matmul(E, gemm, g->b_h, 0, L->w_qkv, g->b_qkv, 0, n, conv_dim, c->hidden);
-    enc_matmul(E, gemm, g->b_h, 0, L->w_a, g->b_ab, 0, n, c->n_v_heads, c->hidden);
-    enc_matmul(E, gemm, g->b_h, 0, L->w_b, g->b_ab, (uint64_t)n * c->n_v_heads,
-               n, c->n_v_heads, c->hidden);
-
-    /* conv1d over the chunk (in place on b_qkv), threading the conv tail via
-     * sg_kv, then SiLU in place. */
-    {
-        void *conv_state = sg_kv_conv(g->kv, layer_idx);
-        const uint32_t pc[8] = { conv_dim, c->conv_kernel, n, 0, 0, 0, 0, 0 };
-        [e setComputePipelineState:g->pipes[KI_CONV1D_CHUNK]];
-        [e setBuffer:bufof(g->b_qkv) offset:(NSUInteger)offof(g->b_qkv) atIndex:0];
-        [e setBuffer:bufof(L->conv_w) offset:(NSUInteger)offof(L->conv_w) atIndex:1];
-        [e setBuffer:bufof(g->b_qkv) offset:(NSUInteger)offof(g->b_qkv) atIndex:2];
-        [e setBytes:pc length:8 * sizeof(uint32_t) atIndex:3];
-        [e setBuffer:bufof(conv_state) offset:(NSUInteger)offof(conv_state) atIndex:4];
-        NSUInteger w = gpu_elem_width(g, KI_CONV1D_CHUNK, conv_dim);
-        [e dispatchThreads:MTLSizeMake(conv_dim, 1, 1)
-        threadsPerThreadgroup:MTLSizeMake(w, 1, 1)];
-    }
-    enc_op(E, KI_SILU, g->b_qkv, 0, NULL, 0, g->b_qkv, 0, nil, 0,
-           PARAMS(n * conv_dim));
-
-    /* q and k RMS-normed per key head (no weight, hardcoded eps 1e-6) then
-     * scaled (q by 1/head_k_dim, k by 1/sqrt(head_k_dim)), exactly enc_gdn's
-     * arithmetic, applied per token: the q|k slices of a token are contiguous
-     * within its conv_dim row but separated by the v half from the next token's,
-     * so a single strided k_rmsnorm_heads cannot span the chunk. */
-    for (uint32_t t = 0; t < n; t++) {
-        uint64_t roff = (uint64_t)t * conv_dim;
-        enc_op(E, KI_RMSNORM_HEADS, g->b_qkv, roff, NULL, 0, g->b_qkv, roff, nil, 0,
-               PARAMS(dk, c->n_k_heads, eps6, 0, dk));
-        enc_op(E, KI_RMSNORM_HEADS, g->b_qkv, roff + key_dim, NULL, 0,
-               g->b_qkv, roff + key_dim, nil, 0,
-               PARAMS(dk, c->n_k_heads, eps6, 0, dk));
-        enc_op(E, KI_SCALE, g->b_qkv, roff, NULL, 0, g->b_qkv, roff, nil, 0,
-               PARAMS(key_dim, fbits((float)(inv * inv))));
-        enc_op(E, KI_SCALE, g->b_qkv, roff + key_dim, NULL, 0,
-               g->b_qkv, roff + key_dim, nil, 0,
-               PARAMS(key_dim, fbits((float)inv)));
-    }
-
-    /* gates for the whole chunk (a = b_ab[0..], b = b_ab[n*n_v..]). */
-    {
-        const uint32_t pg[8] = { c->n_v_heads, neg_exp, n, 0, 0, 0, 0, 0 };
-        [e setComputePipelineState:g->pipes[KI_DELTA_GATES_CHUNK]];
-        [e setBuffer:bufof(g->b_ab) offset:(NSUInteger)offof(g->b_ab) atIndex:0];
-        [e setBuffer:bufof(g->b_ab)
-                offset:(NSUInteger)(offof(g->b_ab) + (uint64_t)n * c->n_v_heads * 4)
-               atIndex:1];
-        [e setBuffer:bufof(g->b_gates) offset:(NSUInteger)offof(g->b_gates) atIndex:2];
-        [e setBytes:pg length:8 * sizeof(uint32_t) atIndex:3];
-        [e setBuffer:bufof(L->a_dt) offset:(NSUInteger)offof(L->a_dt) atIndex:4];
-        uint64_t elems = (uint64_t)n * c->n_v_heads;
-        NSUInteger w = gpu_elem_width(g, KI_DELTA_GATES_CHUNK, elems);
-        [e dispatchThreads:MTLSizeMake((NSUInteger)elems, 1, 1)
-        threadsPerThreadgroup:MTLSizeMake(w, 1, 1)];
-    }
-
-    /* delta recurrence over the chunk, threading S via sg_kv, readout to b_y. */
-    {
-        void *s_state = sg_kv_s(g->kv, layer_idx);
-        const uint32_t pd[8] = { dk, dv, c->n_v_heads, c->n_k_heads, key_dim,
-                                 tiled, n, conv_dim };
-        [e setComputePipelineState:g->pipes[KI_DELTA_CHUNK]];
-        [e setBuffer:bufof(s_state) offset:(NSUInteger)offof(s_state) atIndex:0];
-        [e setBuffer:bufof(g->b_qkv) offset:(NSUInteger)offof(g->b_qkv) atIndex:1];
-        [e setBuffer:bufof(g->b_y) offset:(NSUInteger)offof(g->b_y) atIndex:2];
-        [e setBytes:pd length:8 * sizeof(uint32_t) atIndex:3];
-        [e setBuffer:bufof(g->b_gates) offset:(NSUInteger)offof(g->b_gates) atIndex:4];
-        [e dispatchThreadgroups:MTLSizeMake((NSUInteger)c->n_v_heads, 1, 1)
-            threadsPerThreadgroup:MTLSizeMake(SG_TG, 1, 1)];
-    }
-
-    /* z = w_z @ h into the now-free b_qkv scratch, then RMSNormGated
-     * (silu(z) * rms_norm(y, ssm_norm)) over the chunk, in place on b_y. */
-    enc_matmul(E, gemm, g->b_h, 0, L->w_z, g->b_qkv, 0, n, value_dim, c->hidden);
-    {
-        const uint32_t pn[8] = { dv, c->n_v_heads, fbits(c->rms_eps), n, 0, 0, 0, 0 };
-        [e setComputePipelineState:g->pipes[KI_RMSNORM_GATED_CHUNK]];
-        [e setBuffer:bufof(g->b_y) offset:(NSUInteger)offof(g->b_y) atIndex:0];
-        [e setBuffer:bufof(g->b_qkv) offset:(NSUInteger)offof(g->b_qkv) atIndex:1];
-        [e setBuffer:bufof(g->b_y) offset:(NSUInteger)offof(g->b_y) atIndex:2];
-        [e setBytes:pn length:8 * sizeof(uint32_t) atIndex:3];
-        [e setBuffer:bufof(L->zw)
-                offset:(NSUInteger)(offof(L->zw) + (uint64_t)value_dim * 4)
-               atIndex:4];
-        uint64_t groups = (uint64_t)n * c->n_v_heads;
-        [e dispatchThreadgroups:MTLSizeMake((NSUInteger)groups, 1, 1)
-            threadsPerThreadgroup:MTLSizeMake(SG_TG, 1, 1)];
-    }
-
-    enc_matmul(E, gemm, g->b_y, 0, L->w_out, g->b_r, 0, n, c->hidden, value_dim);
 }
 
 /* GatedDeltaNet for one token, mirroring ref.c's gdn_layer. The conv output
@@ -3507,7 +2614,7 @@ static sg_err gpu_wrap_w(sg_gpu *g, const void *p, uint64_t rows, uint64_t cols,
     return sg_gpu_wrap(g, p, nbytes, out);
 }
 
-static sg_err gpu_alloc_f32(sg_gpu *g, uint64_t n, void **buf, float **host) {
+sg_err gpu_alloc_f32(sg_gpu *g, uint64_t n, void **buf, float **host) {
     void *h = NULL;
     sg_err e = sg_gpu_alloc(g, n * 4, buf, &h);
     if (host) *host = (float *)h;
@@ -3984,12 +3091,14 @@ sg_err sg_gpu_state_new(sg_gpu *g, const sg_model *m, uint32_t max_ctx) {
          * state internally (sg_kv models both layer kinds), which duplicates
          * the ad hoc L->conv_buf/L->ssm allocated just above; on the decode
          * path that state is untouched (decode reads L->conv_buf/L->ssm), but
-         * M5.6's sg_gpu_prefill DOES thread the DeltaNet scan through sg_kv's
+         * M5.6's sg_gpu_prefill (src/metal_prefill.m) DOES thread the DeltaNet
+         * scan through sg_kv's
          * conv/S carriers and then bridges the final state back into
          * L->conv_buf/L->ssm, so those carriers must exist.
          *
          * M5.6 widened this from `n_attn > 0` to also allocate when the model
-         * has ONLY DeltaNet layers: enc_gdn_prefill dereferences
+         * has ONLY DeltaNet layers: enc_gdn_prefill (src/metal_prefill.m)
+         * dereferences
          * sg_kv_conv/sg_kv_s, so a hybrid OR a DeltaNet-only model must have
          * g->kv non-NULL or prefill would fault on a NULL carrier. (With
          * layers > 0, `n_attn > 0 || n_gdn > 0` is always true on the f16
@@ -4116,547 +3225,4 @@ sg_err sg_gpu_forward(sg_gpu *g, const sg_model *m, int32_t token, uint32_t pos,
     g->used = pos + 1;
     if (logits) *logits = g->h_logits;
     return SG_OK;
-}
-
-/* --------------------------------------------------------------------
- * Chunked prompt prefill (Task M5.6)
- * --------------------------------------------------------------------
- *
- * sg_gpu_prefill wires the M5.4 full-attention prefill encoder
- * (enc_attn_prefill) and the M5.5 gated-DeltaNet prefill encoder
- * (enc_gdn_prefill) across ALL layers, one command buffer per chunk, and
- * closes the three M5.2/M5.4/M5.5 carry-forwards:
- *
- *   1. STATE BRIDGING. enc_gdn_prefill threads the DeltaNet recurrent state
- *      (conv tail + S) through sg_kv's per-layer conv/S carriers, but decode
- *      reads that state from the ad hoc L->conv_buf / L->ssm. After the last
- *      chunk this copies each DeltaNet layer's final conv tail and S out of the
- *      sg_kv carriers into L->conv_buf / L->ssm -- a small fixed-size per-layer
- *      host memcpy, safe because every chunk command buffer has been waited on
- *      and both are shared-storage unified memory. Full-attention KV is written
- *      straight into g->kv (the same buffers decode reads), and g->used is left
- *      at n_tokens with sg_kv advanced to match, so decode continues at
- *      pos == n_tokens with no further bridging.
- *   2. g->kv ALLOCATION. Fixed in sg_gpu_state_new (allocated for a hybrid OR a
- *      DeltaNet-only model on the f16 path, not only full-attn f16).
- *   3. WIRING. This is the first end-to-end drive of enc_attn_prefill /
- *      enc_gdn_prefill; tests/test_gpu_prefill.c gates it against the serial
- *      forward on the mini hybrid, which has both a full-attn and DeltaNet layer.
- *
- * The prefill encoders read the g->b_* scratch fields, which sg_gpu_state_new
- * sizes for ONE token. This swaps chunk-sized scratch into those fields for the
- * duration, then frees it and restores the one-token decode buffers untouched,
- * so a following sg_gpu_forward finds exactly the state it expects.
- */
-typedef struct {
-    void *b_x, *b_h, *b_r, *b_qg, *b_ctx, *b_ffg, *b_ffu,
-         *b_qkv, *b_ab, *b_gates, *b_y, *b_cs, *b_k32, *b_v32;
-    float *h_x, *h_cs;
-} sg_prefill_bufs;
-
-static void prefill_save(sg_gpu *g, sg_prefill_bufs *s) {
-    s->b_x = g->b_x; s->b_h = g->b_h; s->b_r = g->b_r; s->b_qg = g->b_qg;
-    s->b_ctx = g->b_ctx; s->b_ffg = g->b_ffg; s->b_ffu = g->b_ffu;
-    s->b_qkv = g->b_qkv; s->b_ab = g->b_ab; s->b_gates = g->b_gates;
-    s->b_y = g->b_y; s->b_cs = g->b_cs; s->b_k32 = g->b_k32; s->b_v32 = g->b_v32;
-    s->h_x = g->h_x; s->h_cs = g->h_cs;
-}
-
-static void prefill_restore(sg_gpu *g, const sg_prefill_bufs *s) {
-    g->b_x = s->b_x; g->b_h = s->b_h; g->b_r = s->b_r; g->b_qg = s->b_qg;
-    g->b_ctx = s->b_ctx; g->b_ffg = s->b_ffg; g->b_ffu = s->b_ffu;
-    g->b_qkv = s->b_qkv; g->b_ab = s->b_ab; g->b_gates = s->b_gates;
-    g->b_y = s->b_y; g->b_cs = s->b_cs; g->b_k32 = s->b_k32; g->b_v32 = s->b_v32;
-    g->h_x = s->h_x; g->h_cs = s->h_cs;
-}
-
-/* Frees whatever chunk buffers are currently in g's b_* fields and NULLs them,
- * so a partial-allocation failure and the normal teardown share one path. */
-static void prefill_free_chunk(sg_gpu *g) {
-    void *bufs[] = { g->b_x, g->b_h, g->b_r, g->b_qg, g->b_ctx, g->b_ffg,
-                     g->b_ffu, g->b_qkv, g->b_ab, g->b_gates, g->b_y, g->b_cs,
-                     g->b_k32, g->b_v32 };
-    for (size_t i = 0; i < sizeof bufs / sizeof *bufs; i++) sg_gpu_buf_free(bufs[i]);
-    g->b_x = g->b_h = g->b_r = g->b_qg = g->b_ctx = g->b_ffg = g->b_ffu = NULL;
-    g->b_qkv = g->b_ab = g->b_gates = g->b_y = g->b_cs = NULL;
-    g->b_k32 = g->b_v32 = NULL;
-    g->h_x = g->h_cs = NULL;
-}
-
-/* Monotonic seconds for the long-prefill progress log below and for the B8
- * duty-cycle's own GPU-busy accounting. */
-static double pf_now_s(void) {
-    struct timespec t;
-    clock_gettime(CLOCK_MONOTONIC, &t);
-    return (double)t.tv_sec + 1e-9 * (double)t.tv_nsec;
-}
-
-/* Task B8: sleeps ms milliseconds via nanosleep, retrying across EINTR (with
- * the remaining time nanosleep itself writes back into req) so a stray
- * signal cannot silently cut a rest short -- load-bearing for the real
- * 90000ms (90s) rests this feature exists for: a truncated rest could leave
- * the GPU idle for less than the firmware limiter's 60-120s recovery window,
- * quietly defeating the whole mitigation. Deliberately nanosleep rather than
- * usleep: nanosleep takes seconds+nanoseconds directly (no risk of a
- * uint32_t microsecond product overflowing) and its POSIX contract includes
- * writing the unslept remainder back on an EINTR return, which is exactly
- * what the retry loop needs. */
-/*
- * Margin applied to the previous chunk's GPU time when predicting the next
- * chunk's. A heuristic, not a guarantee: chunk cost grows monotonically with
- * context because each chunk attends over a longer KV cache, so last-chunk time
- * always under-estimates next-chunk time, and the growth per chunk is small
- * once the context is large. Measured over the 2026-08-14 256K run, consecutive
- * chunk times grew by well under 25%. Callers who need a hard bound should set
- * the work budget below the watchdog window rather than rely on this.
- */
-#define PF_EST_MARGIN 1.25
-
-static void pf_sleep_ms(uint32_t ms) {
-    struct timespec req = { .tv_sec = (time_t)(ms / 1000u),
-                             .tv_nsec = (long)(ms % 1000u) * 1000000L };
-    while (nanosleep(&req, &req) != 0 && errno == EINTR) {
-        /* req now holds the remaining time; loop to finish it out. */
-    }
-}
-
-/* Task B8: arms/disarms the prefill duty-cycle. Either argument 0 disables
- * it (the calloc default): no accumulator crosses work_budget_ms and
- * sg_gpu_prefill never sleeps, so its OUTPUT is byte-identical to before this
- * task (the chunk loop's two clock_gettime reads per chunk still run either
- * way, but feed only rest accounting). When both are nonzero, sg_gpu_prefill
- * sleeps rest_ms (GPU fully idle, no command buffer in flight) once the
- * accumulated GPU-busy wall time across chunks
- * reaches work_budget_ms, provided at least one chunk still remains; this is
- * pure timing and touches no buffer, state, or accumulator that feeds the
- * computed logits or KV state. Settings persist on g until changed again. */
-void sg_gpu_set_prefill_rest(sg_gpu *g, uint32_t work_budget_ms, uint32_t rest_ms) {
-    if (!g) return;
-    g->prefill_work_budget_ms = work_budget_ms;
-    g->prefill_rest_ms = rest_ms;
-}
-
-/*
- * Target ceiling, in ms, for how long any one prefill command buffer holds the
- * GPU. 0 (the calloc default) disables segmentation: one command buffer per
- * chunk, exactly as before.
- *
- * A target, not a guarantee, and specifically NOT a promise of a single
- * overrun. The check is reactive, so each overrun happens in full and the size
- * only halves afterwards: a 64-layer sweep can overrun at 64, then 32, then 16,
- * converging rather than stopping. A segment already at the 1-layer floor
- * cannot shrink further and will keep overrunning. The narrowed size does
- * persist for the rest of the call, so the sequence is bounded by log2(layers)
- * overruns, not by one.
- *
- * This is a different mechanism from the duty-cycle rest and solves a different
- * problem. The rest yields the GPU BETWEEN chunks; this bounds how long a
- * SINGLE submission holds it. Only the latter can protect the compositor once
- * one chunk runs longer than the watchdog window on its own.
- *
- * Unlike changing `chunk`, this cannot alter output: command buffer boundaries
- * carry no state, the same kernels are dispatched with the same arguments in
- * the same order, and buffers committed in sequence on one queue execute in
- * order. Settings persist on g until changed again.
- */
-void sg_gpu_set_prefill_max_burst(sg_gpu *g, uint32_t max_burst_ms) {
-    if (!g) return;
-    g->prefill_max_burst_ms = max_burst_ms;
-}
-
-uint64_t sg_gpu_prefill_segments(const sg_gpu *g) {
-    return g ? g->prefill_segments : 0;
-}
-
-/* Total time (ms) sg_gpu_prefill actually slept during its most recent call;
- * 0 if the feature was disabled or never triggered (e.g. every chunk's
- * GPU-busy time stayed under work_budget_ms). Reset to 0 at the start of
- * every sg_gpu_prefill call, so this always reflects the LAST call, not a
- * running total across calls. */
-uint64_t sg_gpu_prefill_rest_ms(const sg_gpu *g) {
-    return g ? g->prefill_rest_total_ms : 0;
-}
-
-sg_err sg_gpu_prefill(sg_gpu *g, const sg_model *m, const int32_t *tokens,
-                      uint32_t n_tokens, uint32_t chunk_size,
-                      const float **out_last_logits) {
-    if (!g) return (sg_err){"gpu: sg_gpu_prefill got a NULL argument"};
-    /* Task B8: reset the rest-time counter as the very first thing once g is
-     * known non-NULL, before ANY other validation (including the m/tokens
-     * NULL check right below) can return early. sg_gpu_prefill_rest_ms's
-     * contract is "the most recent call", and a failed call (NULL m/tokens,
-     * bad args, wrong KV dtype, oversized chunk, allocation failure) is still
-     * a call: without this reset being unconditionally first, a call that
-     * fails validation would otherwise still report whatever a PRIOR
-     * successful call slept, which is stale and misleading. */
-    g->prefill_rest_total_ms = 0;
-    g->prefill_segments = 0;
-    if (!m || !tokens) return (sg_err){"gpu: sg_gpu_prefill got a NULL argument"};
-    if (!g->have_state) return (sg_err){"gpu: call sg_gpu_state_new first"};
-    if (m != g->model) return (sg_err){"gpu: this gpu was loaded with a different sg_model"};
-    const sg_cfg *c = &g->cfg;
-    if (n_tokens == 0) return (sg_err){"gpu: sg_gpu_prefill needs at least one token"};
-    if (n_tokens > g->max_ctx) return (sg_err){"gpu: prompt length exceeds max_ctx"};
-    for (uint32_t t = 0; t < n_tokens; t++) {
-        if (tokens[t] < 0 || (uint32_t)tokens[t] >= c->vocab) {
-            return (sg_err){"gpu: a prompt token id is out of range"};
-        }
-    }
-    /* enc_attn_prefill reads g->kv's fp16 K/V and enc_gdn_prefill reads its
-     * conv/S carriers; the f32 KV path has no sg_kv object at all. */
-    if (g->kv_dtype != SG_T_F16 || !g->kv) {
-        return (sg_err){"gpu: sg_gpu_prefill needs the f16 KV path (SURGE_KV_DTYPE=f16)"};
-    }
-
-    uint32_t chunk = chunk_size ? chunk_size : SG_PREFILL_CHUNK_DEFAULT;
-    uint32_t cn = (chunk < n_tokens) ? chunk : n_tokens;   /* longest chunk used */
-
-    /* Several per-chunk kernel params are a chunk-length-times-width product
-     * passed as a uint32 (KI_ADD's n*hidden, KI_SWIGLU's n*ffn_hidden,
-     * KI_SILU's n*conv_dim in enc_gdn_prefill, and the smaller per-token slice
-     * counts n*n_heads / n*n_kv_heads / n*n_v_heads). Those are formed in 32-bit
-     * C arithmetic, so a chunk wide enough to overflow one would silently wrap
-     * it (a WRONG result, not a device fault) even though every buffer is sized
-     * in u64. n <= cn for every chunk, so bounding cn against the widest such
-     * factor rejects the whole class up front. In practice the f16 path caps
-     * n_tokens at SG_KV_CAP_MAX (262144), so this only bites an absurdly large
-     * --chunk on a very wide model; reject with a clear message rather than
-     * truncate. */
-    {
-        uint64_t widest = c->hidden;
-        if (c->ffn_hidden > widest) widest = c->ffn_hidden;
-        if (g->conv_dim > widest)   widest = g->conv_dim;
-        if (g->value_dim > widest)  widest = g->value_dim;
-        if (g->q_width > widest)    widest = g->q_width;
-        uint64_t prod = 0;
-        if (!mul_ck((uint64_t)cn, widest, &prod) || prod > UINT32_MAX) {
-            return (sg_err){"gpu: chunk size too large for this model's widths "
-                            "(a 32-bit kernel param would overflow); use a smaller --chunk"};
-        }
-    }
-
-    uint32_t n_attn = 0, n_gdn = 0;
-    for (uint32_t i = 0; i < c->n_layers; i++) {
-        if (g->ls[i].is_attn) n_attn++; else n_gdn++;
-    }
-
-    int gemm = gemm_kernel_for(m->wtype);
-    uint32_t eps = fbits(c->rms_eps);
-    uint32_t half = c->rope_dim / 2u;
-
-    /* Swap the one-token decode scratch out and chunk-sized scratch in. */
-    sg_prefill_bufs saved;
-    prefill_save(g, &saved);
-    g->b_x = g->b_h = g->b_r = g->b_qg = g->b_ctx = g->b_ffg = g->b_ffu = NULL;
-    g->b_qkv = g->b_ab = g->b_gates = g->b_y = g->b_cs = NULL;
-    g->b_k32 = g->b_v32 = NULL;
-    g->h_x = g->h_cs = NULL;
-
-    sg_err e = SG_OK;
-#define PF_ALLOC(field, nelem, hostpp) do { \
-        e = gpu_alloc_f32(g, (uint64_t)(nelem), &g->field, (hostpp)); \
-        if (sg_failed(e)) goto cleanup; \
-    } while (0)
-
-    PF_ALLOC(b_x, (uint64_t)cn * c->hidden, &g->h_x);
-    PF_ALLOC(b_h, (uint64_t)cn * c->hidden, NULL);
-    PF_ALLOC(b_r, (uint64_t)cn * c->hidden, NULL);
-    PF_ALLOC(b_ffg, (uint64_t)cn * c->ffn_hidden, NULL);
-    PF_ALLOC(b_ffu, (uint64_t)cn * c->ffn_hidden, NULL);
-    if (n_attn > 0) {
-        PF_ALLOC(b_qg, (uint64_t)cn * g->q_width, NULL);
-        PF_ALLOC(b_ctx, (uint64_t)cn * g->attn_width, NULL);
-        PF_ALLOC(b_k32, (uint64_t)cn * g->kv_width, NULL);
-        PF_ALLOC(b_v32, (uint64_t)cn * g->kv_width, NULL);
-        PF_ALLOC(b_cs, (uint64_t)cn * c->rope_dim, &g->h_cs);
-    }
-    if (n_gdn > 0) {
-        PF_ALLOC(b_qkv, (uint64_t)cn * g->conv_dim, NULL);
-        PF_ALLOC(b_ab, 2ull * cn * c->n_v_heads, NULL);
-        PF_ALLOC(b_gates, 2ull * cn * c->n_v_heads, NULL);
-        PF_ALLOC(b_y, (uint64_t)cn * g->value_dim, NULL);
-    }
-#undef PF_ALLOC
-
-    /* Start clean at position 0: reset used, zero the sg_kv DeltaNet carriers
-     * (read unconditionally by the scan), and zero the ad hoc decode conv/S
-     * (bridged from sg_kv at the very end, but zeroed now so the state is well
-     * defined throughout). K/V caches are append-only and need no clearing. */
-    g->used = 0;
-    sg_kv_reset(g->kv);
-    for (uint32_t i = 0; i < c->n_layers; i++) {
-        sg_gpu_layer *L = &g->ls[i];
-        if (L->is_attn) continue;
-        float *h = (float *)sg_gpu_buf_host(L->conv_buf);
-        if (h) memset(h, 0, (size_t)g->conv_dim * c->conv_kernel * sizeof *h);
-        h = (float *)sg_gpu_buf_host(L->ssm);
-        if (h) {
-            memset(h, 0, (size_t)c->n_v_heads * c->head_v_dim
-                             * c->head_k_dim * sizeof *h);
-        }
-    }
-
-    /* Progress log for long prefills (a 256K ingest is minutes-to-hours on this
-     * box). Auto-quiet for short prompts so `make check` stays silent; logs a
-     * throttled line every 8th chunk plus the last. */
-    /* Segmentation starts wide (one command buffer for the whole layer sweep,
-     * i.e. today's behaviour) and narrows only if a submission overruns the
-     * ceiling. Reset per call so one long-context run cannot leave a later,
-     * shorter one permanently over-segmented. */
-    g->prefill_seg_layers = c->n_layers;
-
-    bool pf_log = n_tokens >= 8192u;
-    double t_pf0 = pf_now_s();
-
-    /* Task B8: prefill duty-cycle. rest_enabled false (either setting 0, the
-     * calloc default) leaves every buffer, KV/accumulator write, and control
-     * flow below untouched -- pf_work_acc_ms stays unread, no sleep ever
-     * runs, and g->prefill_rest_total_ms (already reset to 0 above) stays 0,
-     * so a disabled run's OUTPUT (gen_ids, logits, KV/decode state, g->used)
-     * is byte-identical to before this task. The chunk-loop timing capture
-     * below (t_gpu0/t_gpu1, two extra clock_gettime calls per chunk) does
-     * run either way, but feeds only this accounting, never anything
-     * output-affecting. */
-    bool rest_enabled = (g->prefill_work_budget_ms > 0 && g->prefill_rest_ms > 0);
-    double pf_work_acc_ms = 0.0;
-
-    for (uint32_t base = 0; base < n_tokens; base += chunk) {
-        uint32_t n = n_tokens - base;
-        if (n > chunk) n = chunk;
-        bool last = (base + n == n_tokens);
-
-        /* Host embedding for the chunk (ref.c's wrow, exactly like decode). */
-        for (uint32_t t = 0; t < n; t++) {
-            gpu_embed_row(m->tok_emb, m->wtype, (uint64_t)tokens[base + t],
-                          c->hidden, g->h_x + (size_t)t * c->hidden);
-        }
-        /* Per-token RoPE cos/sin table in double, uploaded f32: one row per
-         * absolute position, [cos(rope_dim/2), sin(rope_dim/2)], byte-identical
-         * to the one-token table sg_gpu_forward builds. */
-        if (n_attn > 0 && g->h_cs) {
-            for (uint32_t t = 0; t < n; t++) {
-                float *row = g->h_cs + (size_t)t * c->rope_dim;
-                uint32_t pos = base + t;
-                for (uint32_t i = 0; i < half; i++) {
-                    double inv_freq = pow((double)c->rope_theta,
-                                          -2.0 * (double)i / (double)c->rope_dim);
-                    double ang = (double)pos * inv_freq;
-                    row[i] = (float)cos(ang);
-                    row[half + i] = (float)sin(ang);
-                }
-            }
-        }
-        /* k_attn_prefill's per-threadgroup private score row is base+n long,
-         * over n*n_heads threadgroups; ensure it before the command buffer
-         * opens (never mid-encode). */
-        if (n_attn > 0) {
-            uint64_t need = 0, t0 = 0;
-            if (!mul_ck((uint64_t)n * c->n_heads, (uint64_t)base + n, &t0)
-                || !mul_ck(t0, 4, &need)) {
-                e = (sg_err){"gpu: prefill score-scratch size overflows 64 bits"};
-                goto cleanup;
-            }
-            e = scratch_ensure(g, need);
-            if (sg_failed(e)) goto cleanup;
-        }
-
-        __block sg_err rc = SG_OK;
-        /* GPU-busy wall time for this chunk, Task B8 duty-cycle accounting:
-         * set around exactly the commit..waitUntilCompleted span below (the
-         * interval the GPU is actually working), not the host-side encode
-         * loop above. Captured unconditionally (two clock_gettime calls) so
-         * the encode path itself never branches on rest_enabled; only the
-         * accumulate-and-maybe-rest decision after the command buffer
-         * completes does. */
-        double chunk_gpu_s = 0.0;
-        uint32_t seg = g->prefill_seg_layers;
-        if (seg == 0u || seg > c->n_layers) seg = c->n_layers;
-
-        /*
-         * The cursor advances by the layers actually encoded (l1 - l0), NOT by
-         * `seg`. `seg` can shrink at the bottom of this loop, and a `l0 += seg`
-         * increment would then rewind over layers already applied to the
-         * residual stream, running them a second time. That is silent: it
-         * produces a plausible but wrong hidden state rather than an error.
-         */
-        for (uint32_t l0 = 0; l0 < c->n_layers && !sg_failed(rc); ) {
-            uint32_t l1 = l0 + seg;
-            if (l1 > c->n_layers) l1 = c->n_layers;
-
-        double t_gpu0 = 0.0, t_gpu1 = 0.0;
-        @autoreleasepool {
-            id<MTLCommandBuffer> cb = [g->queue commandBuffer];
-            id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
-            if (!cb || !enc) {
-                rc = (sg_err){"gpu: could not open a compute encoder"};
-            } else {
-                sg_enc E = { g, enc };
-                for (uint32_t i = l0; i < l1; i++) {
-                    sg_gpu_layer *L = &g->ls[i];
-                    /* ln1 per token: KI_RMSNORM_HEADS with heads=n is the
-                     * per-slice form of decode's k_rmsnorm (identical scale
-                     * formula and tg_sum tree), so ln1/ln2 are bit-identical to
-                     * decode per token and the only prefill-vs-decode numeric
-                     * gap is GEMM-vs-matvec reassociation. */
-                    enc_op(&E, KI_RMSNORM_HEADS, g->b_x, 0, L->ln1, 0, g->b_h, 0,
-                           nil, 0, PARAMS(c->hidden, n, eps, 1, c->hidden));
-                    if (L->is_attn) enc_attn_prefill(&E, L, i, base, n);
-                    else            enc_gdn_prefill(&E, L, i, base, n);
-                    enc_op(&E, KI_ADD, g->b_x, 0, g->b_r, 0, g->b_x, 0, nil, 0,
-                           PARAMS(n * c->hidden));
-
-                    enc_op(&E, KI_RMSNORM_HEADS, g->b_x, 0, L->ln2, 0, g->b_h, 0,
-                           nil, 0, PARAMS(c->hidden, n, eps, 1, c->hidden));
-                    enc_matmul(&E, gemm, g->b_h, 0, L->w_gate, g->b_ffg, 0,
-                               n, c->ffn_hidden, c->hidden);
-                    enc_matmul(&E, gemm, g->b_h, 0, L->w_up, g->b_ffu, 0,
-                               n, c->ffn_hidden, c->hidden);
-                    enc_op(&E, KI_SWIGLU, g->b_ffg, 0, g->b_ffu, 0, g->b_ffg, 0,
-                           nil, 0, PARAMS(n * c->ffn_hidden));
-                    enc_matmul(&E, gemm, g->b_ffg, 0, L->w_down, g->b_r, 0,
-                               n, c->hidden, c->ffn_hidden);
-                    enc_op(&E, KI_ADD, g->b_x, 0, g->b_r, 0, g->b_x, 0, nil, 0,
-                           PARAMS(n * c->hidden));
-                }
-                /* Logits belong to the FINAL segment of the final chunk, so
-                 * that b_x already carries every layer's contribution. */
-                if (last && l1 == c->n_layers) {
-                    /* Only the last chunk's LAST row needs logits: out_norm on
-                     * that row (KI_RMSNORM_HEADS, heads=1, reading b_x at the
-                     * last token's offset) then lm_head via the matvec kernel,
-                     * exactly decode's final two ops. */
-                    enc_op(&E, KI_RMSNORM_HEADS, g->b_x,
-                           (uint64_t)(n - 1) * c->hidden, g->out_norm, 0,
-                           g->b_h, 0, nil, 0, PARAMS(c->hidden, 1, eps, 1, c->hidden));
-                    enc_op(&E, g->mat_kernel, g->lm_head, 0, g->b_h, 0,
-                           g->b_logits, 0, nil, 0, PARAMS(c->vocab, c->hidden));
-                }
-                [enc endEncoding];
-                t_gpu0 = pf_now_s();
-                [cb commit];
-                [cb waitUntilCompleted];
-                t_gpu1 = pf_now_s();
-                if ([cb error]) {
-                    rc = gpu_errf("gpu: prefill chunk failed: %s",
-                                  [[[cb error] localizedDescription] UTF8String]);
-                }
-            }
-        }
-        chunk_gpu_s += t_gpu1 - t_gpu0;
-        /* Counts SUBMITTED command buffers, so a segment whose encoder could
-         * not be opened is not counted; t_gpu1/t_gpu0 are both 0 in that case
-         * and rc is already set, ending the loop. */
-        if (!sg_failed(rc)) g->prefill_segments++;
-        l0 = l1;
-
-        /* Adapt the segment size to the measured submission time.
-         *
-         * REACTIVE, not a hard cap: this segment has already run long by the
-         * time we look. Overruns can therefore REPEAT while the size converges
-         * (64 layers can overrun at 64, then 32, then 16), and a segment already
-         * at the 1-layer floor cannot shrink further, so it can overrun forever.
-         * What halving guarantees is only that each overrun makes the next
-         * submission smaller until the floor. Choose a ceiling well under the
-         * watchdog window so the overruns along the way still land inside it.
-         *
-         * Applies from the NEXT segment; the cursor above already advanced by
-         * what was encoded, so shrinking here cannot rewind it. */
-        if (g->prefill_max_burst_ms > 0u && seg > 1u &&
-            (t_gpu1 - t_gpu0) * 1000.0 > (double)g->prefill_max_burst_ms) {
-            seg /= 2u;
-            g->prefill_seg_layers = seg;
-            if (pf_log) {
-                fprintf(stderr, "gpu: prefill segment -> %u layers "
-                        "(command buffer ran %.0f ms, ceiling %u ms)\n",
-                        seg, (t_gpu1 - t_gpu0) * 1000.0, g->prefill_max_burst_ms);
-            }
-        }
-        }
-        if (sg_failed(rc)) { e = rc; goto cleanup; }
-
-        /* Advance both counters together: decode's position bookkeeping uses
-         * g->used, and sg_kv's own used is kept consistent for its append-only
-         * overflow guard (M5.2 note). */
-        g->used += n;
-        e = sg_kv_advance(g->kv, n);
-        if (sg_failed(e)) goto cleanup;
-
-        if (pf_log && (last || ((base / chunk) & 7u) == 0u)) {
-            double el = pf_now_s() - t_pf0;
-            fprintf(stderr, "gpu: prefill %u/%u tokens (%.1f%%), %.0f tok/s, "
-                    "%.1fs elapsed\n", base + n, n_tokens,
-                    100.0 * (double)(base + n) / (double)n_tokens,
-                    el > 0.0 ? (double)(base + n) / el : 0.0, el);
-        }
-
-        /* Task B8 duty-cycle: between THIS chunk's waitUntilCompleted (just
-         * above, GPU idle at that instant) and the NEXT chunk's encode (top of
-         * the next iteration). Pure timing -- no buffer, state, or accumulator
-         * that feeds the computed logits or KV state is touched here, only
-         * pf_work_acc_ms (a local, loop-scoped counter) and g's rest-tracking
-         * fields, so this cannot change gen_ids. No-op when disabled.
-         *
-         * The test is PREDICTIVE: it asks whether the NEXT chunk would carry
-         * the accumulator past the budget, not whether this one already did.
-         * Testing after the fact meant a burst always ran to budget + one
-         * chunk, and one chunk grows with context: over the 2026-08-14 256K
-         * run, 367 of 367 bursts overran a 150 s budget, median 199.5 s and
-         * worst 332.9 s. Chunk cost grows monotonically with context (each
-         * chunk attends over a longer KV cache), so the previous chunk is a
-         * slight UNDER-estimate of the next; PF_EST_MARGIN covers that.
-         *
-         * The final chunk is now PROTECTED rather than special-cased. The old
-         * rule skipped the budget test whenever the next chunk was the last
-         * one, so the longest chunk of the run was the one most likely to be
-         * submitted onto an already-exhausted budget. Here the test runs at the
-         * end of every non-final chunk and accounts for the chunk that follows,
-         * including when that chunk is the last. Resting AFTER the final chunk
-         * is still pointless (nothing follows it), which is what !last means
-         * now. */
-        if (rest_enabled && !last) {
-            double est_next_ms;
-
-            pf_work_acc_ms += chunk_gpu_s * 1000.0;
-            est_next_ms = chunk_gpu_s * 1000.0 * PF_EST_MARGIN;
-
-            if (pf_work_acc_ms + est_next_ms >= (double)g->prefill_work_budget_ms) {
-                if (pf_log) {
-                    fprintf(stderr, "gpu: prefill duty-cycle resting %u ms "
-                            "(worked %.0f ms since last rest)\n",
-                            g->prefill_rest_ms, pf_work_acc_ms);
-                }
-                pf_sleep_ms(g->prefill_rest_ms);
-                g->prefill_rest_total_ms += g->prefill_rest_ms;
-                pf_work_acc_ms = 0.0;
-            }
-        }
-    }
-
-    /* Bridge the DeltaNet state from the sg_kv carriers into the decode
-     * buffers. conv tail: sg_kv_conv is [conv_kernel-1, conv_dim] oldest-first;
-     * L->conv_buf is [conv_kernel, conv_dim] (output row then the same tail), so
-     * the tail lands at element offset conv_dim. S: identical [n_v, dv, dk]. */
-    {
-        uint64_t conv_tail = (uint64_t)(c->conv_kernel - 1u) * g->conv_dim;
-        uint64_t s_elems = (uint64_t)c->n_v_heads * c->head_v_dim * c->head_k_dim;
-        for (uint32_t i = 0; i < c->n_layers; i++) {
-            sg_gpu_layer *L = &g->ls[i];
-            if (L->is_attn) continue;
-            float *cs = (float *)sg_gpu_buf_host(sg_kv_conv(g->kv, i));
-            float *cd = (float *)sg_gpu_buf_host(L->conv_buf);
-            if (cs && cd && conv_tail) {
-                memcpy(cd + g->conv_dim, cs, (size_t)conv_tail * sizeof *cd);
-            }
-            float *ss = (float *)sg_gpu_buf_host(sg_kv_s(g->kv, i));
-            float *sd = (float *)sg_gpu_buf_host(L->ssm);
-            if (ss && sd) memcpy(sd, ss, (size_t)s_elems * sizeof *sd);
-        }
-    }
-
-    if (out_last_logits) *out_last_logits = g->h_logits;
-
-cleanup:
-    prefill_free_chunk(g);
-    prefill_restore(g, &saved);
-    return e;
 }

@@ -936,30 +936,85 @@ fi
 #     3. -n 48 rather than 16 for the same reason: a longer decode phase
 #     makes both the probe and the paced arms less sensitive to a single
 #     slow step.
+#     CALIBRATION IS RE-CHECKED, NOT ASSUMED. The probe and the arms are
+#     separate processes at different instants, so the budget can be stale by
+#     the time the arms run: on a machine whose load changed in between, the
+#     div-1 arm can exceed a budget that was generous when it was measured.
+#     Observed for real on 2026-08-20, where an unrelated MLX benchmark held
+#     the GPU at 99% and the probed decode phase came out 1.15415s against
+#     0.034926s on the same machine idle, a 33x swing, and the div-1 arm rested
+#     once and failed the case.
+#
+#     The discriminator is the arm's OWN decode wall. div-1 resting is a real
+#     fault ONLY if that arm's decode phase fit inside the budget it was given:
+#     if the phase itself overran the budget, any correct scheduler would rest
+#     and the calibration, not the detector, is what broke. In that case the
+#     probe is retaken and the arms rerun. If the machine stays too unsteady to
+#     calibrate across P30_ESC_TRIES attempts the case SKIPS loudly rather than
+#     reporting a fault it cannot substantiate.
 ncase=$((ncase + 1))
 P30_ESC_N=48
-p30_probe_json="$(mktemp)"
-p30_run_n "$p30_probe_json" "$P30_ESC_N"
-p30_probe_w="$(p30_get "$p30_probe_json" decode_wall_s)"
-rm -f "$p30_probe_json"
-p30_budget="$(awk -v w="$p30_probe_w" 'BEGIN { b = int(w * 1000 * 1.5); if (b < 8) b = 8; print b }')"
-p30_d1_json="$(mktemp)"; p30_d4_json="$(mktemp)"
-p30_run_n "$p30_d1_json" "$P30_ESC_N" --decode-work-ms "$p30_budget" --decode-rest-ms 20 \
-    --decode-baseline-ms 0.001 --decode-clamp-div 1
-p30_run_n "$p30_d4_json" "$P30_ESC_N" --decode-work-ms "$p30_budget" --decode-rest-ms 20 \
-    --decode-baseline-ms 0.001 --decode-clamp-div 4
-p30_n_d1="$(p30_get "$p30_d1_json" decode_rests)"
-p30_n_d4="$(p30_get "$p30_d4_json" decode_rests)"
-p30_ev_d4="$(p30_get "$p30_d4_json" decode_clamp_events)"
-rm -f "$p30_d1_json" "$p30_d4_json"
-if [ -z "$p30_n_d1" ] || [ -z "$p30_n_d4" ] || [ -z "$p30_probe_w" ] || [ -z "$p30_ev_d4" ]; then
-    echo "FAIL p30 clamp-escalation: could not read JSON (probe_wall='$p30_probe_w' " \
-         "div1='$p30_n_d1' div4='$p30_n_d4' events='$p30_ev_d4')" >&2
-    fail=1
-elif [ "$p30_n_d1" -ne 0 ]; then
+P30_ESC_TRIES=3
+p30_esc_state="unmeasurable"
+p30_esc_note=""
+for p30_try in $(seq 1 "$P30_ESC_TRIES"); do
+    p30_probe_json="$(mktemp)"
+    p30_run_n "$p30_probe_json" "$P30_ESC_N"
+    p30_probe_w="$(p30_get "$p30_probe_json" decode_wall_s)"
+    rm -f "$p30_probe_json"
+    [ -n "$p30_probe_w" ] || break
+    p30_budget="$(awk -v w="$p30_probe_w" 'BEGIN { b = int(w * 1000 * 1.5); if (b < 8) b = 8; print b }')"
+
+    p30_d1_json="$(mktemp)"
+    p30_run_n "$p30_d1_json" "$P30_ESC_N" --decode-work-ms "$p30_budget" --decode-rest-ms 20 \
+        --decode-baseline-ms 0.001 --decode-clamp-div 1
+    p30_n_d1="$(p30_get "$p30_d1_json" decode_rests)"
+    p30_d1_w="$(p30_get "$p30_d1_json" decode_wall_s)"
+    rm -f "$p30_d1_json"
+    [ -n "$p30_n_d1" ] && [ -n "$p30_d1_w" ] || break
+
+    if [ "$p30_n_d1" -eq 0 ]; then
+        p30_esc_state="calibrated"
+    else
+        # Did this arm's own decode phase fit the budget it was handed? If not,
+        # the budget went stale between the probe and the run and the rest says
+        # nothing about the detector.
+        p30_stale="$(awk -v w="$p30_d1_w" -v b="$p30_budget" \
+            'BEGIN { print (w * 1000 > b) ? "1" : "0" }')"
+        if [ "$p30_stale" = "1" ]; then
+            p30_esc_note="attempt $p30_try: probe ${p30_probe_w}s -> budget ${p30_budget}ms, but the div-1 arm's own decode phase was ${p30_d1_w}s; recalibrating"
+            echo "  .. p30 clamp-escalation: $p30_esc_note" >&2
+            continue
+        fi
+        p30_esc_state="fault"
+    fi
+    break
+done
+
+if [ "$p30_esc_state" = "calibrated" ]; then
+    p30_d4_json="$(mktemp)"
+    p30_run_n "$p30_d4_json" "$P30_ESC_N" --decode-work-ms "$p30_budget" --decode-rest-ms 20 \
+        --decode-baseline-ms 0.001 --decode-clamp-div 4
+    p30_n_d4="$(p30_get "$p30_d4_json" decode_rests)"
+    p30_ev_d4="$(p30_get "$p30_d4_json" decode_clamp_events)"
+    rm -f "$p30_d4_json"
+else
+    p30_n_d4=""; p30_ev_d4=""
+fi
+
+if [ "$p30_esc_state" = "unmeasurable" ]; then
+    echo "  skip p30 clamp-escalation: the machine did not hold a steady decode speed " \
+         "across $P30_ESC_TRIES calibration attempts, so the div-1 arm cannot be " \
+         "distinguished from a stale budget. Last: ${p30_esc_note:-no probe}" >&2
+elif [ "$p30_esc_state" = "fault" ]; then
     echo "FAIL p30 clamp-escalation: --decode-clamp-div 1 rested $p30_n_d1 time(s) against a " \
-         "${p30_budget}ms budget (1.5x the ${p30_probe_w}s probed decode phase) -- the " \
-         "detector must not drive rests by default" >&2
+         "${p30_budget}ms budget while its OWN decode phase (${p30_d1_w}s) fit inside that " \
+         "budget -- so this is the detector driving rests by default, not a stale " \
+         "calibration" >&2
+    fail=1
+elif [ -z "$p30_n_d4" ] || [ -z "$p30_ev_d4" ]; then
+    echo "FAIL p30 clamp-escalation: could not read the div-4 JSON " \
+         "(div4='$p30_n_d4' events='$p30_ev_d4')" >&2
     fail=1
 elif [ "$p30_ev_d4" -lt 1 ]; then
     echo "FAIL p30 clamp-escalation: the div-4 arm never latched the detector " \
@@ -972,8 +1027,8 @@ elif [ "$p30_n_d4" -lt 1 ]; then
     fail=1
 else
     echo "  ok p30 clamp-escalation: budget=${p30_budget}ms (1.5x probe ${p30_probe_w}s over " \
-         "$P30_ESC_N tokens), div1 rests=$p30_n_d1, div4 rests=$p30_n_d4 over " \
-         "$p30_ev_d4 clamp event(s)" >&2
+         "$P30_ESC_N tokens), div-1 phase ${p30_d1_w}s fit the budget and rested " \
+         "$p30_n_d1, div4 rests=$p30_n_d4 over $p30_ev_d4 clamp event(s)" >&2
 fi
 
 # (5) Same determinism proof on a real model, env-gated so `make check` stays

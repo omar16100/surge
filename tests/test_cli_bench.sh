@@ -962,7 +962,7 @@ for p30_try in $(seq 1 "$P30_ESC_TRIES"); do
     p30_run_n "$p30_probe_json" "$P30_ESC_N"
     p30_probe_w="$(p30_get "$p30_probe_json" decode_wall_s)"
     rm -f "$p30_probe_json"
-    [ -n "$p30_probe_w" ] || break
+    if [ -z "$p30_probe_w" ]; then p30_esc_state="unreadable"; break; fi
     p30_budget="$(awk -v w="$p30_probe_w" 'BEGIN { b = int(w * 1000 * 1.5); if (b < 8) b = 8; print b }')"
 
     p30_d1_json="$(mktemp)"
@@ -971,7 +971,7 @@ for p30_try in $(seq 1 "$P30_ESC_TRIES"); do
     p30_n_d1="$(p30_get "$p30_d1_json" decode_rests)"
     p30_d1_w="$(p30_get "$p30_d1_json" decode_wall_s)"
     rm -f "$p30_d1_json"
-    [ -n "$p30_n_d1" ] && [ -n "$p30_d1_w" ] || break
+    if [ -z "$p30_n_d1" ] || [ -z "$p30_d1_w" ]; then p30_esc_state="unreadable"; break; fi
 
     if [ "$p30_n_d1" -eq 0 ]; then
         p30_esc_state="calibrated"
@@ -1002,7 +1002,12 @@ else
     p30_n_d4=""; p30_ev_d4=""
 fi
 
-if [ "$p30_esc_state" = "unmeasurable" ]; then
+if [ "$p30_esc_state" = "unreadable" ]; then
+    echo "FAIL p30 clamp-escalation: could not read the probe or div-1 JSON " \
+         "(probe_wall='$p30_probe_w' div1_rests='$p30_n_d1' div1_wall='$p30_d1_w') -- a run " \
+         "that produces no JSON is a fault, not an unsteady machine" >&2
+    fail=1
+elif [ "$p30_esc_state" = "unmeasurable" ]; then
     echo "  skip p30 clamp-escalation: the machine did not hold a steady decode speed " \
          "across $P30_ESC_TRIES calibration attempts, so the div-1 arm cannot be " \
          "distinguished from a stale budget. Last: ${p30_esc_note:-no probe}" >&2

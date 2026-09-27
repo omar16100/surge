@@ -15,10 +15,13 @@
       prompt-lookup speculation marked not built, 630 GB/s and 21.9 TFLOPS removed (private
       repo figures, no data file here). GitHub description no longer says "limiter-aware".
 - [x] `docs/c4model.md` status block: M3 + M5 now "built, on main", not "in progress".
-- [x] Review fix: `tests/test_cli_bench.sh` p30 clamp-escalation now judges the div-1 arm on
-      its non-rest decode time (`decode_wall_s - decode_rest_s`), so erroneous rests can no
-      longer masquerade as a stale budget and SKIP. New case (4a) checks the classifier on
-      injected values; test_cli_bench is now 19 cases. `make check` 87604/0 after the fix.
+- [x] Review fix: `tests/test_cli_bench.sh` p30 clamp-escalation judged the div-1 arm on
+      its decode wall, which includes the rests under test, so a real detector fault could
+      end as a SKIP. `surge-bench` JSON now carries `decode_step_ms` (`%.17g`, sum of the
+      valid per-step times the pacer's budget accumulates) and the case uses it: a rest
+      before those steps reach the budget is proof of a fault; at or above it the case
+      recalibrates. New case (4a) checks the classifier on injected values, including the
+      budget boundary; test_cli_bench is 19 cases.
 - Plan: `docs/27092026_m3_m5_tail_merge_plan.md`.
 
 ## Split-K decode attention (P2.x): COMPLETE AND GATED ON GPU

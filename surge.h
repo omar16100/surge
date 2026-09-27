@@ -1883,10 +1883,13 @@ typedef struct {
      * discipline, same reason: with pacing armed, decode_tps_slope and
      * decode_tps_avg are wall-clock and so FALL, and these are what let a
      * reader separate compute from idle. */
-    double decode_rest_s;      /* total time the decode duty cycle slept,
-                                * seconds, a SUBSET of decode_wall_s (not
-                                * additional). 0 when pacing is disabled,
-                                * which is the default. */
+    double decode_rest_s;      /* total CONFIGURED rest the decode duty cycle
+                                * requested (rests x rest_ms), seconds, a
+                                * SUBSET of decode_wall_s (not additional).
+                                * A real sleep can run longer than it asked
+                                * for, so this is a floor on the time slept,
+                                * not a measurement of it. 0 when pacing is
+                                * disabled, which is the default. */
     double decode_compute_tps; /* n_gen / (decode_wall_s - decode_rest_s),
                                 * the fair full-clock decode rate with the
                                 * pacing idle excluded. < 0 if the
@@ -1900,6 +1903,21 @@ typedef struct {
                                 * number of per-token pacing points, which
                                 * catches a rest emitted from the wrong place
                                 * in the loop. */
+    double decode_step_ms;     /* sum of the valid (finite, positive) per-step
+                                * times fed to the decode pacer, ms, i.e. the
+                                * figure its work budget accumulates. Written
+                                * at full precision (%.17g) because a test
+                                * compares it with an integer ms budget.
+                                * Neither decode_wall_s nor decode_wall_s -
+                                * decode_rest_s is that figure: the wall also
+                                * covers the argmax and the progress print,
+                                * and a real sleep can overrun its configured
+                                * rest_ms. With clamp_div 1, a rest while this
+                                * is below the budget cannot have been earned
+                                * (tests/test_cli_bench.sh p30); at or above
+                                * the budget it is inconclusive, since the
+                                * total says nothing about how many rests the
+                                * budget allowed. */
     /* Detector output. These are populated on EVERY run, paced or not,
      * because they cost no wall time and their job is to tell a reader
      * whether the decode number next to them is trustworthy. */
@@ -1941,7 +1959,8 @@ void sg_bench_format_md_row(const sg_bench_row *row, char *buf, size_t cap);
 
 /* A flat JSON object of every field, key names matching the struct field
  * names verbatim. Numbers at "%.6g" (round-trips a double to display
- * precision, not bit-exact); ingestion_ok as a JSON bool; string fields
+ * precision, not bit-exact), except decode_step_ms at "%.17g" because a test
+ * compares it with an integer ms budget; ingestion_ok as a JSON bool; string fields
  * (model, engine, status, log_id) are JSON-escaped (quote, backslash, and
  * control bytes as \u00XX) so the output stays valid JSON even if one of
  * them ever contains a quote. snprintf-truncates into cap like the md

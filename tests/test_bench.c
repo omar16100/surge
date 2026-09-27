@@ -237,6 +237,7 @@ static void test_format_json(void) {
     row.decode_rest_s = 12.5;            /* Task P3.0 */
     row.decode_compute_tps = 3.71;       /* Task P3.0 */
     row.decode_rests = 250;              /* Task P3.0 */
+    row.decode_step_ms = 9812.5;         /* p30 escalation discriminator */
     row.decode_clamp_events = 3;         /* Task P3.0 */
     row.decode_baseline_ms = 26.375;     /* Task P3.0 */
     row.peak_ram_gib = 75.5;
@@ -276,6 +277,7 @@ static void test_format_json(void) {
     CHECK_D("\"prefill_compute_tps\":", row.prefill_compute_tps); /* Task B8 */
     CHECK_D("\"decode_rest_s\":", row.decode_rest_s);             /* Task P3.0 */
     CHECK_D("\"decode_compute_tps\":", row.decode_compute_tps);   /* Task P3.0 */
+    CHECK_D("\"decode_step_ms\":", row.decode_step_ms);           /* p30 discriminator */
     CHECK_D("\"decode_baseline_ms\":", row.decode_baseline_ms);   /* Task P3.0 */
     CHECK_D("\"peak_ram_gib\":", row.peak_ram_gib);
     CHECK_D("\"gpu_alloc_gib\":", row.gpu_alloc_gib);

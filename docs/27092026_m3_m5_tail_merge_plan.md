@@ -31,8 +31,8 @@ and quoted bandwidth and TFLOPS figures from a private repo with no data file he
 4. `docs/c4model.md`: the M3/M5 status block said "In progress (branch `feat/m3-m5`)";
    it now says built and merged.
 5. GitHub description: drop "limiter-aware pacing scheduler", which restates the premise.
-6. One test fix from review: the p30 clamp-escalation discriminator in
-   `tests/test_cli_bench.sh` (see Review below).
+6. From review: a sounder p30 clamp-escalation discriminator in `tests/test_cli_bench.sh`,
+   backed by a new additive `decode_step_ms` field in `surge-bench`'s JSON (see Review).
 
 ## Verification
 
@@ -42,11 +42,16 @@ and quoted bandwidth and TFLOPS figures from a private repo with no data file he
   `tests/test_cli_prefill.sh` 11 cases, `tests/test_cli_bench.sh` 18 cases. Skipped: the
   env-gated real-model gates (`SURGE_GGUF`, `SURGE_GGUF_QWEN3`, `SURGE_ST`,
   `SURGE_GGUF_TWIN`, `SURGE_BENCH_TOK_MODEL`, `SURGE_PACE_MODEL`), which need model files.
-- After the review fix below: `make check` exit 0, 87604 checks, 0 failures,
-  `tests/test_cli_bench.sh` 19 cases (one new), plus three standalone reruns of that
-  script, all 19/19. One earlier full run hit the known B6 `check2` timing flake (3 percent
-  bar) while another job held the CPU at load average 39; it passed on every rerun once
-  the load dropped. The flake is pre-existing and recorded in
+- After the review fixes below: `make check` exit 0, 19 test binaries, 87605 checks (one
+  new round-trip check for `decode_step_ms`), 0 failures, `tests/test_cli_bench.sh` 19
+  cases (one new). `make debug` exit 0, 83615 checks, 0 failures, 0 sanitizer
+  diagnostics. Mutation checks on copies of the script: forcing the div-1 arm to rest by
+  default (clamp div 4 in its slot) now FAILS with steps 30.6 ms under a 46 ms budget
+  while its wall was 84.9 ms (the wall rule would have called it stale); a 0.05x budget
+  multiplier gives three recalibrations then the loud SKIP; an unreadable first probe
+  reaches its FAIL message. One earlier full run hit the known B6 `check2` timing flake
+  (3 percent bar) while another job held the CPU at load average 39; it passed on every
+  rerun once the load dropped. The flake is pre-existing and recorded in
   `docs/18082026_decode_optimization_summary.md`.
 - Personal-data scan over `git log -p origin/main..HEAD`, plus gitleaks over the range and
   the tree.
@@ -54,14 +59,26 @@ and quoted bandwidth and TFLOPS figures from a private repo with no data file he
 
 ## Review (codex, 2026-09-27)
 
-- MAJOR, fixed: the p30 clamp-escalation case compared the div-1 arm's decode WALL with
-  the budget, and the wall includes the very rests under test. On a fast machine two
-  erroneous 20 ms rests pushed a 35 ms phase past a 52 ms budget, so a detector bug was
-  retried as a stale calibration and ended as a SKIP. The discriminator now subtracts the
-  arm's own `decode_rest_s`, lives in one function (`p30_esc_classify`), and a new
-  injected-value case (4a) pins it: the old rule misclassifies three of its five inputs.
-  The narrower window the previous commit documented (step time is about 0.85x the
-  non-rest wall) remains, and closing it needs the bench to emit accumulated step time.
+- MAJOR, fixed (round 1): the p30 clamp-escalation case compared the div-1 arm's decode
+  WALL with the budget, and the wall includes the very rests under test. On a fast
+  machine two erroneous 20 ms rests pushed a 35 ms phase past a 52 ms budget, so a
+  detector bug was retried as a stale calibration and ended as a SKIP.
+- MAJOR, fixed (round 2): the first fix subtracted `decode_rest_s`, but that is the
+  CONFIGURED rest (rests x rest_ms) and a real sleep can overrun it, so the masking could
+  come back on a loaded machine. `surge-bench` now reports `decode_step_ms`, the sum of
+  the valid per-step times the pacer's budget accumulates (additive JSON field,
+  `surge.h`, `src/bench.c`, `src/cli_bench.c`, round-trip checked in `tests/test_bench.c`).
+  With clamp div 1, a rest while that sum is below the budget is proof of a fault; at or
+  above it the verdict is inconclusive and the case recalibrates (`p30_esc_classify`).
+  A new injected-value case (4a) pins it.
+- Minor, fixed (round 2): an unreadable first probe expanded unset variables under
+  `set -u` before its FAIL message; they are now initialized.
+- Minors, fixed (round 3): the field was first written as seconds with `%.6g`, which
+  could flip a verdict at the budget boundary; it is now milliseconds with `%.17g`, and
+  (4a) pins three boundary rows. `cli_bench.c` now drops non-finite and non-positive steps
+  exactly as `sg_decode_pace_decide` does. The wording no longer calls the verdict
+  "exact" in both directions, and the `decode_rest_s` comment in `surge.h` now says it is
+  the configured rest, not the measured sleep.
 - Minor, fixed: README no longer states a date range for the blog's runs (no committed
   source), says the compositor mitigation reduces risk rather than prevents it, and
   notes the opt-in `--decode-clamp-div` escalation.

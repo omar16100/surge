@@ -84,6 +84,7 @@
  */
 #include "surge.h"
 
+#include <float.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -622,6 +623,7 @@ int main(int argc, char **argv) {
      * The stopping rules below are byte-identical to cli_metal.c's, so with the
      * shared argmax and shared prefill the emitted gen_ids match `surge`. */
     uint32_t produced = 0;
+    double decode_step_ms_total = 0.0;   /* what the pacer's budget sees */
     if (n_gen > 0) {
         gen = malloc((size_t)n_gen * sizeof *gen);
         t_wall = malloc((size_t)n_gen * sizeof *t_wall);
@@ -653,7 +655,11 @@ int main(int argc, char **argv) {
              * the decode analogue of B8's between-chunks placement. When
              * pacing is disabled -- the default -- sg_decode_pace_step
              * returns 0 without sleeping and this is a no-op. */
-            sg_decode_pace_step(&pacer, (now_s() - t_step) * 1000.0);
+            double step_ms = (now_s() - t_step) * 1000.0;
+            /* Same filter sg_decode_pace_decide applies before accumulating,
+             * so this total is the sum the pacer's budget actually saw. */
+            if (step_ms > 0.0 && step_ms <= DBL_MAX) decode_step_ms_total += step_ms;
+            sg_decode_pace_step(&pacer, step_ms);
             if (!quiet && (i % 32 == 0 || i + 2 == n_gen)) {
                 fprintf(stderr, "\r  generated %u/%u", i + 1, n_gen);
             }
@@ -677,6 +683,7 @@ int main(int argc, char **argv) {
     row.decode_compute_tps = (decode_compute_wall > 0.0)
         ? (double)produced / decode_compute_wall : -1.0;
     row.decode_rests = sg_decode_pace_rests(&pacer);
+    row.decode_step_ms = decode_step_ms_total;
     row.decode_clamp_events = sg_decode_pace_clamp_events(&pacer);
     row.decode_baseline_ms = sg_decode_pace_baseline_ms(&pacer);
     if (!quiet && (row.decode_rest_s > 0.0 || row.decode_clamp_events > 0)) {

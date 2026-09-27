@@ -945,54 +945,65 @@ fi
 #     0.034926s on the same machine idle, a 33x swing, and the div-1 arm rested
 #     once and failed the case.
 #
-#     The discriminator is the arm's OWN decode wall MINUS ITS OWN RESTS
-#     (decode_wall_s - decode_rest_s). div-1 resting is a real fault ONLY if
-#     that arm's non-rest decode time fit inside the budget it was given: if it
-#     overran the budget, any correct scheduler would rest and the calibration,
-#     not the detector, is what broke. In that case the probe is retaken and
-#     the arms rerun. If the machine stays too unsteady to calibrate across
-#     P30_ESC_TRIES attempts the case SKIPS loudly rather than reporting a
-#     fault it cannot substantiate.
+#     The discriminator is the arm's OWN accumulated step time,
+#     decode_step_ms: the sum of exactly the per-step times the pacer's work
+#     budget accumulates. With --decode-clamp-div 1 no rest can be earned
+#     before that sum reaches the budget, so a rest while decode_step_ms <
+#     budget is PROOF of a fault. At or above the budget the verdict is only
+#     INCONCLUSIVE (the total says nothing about how many rests the budget
+#     allowed), and the case treats it as a possibly stale calibration: the
+#     probe is retaken and the arms rerun. If the machine stays too unsteady
+#     to calibrate across P30_ESC_TRIES attempts the case SKIPS loudly rather
+#     than reporting a fault it cannot substantiate.
 #
-#     WHY THE RESTS ARE SUBTRACTED (2026-09-27 review). Comparing the raw wall
-#     let the very bug this case exists to catch hide itself: every erroneous
-#     20 ms rest inflates the wall, so on a fast machine (35 ms probe, 52 ms
-#     budget) two wrong rests push the wall to 75 ms, the arm looks "stale",
-#     is retried three times, and the case SKIPS instead of failing. With the
-#     rests removed that arm reads 35 ms against 52 ms and FAILS. What remains
-#     is the one-directional window the previous commit documented: the
-#     scheduler budgets accumulated STEP time (~0.85x the non-rest wall), so a
-#     detector bug that rests while the non-rest wall sits between 1.0x and
-#     about 1.18x the budget is still retried rather than reported. Closing
-#     that needs the bench to emit accumulated step time.
+#     WHY NOT THE WALL (2026-09-27 review). Earlier versions compared
+#     decode_wall_s with the budget, and the wall includes the very rests
+#     under test: on a fast machine (35 ms of steps, 52 ms budget) two
+#     erroneous 20 ms rests pushed the wall to 75 ms, the arm looked "stale",
+#     was retried three times, and the case SKIPPED instead of failing.
+#     Subtracting decode_rest_s is not enough either, because that is the
+#     CONFIGURED rest (rests x rest_ms) and a real nanosleep can overrun it,
+#     and because the wall also covers the argmax and the progress print.
+#     decode_step_ms has neither problem, and it is written with %.17g in
+#     milliseconds so the comparison with the integer budget is not decided
+#     by a JSON rounding. The probe still calibrates from decode_wall_s,
+#     which only sets the headroom described above.
 p30_esc_classify() {
-    # $1 div-1 rests, $2 decode_wall_s, $3 decode_rest_s, $4 budget ms.
-    # Prints calibrated (no rest), stale (non-rest wall overran the budget)
-    # or fault (rested while the non-rest wall fit the budget).
+    # $1 div-1 rests, $2 decode_step_ms, $3 budget ms.
+    # Prints calibrated (no rest), stale (steps reached the budget, so the
+    # rest may have been earned: inconclusive) or fault (rested before the
+    # steps reached it, which no correct div-1 scheduler can do).
     if [ "$1" -eq 0 ]; then echo calibrated; return; fi
-    awk -v w="$2" -v r="$3" -v b="$4" \
-        'BEGIN { print ((w - r) * 1000 > b) ? "stale" : "fault" }'
+    awk -v st="$2" -v b="$3" \
+        'BEGIN { print (st + 0 >= b + 0) ? "stale" : "fault" }'
 }
 
 # (4a) The discriminator itself, on injected values, so the masking bug above
-#      cannot come back unnoticed. Pure shell, no GPU, no timing.
+#      cannot come back unnoticed. Pure shell, no GPU, no timing. The second
+#      row is the review's case: 35 ms of steps and two erroneous rests,
+#      which the wall rule and the wall-minus-configured-rest rule both
+#      called stale. The last three pin the budget boundary at the precision
+#      surge-bench writes (a %.6g seconds field got the first and third wrong).
 ncase=$((ncase + 1))
 p30_cls_bad=""
 for p30_cls_case in \
-    "0 0.030 0 52 calibrated" \
-    "2 0.075 0.04 52 fault" \
-    "1 0.070 0.02 52 fault" \
-    "1 1.15415 0.02 52 stale" \
-    "3 0.110 0.06 52 fault"; do
-    read -r c_n c_w c_rs c_b c_want <<< "$p30_cls_case"
-    p30_cls_got="$(p30_esc_classify "$c_n" "$c_w" "$c_rs" "$c_b")"
+    "0 30 52 calibrated" \
+    "2 35 52 fault" \
+    "1 50 52 fault" \
+    "1 60 52 stale" \
+    "1 1154.15 52 stale" \
+    "1 51.999960000000002 52 fault" \
+    "1 52 52 stale" \
+    "1 1001.0000100000001 1001 stale"; do
+    read -r c_n c_st c_b c_want <<< "$p30_cls_case"
+    p30_cls_got="$(p30_esc_classify "$c_n" "$c_st" "$c_b")"
     [ "$p30_cls_got" = "$c_want" ] || p30_cls_bad="$p30_cls_bad [$p30_cls_case -> $p30_cls_got]"
 done
 if [ -n "$p30_cls_bad" ]; then
     echo "FAIL p30 clamp-escalation-discriminator: misclassified$p30_cls_bad" >&2
     fail=1
 else
-    echo "  ok p30 clamp-escalation-discriminator: erroneous rests are faults, not stale budgets" >&2
+    echo "  ok p30 clamp-escalation-discriminator: a rest before the steps reach the budget is a fault" >&2
 fi
 
 ncase=$((ncase + 1))
@@ -1000,6 +1011,9 @@ P30_ESC_N=48
 P30_ESC_TRIES=3
 p30_esc_state="unmeasurable"
 p30_esc_note=""
+# Initialized so an unreadable FIRST probe still reaches its own FAIL message
+# under set -u instead of dying on an unset expansion.
+p30_probe_w=""; p30_n_d1=""; p30_d1_w=""; p30_d1_st=""; p30_budget=""
 for p30_try in $(seq 1 "$P30_ESC_TRIES"); do
     p30_probe_json="$(mktemp)"
     p30_run_n "$p30_probe_json" "$P30_ESC_N"
@@ -1013,19 +1027,19 @@ for p30_try in $(seq 1 "$P30_ESC_TRIES"); do
         --decode-baseline-ms 0.001 --decode-clamp-div 1
     p30_n_d1="$(p30_get "$p30_d1_json" decode_rests)"
     p30_d1_w="$(p30_get "$p30_d1_json" decode_wall_s)"
-    p30_d1_rs="$(p30_get "$p30_d1_json" decode_rest_s)"
+    p30_d1_st="$(p30_get "$p30_d1_json" decode_step_ms)"
     rm -f "$p30_d1_json"
-    if [ -z "$p30_n_d1" ] || [ -z "$p30_d1_w" ] || [ -z "$p30_d1_rs" ]; then
+    if [ -z "$p30_n_d1" ] || [ -z "$p30_d1_w" ] || [ -z "$p30_d1_st" ]; then
         p30_esc_state="unreadable"; break
     fi
 
-    # Did this arm's own non-rest decode time fit the budget it was handed? If
-    # not, the budget went stale between the probe and the run and the rest
-    # says nothing about the detector.
-    p30_esc_state="$(p30_esc_classify "$p30_n_d1" "$p30_d1_w" "$p30_d1_rs" "$p30_budget")"
+    # Did this arm's own accumulated step time stay under the budget it was
+    # handed? If not, the budget went stale between the probe and the run
+    # and the rest says nothing about the detector.
+    p30_esc_state="$(p30_esc_classify "$p30_n_d1" "$p30_d1_st" "$p30_budget")"
     if [ "$p30_esc_state" = "stale" ]; then
         p30_esc_state="unmeasurable"
-        p30_esc_note="attempt $p30_try: probe ${p30_probe_w}s -> budget ${p30_budget}ms, but the div-1 arm's own non-rest decode phase was ${p30_d1_w}s - ${p30_d1_rs}s rest; recalibrating"
+        p30_esc_note="attempt $p30_try: probe ${p30_probe_w}s -> budget ${p30_budget}ms, but the div-1 arm's own steps summed to ${p30_d1_st}ms, so its rest may have been earned; recalibrating"
         echo "  .. p30 clamp-escalation: $p30_esc_note" >&2
         continue
     fi
@@ -1045,8 +1059,8 @@ fi
 
 if [ "$p30_esc_state" = "unreadable" ]; then
     echo "FAIL p30 clamp-escalation: could not read the probe or div-1 JSON " \
-         "(probe_wall='$p30_probe_w' div1_rests='$p30_n_d1' div1_wall='$p30_d1_w' " \
-         "div1_rest='${p30_d1_rs:-}') -- a run " \
+         "(probe_wall='${p30_probe_w:-}' div1_rests='${p30_n_d1:-}' div1_wall='${p30_d1_w:-}' " \
+         "div1_steps='${p30_d1_st:-}') -- a run " \
          "that produces no JSON is a fault, not an unsteady machine" >&2
     fail=1
 elif [ "$p30_esc_state" = "unmeasurable" ]; then
@@ -1055,8 +1069,8 @@ elif [ "$p30_esc_state" = "unmeasurable" ]; then
          "distinguished from a stale budget. Last: ${p30_esc_note:-no probe}" >&2
 elif [ "$p30_esc_state" = "fault" ]; then
     echo "FAIL p30 clamp-escalation: --decode-clamp-div 1 rested $p30_n_d1 time(s) against a " \
-         "${p30_budget}ms budget while its OWN non-rest decode phase (${p30_d1_w}s wall - " \
-         "${p30_d1_rs}s rest) fit inside that " \
+         "${p30_budget}ms budget while its OWN steps summed to only ${p30_d1_st}ms " \
+         "(decode wall ${p30_d1_w}s), under that " \
          "budget -- so this is the detector driving rests by default, not a stale " \
          "calibration" >&2
     fail=1
@@ -1075,7 +1089,7 @@ elif [ "$p30_n_d4" -lt 1 ]; then
     fail=1
 else
     echo "  ok p30 clamp-escalation: budget=${p30_budget}ms (1.5x probe ${p30_probe_w}s over " \
-         "$P30_ESC_N tokens), div-1 phase ${p30_d1_w}s fit the budget and rested " \
+         "$P30_ESC_N tokens), div-1 steps ${p30_d1_st}ms stayed under it and rested " \
          "$p30_n_d1, div4 rests=$p30_n_d4 over $p30_ev_d4 clamp event(s)" >&2
 fi
 

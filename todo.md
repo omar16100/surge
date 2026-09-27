@@ -1,5 +1,18 @@
 # Surge M0-M2 Tasks
 
+## 2026-09-27: publish the ANE backend as a draft PR (branch feat/ane-backend)
+
+- [x] Carried the uncommitted A0 work onto a branch from main after PR #2: tracked diff via
+      `git apply -3` (conflicts in `docs/c4model.md` and this file resolved by keeping both
+      sides), plus eight listed untracked files. `tests/fixtures/ane/` not committed, now in
+      `.gitignore` (regenerate with `make ane-fixture`).
+- [x] Parameterized personal paths: `ANE_PY`, `GGUF`, `PY` default under `$(HOME)`;
+      `SURGE_GPU_PY` for the tools' GPU arm; `surge.h` comment paths use `~/`.
+- [x] `make check` 87605/0 (test_ane SKIPs with no fixture); `test_ane` with a local fixture
+      14/0, `on_ane=1`; `make debug` 83615/0.
+- [ ] Not wired in. Next: split prefill GEMM between Metal and the ANE, gate on `gen_ids`.
+- Plan: `docs/27092026_ane_backend_plan.md`.
+
 ## 2026-09-27: merge the feat/m3-m5 tail, README honesty pass (branch chore/m3-m5-tail)
 
 - [x] Tail = `origin/main..1173c82`, 13 commits: the 11 `feat/m3-m5` gained after PR #1
@@ -24,6 +37,53 @@
       budget boundary; test_cli_bench is 19 cases.
 - [x] CI added (`.github/workflows/ci.yml`): `make debug` on macos-15. `make check` stays local.
 - Plan: `docs/27092026_m3_m5_tail_merge_plan.md`.
+
+## Task A0 (2026-08-28): ANE backend, first primitive. DONE AND GATED ON HARDWARE
+
+A SECOND COMPUTE PATH, ADDITIVE TO METAL, NOT A REPLACEMENT. New files: `src/ane.m`,
+`tests/test_ane.c`, `tools/ane_build_model.py`, plus the measurement harnesses
+`tools/ane_gemm_probe.py` and `tools/ane_envelope.py`. `surge.h` gains the `sg_ane_*` API,
+the Makefile gains `ANE_M`, `ane-fixture` and an `ANE_TESTS` rule, and `make debug` now also
+defines `-DSURGE_NO_ANE` so CoreML stays out of the ASan run the way Metal does.
+
+**WHY, MEASURED BEFORE ANY CODE WAS WRITTEN.** The ANE is the slower processor on every axis:
+~8.2 TFLOPS fp16 per die over ~126 GB/s of weight bandwidth, two dies, against the GPU's
+~23.6 TFLOPS and ~573 GB/s. It earns its place because it does NOT take those cycles from the
+GPU. Both dies plus the GPU at a bandwidth-bound shape measured **31.71 TFLOPS / 495.5 GB/s
+against the GPU's own 15.81, a 2.005x aggregate**, with the ANE retaining 0.963x and the GPU
+1.002x of solo rate. So this is a PREFILL path. Decode at depth is memory-bandwidth-bound and
+the ANE has 0.22x of the bandwidth, so decode stays on Metal, permanently.
+
+**GATE (`./tests/test_ane.bin`, 14 checks, 0 failures, `on_ane=1` confirmed by `MLComputePlan`):**
+
+| result | value | why it matters |
+|---|---|---|
+| accuracy vs f64 reference | **1.101e-2** (bar 2e-2) | CORRECTED 2026-08-29: this row said the ANE accumulates in fp16. `tools/ane_accum_probe.py` falsified that (error FALLS with k, exponent -0.24, where a narrow running sum needs +0.5). The accumulator is WIDE; the 1.1e-2 is a CANCELLATION artifact of this fixture, and a well-conditioned workload holds about 1e-3 |
+| determinism | **8 reruns byte-identical** | this is what leaves a byte-exact greedy gate POSSIBLE on this path |
+| per-dispatch floor | **0.815 ms from C** | against 13 to 15 ms through Python, a ~17x reduction; this is the number that decides whether the path can carry per-layer or only whole-stack work |
+
+The oracle is INDEPENDENT: the generator writes `weights.f16` alongside the compiled program and
+the test recomputes the product in double from those bytes, so a bug in the CoreML program, the
+layout translation, or `src/ane.m`'s marshalling lands on exactly one side.
+
+**TWO CONSTRAINTS ON ANY FUTURE USE, both measured and both non-obvious.** (1) CoreML picks the
+processor BY SIZE: CPU below roughly 1024x1024x1024, ANE at and above it, so a program built for
+a small shape is silently a CPU program and `sg_ane_on_ane()` exists to catch that. (2) At the
+n=1 decode shape a rank-2 `matmul` is assigned to the **CPU** while the identical arithmetic as a
+1x1 conv over a 4D `(B, C, 1, S)` tensor is assigned to the **ANE**. Activations here are
+therefore CHANNEL-MAJOR and a caller crossing the boundary transposes.
+
+**NOT WIRED IN.** Nothing calls `sg_ane_matmul` from `sg_gpu_forward` or `sg_gpu_prefill`. That
+is the next task: split prefill GEMM between Metal and the ANE at a measured ratio, gate on
+`gen_ids` being unchanged, and measure the end-to-end gain against the 2.005x microbenchmark
+ceiling. The microbenchmark is a GEMM stack, not a transformer layer stack, so the ceiling is an
+upper bound and should be treated as one.
+
+**KNOWN DEPENDENCY, recorded rather than glossed:** `tools/ane_build_model.py` needs
+`coremltools` from a Python venv (the Makefile's `ANE_PY`), which breaks surge's no-third-party rule at
+BUILD time (not at run time). CoreML programs are protobuf and Apple ships no command that
+authors one, unlike `xcrun metal` for the metallib. Emitting the protobuf from C would close it.
+
 
 ## Split-K decode attention (P2.x): COMPLETE AND GATED ON GPU
 

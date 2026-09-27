@@ -184,8 +184,8 @@ bench-splitk: $(BENCH_SPLITK)
 # Slow (one scalar-C 27B CPU forward ~10 min) and needs the 28 GB GGUF plus
 # llama.cpp, so it stays a manual/env-gated target -- `make check` never runs
 # it. Override GGUF=/path or PY=/interp; FREEZE=1 re-freezes the digest.
-GGUF ?= /Users/macmini/models/gguf/Qwen3.6-27B-Q8_0.gguf
-PY   ?= /Users/macmini/models/dsv4-venv/bin/python
+GGUF ?= $(HOME)/models/gguf/Qwen3.6-27B-Q8_0.gguf
+PY   ?= $(HOME)/models/dsv4-venv/bin/python
 .PHONY: gate gate-a gate-b
 gate: surge surge-ref
 	@FREEZE=$(FREEZE) bash tools/gate_q8.sh "$(GGUF)" "$(PY)"
@@ -193,6 +193,60 @@ gate-a: surge surge-ref
 	$(PY) tools/tf_compare_q8.py --gguf "$(GGUF)" $(if $(FREEZE),--freeze,)
 gate-b: surge
 	$(PY) tools/xcheck_llama_q8.py --gguf "$(GGUF)"
+
+# --- ANE (Apple Neural Engine) backend ---------------------------------
+#
+# A SECOND HOST LAYER, PARALLEL TO THE METAL ONE, not a replacement. Measured
+# on this M3 Ultra 2026-08-28: the ANE does ~8.2 TFLOPS fp16 per die over
+# ~126 GB/s against the GPU's ~23.6 TFLOPS and ~573 GB/s, so it is slower on
+# every axis. It earns its place by running CONCURRENTLY at ~0 interference
+# (both dies plus the GPU measured 31.7 TFLOPS against the GPU's own 15.8).
+# So this is an additive prefill path. See src/ane.m's header.
+#
+# src/ane.m is ONE translation unit and stays that way until it passes the
+# ~2000-line guideline, at which point it splits the way src/metal.m did.
+# Unlike METAL_M it is NOT on every link line: a binary that does not use the
+# ANE does not link CoreML.
+ANE_M = src/ane.m
+ANE_M_DEPS = $(ANE_M) surge.h
+ANE_FRAMEWORKS = -framework CoreML -framework Foundation
+
+# The compiled CoreML program is a BUILD ARTIFACT, the ANE analogue of
+# $(METALLIB), and it is generated the same way: a tool turns a description
+# into something the host loads by path. THE ONE HONEST DIFFERENCE, recorded
+# here rather than glossed: `xcrun metal` ships with Xcode, while this
+# generator needs coremltools from a pip venv. CoreML programs are protobuf
+# and Apple ships no command that authors one. Emitting the protobuf directly
+# from C would remove the dependency and is a later task.
+#
+# THE SHAPE IS NOT ARBITRARY. CoreML assigns ops to a processor by size: at
+# 512x512x512 it puts this same conv on the CPU and only at 1024^3 and above
+# on the Neural Engine. The fixture is built at 1024^3 so tests/test_ane.c
+# exercises the ANE rather than silently gating the CPU.
+ANE_PY ?= $(HOME)/models/ane-venv/bin/python
+ANE_FIXTURE ?= tests/fixtures/ane
+ANE_FIXTURE_N ?= 1024
+ANE_FIXTURE_K ?= 1024
+ANE_FIXTURE_M ?= 1024
+.PHONY: ane-fixture
+ane-fixture:
+	$(ANE_PY) tools/ane_build_model.py --n $(ANE_FIXTURE_N) --k $(ANE_FIXTURE_K) \
+	  --m $(ANE_FIXTURE_M) --out-dir $(ANE_FIXTURE)
+
+# tests/test_ane.bin needs CoreML, so it gets its own static pattern rule like
+# METAL_TESTS. Under -DSURGE_NO_ANE (which `debug` sets) it collapses to a bare
+# skip stub, keeping CoreML's XPC services and threads out of the ASan run for
+# the same reason Metal is kept out. It SKIPs and exits 0 with no fixture
+# present, so `make check` is green on a machine that has never run
+# `make ane-fixture`.
+ANE_TESTS = tests/test_ane.bin
+ifeq (,$(findstring SURGE_NO_ANE,$(CFLAGS)))
+$(ANE_TESTS): tests/%.bin: tests/%.c $(LIB_SRC) $(ANE_M_DEPS)
+	$(CC) $(CFLAGS) -o $@ $(ANE_M) $< $(LIB_SRC) $(ANE_FRAMEWORKS) $(LDLIBS)
+else
+$(ANE_TESTS): tests/%.bin: tests/%.c
+	$(CC) $(CFLAGS) -o $@ $<
+endif
 
 # `debug` must DELETE the test binaries first. Without that, a preceding
 # `make check` leaves them newer than the sources, make considers them up to
@@ -204,7 +258,7 @@ gate-b: surge
 debug:
 	@rm -f $(TESTS:.c=.bin)
 	@rm -rf $(TESTS:.c=.bin.dSYM)
-	$(MAKE) CFLAGS="$(CFLAGS) -DSURGE_NO_METAL -fsanitize=address,undefined -fno-omit-frame-pointer -g -O0" check
+	$(MAKE) CFLAGS="$(CFLAGS) -DSURGE_NO_METAL -DSURGE_NO_ANE -fsanitize=address,undefined -fno-omit-frame-pointer -g -O0" check
 	@rm -f $(TESTS:.c=.bin)
 	@rm -rf $(TESTS:.c=.bin.dSYM)
 clean:

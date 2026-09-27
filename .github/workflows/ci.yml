@@ -1,0 +1,18 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  debug:
+    # `make debug` builds and runs every pure-C test under ASan and UBSan with
+    # -DSURGE_NO_METAL, so it needs no GPU and no Metal toolchain. `make check`
+    # (Metal kernels, the surge and surge-bench CLIs, timing-based cases) needs
+    # the real machine and stays a local gate.
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v7
+      - name: make debug
+        run: make debug

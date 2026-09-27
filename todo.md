@@ -22,6 +22,7 @@
       before those steps reach the budget is proof of a fault; at or above it the case
       recalibrates. New case (4a) checks the classifier on injected values, including the
       budget boundary; test_cli_bench is 19 cases.
+- [x] CI added (`.github/workflows/ci.yml`): `make debug` on macos-15. `make check` stays local.
 - Plan: `docs/27092026_m3_m5_tail_merge_plan.md`.
 
 ## Split-K decode attention (P2.x): COMPLETE AND GATED ON GPU

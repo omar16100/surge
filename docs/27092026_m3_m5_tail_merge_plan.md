@@ -33,6 +33,10 @@ and quoted bandwidth and TFLOPS figures from a private repo with no data file he
 5. GitHub description: drop "limiter-aware pacing scheduler", which restates the premise.
 6. From review: a sounder p30 clamp-escalation discriminator in `tests/test_cli_bench.sh`,
    backed by a new additive `decode_step_ms` field in `surge-bench`'s JSON (see Review).
+7. CI: the repo had none. `.github/workflows/ci.yml` runs `make debug` (pure-C tests under
+   ASan and UBSan, `-DSURGE_NO_METAL`) on `macos-15`, which needs no GPU and no Metal
+   toolchain. `make check` stays a local gate: it needs the Metal toolchain, a real GPU,
+   and its timing-based cases are not meaningful on a shared runner.
 
 ## Verification
 

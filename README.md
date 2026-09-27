@@ -76,8 +76,8 @@ is confirmed). No throughput benefit from pacing has been demonstrated
 - `make check`: builds and runs the unit tests plus the Metal and CLI checks.
   Needs Xcode's Metal toolchain; the Metal tests skip when no GPU is available.
 - `make debug`: the pure-C tests under ASan and UBSan, with Metal excluded.
-  This is what CI runs (`.github/workflows/ci.yml`); `make check` needs the
-  real machine and is a local gate.
+  This is what CI runs (`.github/workflows/ci.yml`); `make check` is a local
+  gate, since its full coverage needs the real machine.
 - `make surge`, `make surge-bench`: the decode CLI and the benchmark harness.
 
 Background reading: the write-up the premise came from,

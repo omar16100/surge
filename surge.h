@@ -171,7 +171,7 @@ typedef struct {
  *
  * FOUR THINGS A CALLER MUST NOT ASSUME. Items 1, 2 and 4 were verified by
  * comparing the GGUF against an HF safetensors copy of THE SAME MODEL
- * (/Users/macmini/models/qwen36-27b-8bit, an mlx 8-bit repack of
+ * (~/models/qwen36-27b-8bit, an mlx 8-bit repack of
  * Qwen3.6-27B) tensor by tensor; item 3 against the 2B and the 27B.
  *
  * 1. sg_model.wtype does NOT describe these pointers. It is the embedding
@@ -208,7 +208,7 @@ typedef struct {
  *    mlx's shift list and needs no adjustment from either source.
  *
  *    Evidence, SAME MODEL on both sides (Qwen3.6-27B-Q8_0.gguf against
- *    /Users/macmini/models/qwen36-27b-8bit, an mlx repack of the same
+ *    ~/models/qwen36-27b-8bit, an mlx repack of the same
  *    weights, so its norms are already post-sanitize):
  *
  *      tensor                     |gguf - hf|   |gguf - (hf + 1)|
@@ -1805,7 +1805,7 @@ void sg_decode_pace_reset(sg_decode_pacer *p);
  * the GPU is busy running the 256K comparison loop. Two curve-fit helpers
  * over a per-token cumulative-wall-time series, a leaderboard-row struct,
  * and formatters matching the live doc's table
- * (/Users/macmini/projects/llm-rnd/docs/256k_comparison.md): decode t/s
+ * (llm-rnd/docs/256k_comparison.md): decode t/s
  * is measured by SLOPE (least-squares fit of token index against wall
  * time) as the headline number, with the mlx-lm-style endpoint average
  * also exposed so B6 can cross-check the two against each other.
@@ -1995,7 +1995,7 @@ void sg_bench_finalize_status(sg_bench_row *row);
  *
  * PURE C, no Metal, no GPU, no Foundation -- same safety property as the
  * rest of bench.c. Two pieces: a whole-file reader for prompt files (e.g.
- * /Users/macmini/models/niah_256k_prompt.txt), and the VOID/PASS guard
+ * ~/models/niah_256k_prompt.txt), and the VOID/PASS guard
  * that mirrors bench_niah_mlx.py's prompt_tokens==n_built check -- B5's
  * CLI runs this after tokenizing a prompt file and refuses to emit a
  * non-VOID row unless it passes. Tokenizer/GGUF logic (turning bytes into
@@ -2033,7 +2033,7 @@ void sg_bench_check_ingestion(uint64_t n_ids, uint32_t max_ctx, uint64_t expect_
  *
  * PURE C, no Metal, no GPU, no Foundation -- same safety property as the
  * rest of bench.c. Ground truth in the 256K NIAH prompt
- * (/Users/macmini/models/niah_256k_prompt.txt) is a set of "needle" pairs
+ * (~/models/niah_256k_prompt.txt) is a set of "needle" pairs
  * (city, code) buried in filler text, each written EXACTLY as:
  *
  *     IMPORTANT RECORD: the secret access code for <City> is <DIGITS>.
@@ -2148,7 +2148,7 @@ void sg_bench_score_niah(const char *gen, const sg_bench_needle *needles, uint32
  * actually resident -- confirmed with a standalone 512 MiB mmap+wrap probe
  * (reported size == the wrap length exactly, before touching a single
  * page) and live against the real 2B (SURGE_GATE_MODEL=
- * /Users/macmini/models/qwen35-2b): immediately after sg_gpu_load_model,
+ * ~/models/qwen35-2b): immediately after sg_gpu_load_model,
  * sg_gpu_current_alloc_bytes read 3,768,385,536 bytes (the model's ~3.5 GiB
  * of wrapped bf16 weights) while this function read only 10,683,616 bytes,
  * since almost none of that mmap had been touched yet. The ordering DOES
@@ -2173,5 +2173,67 @@ typedef struct { uint64_t peak; } sg_mem_tracker;
 void sg_mem_tracker_reset(sg_mem_tracker *t);
 void sg_mem_tracker_sample(sg_mem_tracker *t, uint64_t current_alloc, uint64_t phys_footprint);
 uint64_t sg_mem_tracker_peak(const sg_mem_tracker *t);
+
+/* --- ANE (Apple Neural Engine) backend, src/ane.m -------------------------
+ *
+ * A SECOND COMPUTE PATH THAT RUNS ALONGSIDE METAL, NOT INSTEAD OF IT. Measured
+ * on this M3 Ultra 2026-08-28 (tools/ane_gemm_probe.py, tools/ane_envelope.py;
+ * local runs, raw results not committed):
+ * the ANE does ~8.2 TFLOPS fp16 per die over ~126 GB/s, two dies, against the
+ * GPU's ~23.6 TFLOPS and ~573 GB/s. It is slower on every axis. What could make
+ * it worth having is that it may not take those cycles from the GPU: both dies
+ * plus the GPU at a bandwidth-bound shape measured 31.7 TFLOPS against the
+ * GPU's own 15.8, the ANE keeping 0.963x and the GPU 1.002x of solo rate.
+ * PROVISIONAL: that run did not time the GPU and the ANE over a common window
+ * (the GPU loop started before the ANE workers compiled), so the aggregate,
+ * the retention figures and any additive speedup need a synchronized
+ * re-measurement.
+ *
+ * SO THIS IS A PREFILL PATH. Decode at depth is memory-bandwidth-bound and the
+ * ANE has about a quarter of the bandwidth, so decode belongs on the GPU. See
+ * src/ane.m's header for the full measurement table.
+ *
+ * The compiled program is a build artifact from tools/ane_build_model.py, the
+ * ANE analogue of src/kernels.metallib. Nothing here is wired into
+ * sg_gpu_forward or sg_gpu_prefill yet: this is the primitive and its gate.
+ *
+ * ACTIVATION LAYOUT IS CHANNEL-MAJOR (1, K, 1, N): element (c, s) at c*n + s,
+ * fp16. That is not a style choice. At n=1 CoreML assigns a rank-2 matmul to
+ * the CPU and the equivalent 1x1 conv over this 4D layout to the ANE. surge's
+ * own GEMM is token-major, so a caller transposes across this boundary. */
+typedef struct sg_ane sg_ane;
+
+/* Whether CoreML accepts an ANE-targeted configuration at all. This is the
+ * weak check; it cannot tell you a given program will actually be scheduled on
+ * the ANE, because that decision is per-shape. sg_ane_on_ane() is the better
+ * answer: the placement CoreML reported when the program was generated, which
+ * is a build-time record rather than a check on the running machine. */
+int sg_ane_available(void);
+
+/* Opens the directory tools/ane_build_model.py wrote: program.mlmodelc plus
+ * manifest.json. Shape is read back from the model itself, never taken on the
+ * caller's word, so a program built for a different shape fails here instead
+ * of returning silent garbage. */
+sg_err sg_ane_open(const char *dir, sg_ane **out);
+void sg_ane_close(sg_ane *a);
+
+/* out[m][n] = W[m][k] @ in[k][n], fp16, both operands channel-major, W baked
+ * into the program at build time. in holds k*n halves, out holds m*n. */
+sg_err sg_ane_matmul(sg_ane *a, const void *in, void *out);
+
+/* The shape the loaded program was built for. */
+void sg_ane_shape(const sg_ane *a, uint32_t *n, uint32_t *k, uint32_t *m);
+
+/* 1 when CoreML assigned this program to the Neural Engine, 0 when it assigned
+ * it elsewhere (which it does below roughly 1024x1024x1024), -1 when unknown.
+ * -1 IS NOT A YES: an absent manifest or an unreadable field reports unknown,
+ * and a caller must not treat that as confirmation. */
+int sg_ane_on_ane(const sg_ane *a);
+
+/* Wall time of the last sg_ane_matmul, and the count of successful ones.
+ * Diagnostic: the per-dispatch floor is the number that decides whether this
+ * backend can carry fine-grained work, and it cannot be measured from Python. */
+double sg_ane_last_predict_s(const sg_ane *a);
+uint64_t sg_ane_predicts(const sg_ane *a);
 
 #endif

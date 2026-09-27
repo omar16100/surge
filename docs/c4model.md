@@ -137,7 +137,10 @@ optionally Accelerate for the CPU reference path. No third-party libraries.
 - **Built (M0-M2, on main):** gguf/st/tok/model_qwen/ref, Metal decode, CPU-ref forward.
   M1 gate: 100% top-1 vs mlx-lm on Qwen3.5-2B. M2 gate: byte-exact Metal-vs-ref greedy.
   Decode ~76 tok/s on the 2B bf16; measured at 0.57x of mlx-lm (speed is M4's milestone).
-- **In progress (branch `feat/m3-m5`):**
+- **Built (M3 + M5 + bench harness + decode work, on main):** developed on `feat/m3-m5`,
+  merged by PR #1 (2026-08-20) and its post-merge tail (tasks R2, R3, R4, the P2.3 claim
+  corrections and two `tests/test_cli_bench.sh` hardening commits) by the 2026-09-27 tail PR,
+  with a merge commit so later branches keep ancestry. Per-task record:
   - M3 (Q8_0 weights end-to-end): DONE. M3.1 `k_matvec_q8`; M3.2+M3.3 (merged: the
     decode encoder selects the matvec kernel from the weight dtype via
     `matmul_kernel_for`, and `sg_gpu_load_model` wraps Q8_0 tensors no-copy and dequantizes

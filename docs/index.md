@@ -1,8 +1,8 @@
 # surge documentation index
 
 Read this first. surge is a from-scratch C11 + Metal LLM inference engine for the Mac
-Studio M3 Ultra (github.com/omar16100/surge, MIT). All doc paths are under
-`/Users/macmini/projects/surge/`.
+Studio M3 Ultra (github.com/omar16100/surge, MIT). All doc paths are relative to the
+repo root.
 
 ## Conventions
 
@@ -26,10 +26,11 @@ Studio M3 Ultra (github.com/omar16100/surge, MIT). All doc paths are under
 | Decode Optimization Summary: P2.3 to P4.0 | Reference (dated summary) | `docs/18082026_decode_optimization_summary.md` | End-to-end story of the decode work: what was built and its measured effect per task, the three measurements that changed decisions (the split policy is a CAP not a rescaling, the occupancy guard is a threadgroup count not a seq threshold, and online softmax needed the V-phase fix to be viable), why correctness is trusted (mutation-proved positive controls, and byte-identity claimed only where it applies), and what is still open including that PREFILL is now the gap at 32x behind llama.cpp. |
 | Decode pacing + clamp detection | Gate (dated) | `docs/18082026_decode_pacing.md` | Task P3.0: `src/sched.c`, the decode analogue of B8's prefill duty cycle, plus a clamp detector. Why it exists (P2.9 measured 38.47 / 25.40 / 16.71 tok/s across three IDENTICAL decode arms, then 39.72 / 41.16 / 34.66 on the same three after 150 s of idle), the exact clamp signal (per-step time against the median of the run's first 8 steps, 1.5x, 3 consecutive to latch, 3 to clear) with its false-positive rate measured by replaying real per-token series offline, the blind spot it cannot see (a run already slow at its first token, which is the motivating case) and the two things that cover it, why a confirmed clamp drives NO rest schedule by default, and the five gates. Off by default; throughput effect not measured. |
 | M5.7 long-context gate | Gate (dated) | `docs/11082026_m57_longctx_gate.md` | How to run the M5.7 gate that closes M5 (`tools/prefill_longctx_gate.sh`, env-gated on `SURGE_GATE_MODEL`): (A) prefill+decode == serial+decode at 8192/16384/32768 (0 token-id mismatches), (B) 262144 ingest (262112 prefill + 32 decode) reaches used==262144 with non-degenerate output, (C) CLI `--max-ctx` cap rejection. |
+| Tail merge + README honesty | Plan (dated) | `docs/27092026_m3_m5_tail_merge_plan.md` | 2026-09-27: merges the 13 commits main lacked (the 11 `feat/m3-m5` gained after PR #1: R2, R3, R4, the P2.3 claim corrections; plus two `test_cli_bench.sh` hardening commits) with a merge commit, scrubs personal paths from `todo.md`, and rewrites the README to match `docs/c4model.md`: experimental not production, M0-M3 + M5 status, the 338 MHz limiter premise shown as retracted, the unbuilt fanpro hook and prompt-lookup speculation marked as such, and the private-repo bandwidth/TFLOPS figures removed. |
 
 ## Related (not in docs/)
 
 - `todo.md` (repo root): running status log per task.
-- The 256K comparison surge is being built to join lives in the llm-rnd project:
-  `/Users/macmini/projects/llm-rnd/docs/256k_comparison.md` and `leaderboard.md`.
+- The 256K comparison surge is being built to join lives in the llm-rnd project (not
+  published): `docs/256k_comparison.md` and `leaderboard.md` there.
 - Benchmark logs: `~/bench_logs/`.

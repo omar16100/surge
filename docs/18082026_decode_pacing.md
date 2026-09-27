@@ -29,9 +29,13 @@ Two separable things, both in one pure-C file with no Metal, no Foundation and n
 2. **A clamp detector**, which needs no configuration, never sleeps on its own, and reports on
    every run whether that run's decode number is trustworthy.
 
-`src/metal.m` is not touched. B8's rest had to live there because the loop it paces is inside
-`sg_gpu_prefill`; there is no decode loop inside `metal.m` at all (`sg_gpu_forward` is one
-step), so the pacer is a caller-owned value fed at the per-token boundary in `src/cli_bench.c`.
+The Metal host layer is not touched. B8's rest had to live there because the loop it paces is
+inside `sg_gpu_prefill` (`src/metal_prefill.m` since task R2, `src/metal.m` before it); there
+is no decode loop inside the Metal host layer at all (`sg_gpu_forward` is one step), so the
+pacer is a caller-owned value fed at the per-token boundary in `src/cli_bench.c`. (Anchor
+qualified in R2 fix round 1, 2026-08-20, to match what `src/sched.c:10` already says; the
+sentence originally named `src/metal.m` alone, which stopped being the whole story when R2
+moved `sg_gpu_prefill` out.)
 
 Deliberately NOT built, per the task brief: no fan-daemon hook of any kind. surge is a public
 engine and driving a machine's cooling is not its business.

@@ -393,7 +393,7 @@ void sg_ref_attn_combine(const float *m, const float *s, const float *acc,
  * qh[0 .. head_dim) is ever read here, so a q_stride > head_dim gate half
  * (Task P1) is never touched. dacc[head_dim] is caller-owned double scratch,
  * overwritten on every call (not read beforehand). */
-/* Overflow-checked size_t multiply/add, mirroring src/metal.m's mul_ck/
+/* Overflow-checked size_t multiply/add, mirroring src/metal_internal.h's mul_ck/
  * add_ck (same problem, different translation unit and a different integer
  * domain: metal.m guards GPU buffer byte counts in uint64_t, this guards a
  * host malloc() size in size_t, the type malloc actually takes). A wrapped

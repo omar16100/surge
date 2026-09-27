@@ -99,9 +99,18 @@ using namespace metal;
  * wide, but it IS bounded.
  *
  * THE MEASUREMENT WAS TAKEN (P2.3a, `make bench-splitk`): the fastest n_splits
- * was exactly seq / SG_TG at every seq and both real shapes tested, i.e. the
- * TOP of that band, giving each split exactly SG_TG keys. So the decode path
- * uses n_splits = clamp(seq / SG_TG, 4, 1024).
+ * was seq / SG_TG in seven of the eight (seq, shape) cells swept, i.e. the TOP
+ * of that band, giving each split exactly SG_TG keys. So the decode path uses
+ * n_splits = clamp(seq / SG_TG, 4, 1024).
+ *
+ * THE EIGHTH CELL DISAGREES and the disagreement is reproduced: on the 27B
+ * decode shape at seq 8192, n_splits 16 beats the closed form's 32 by about
+ * 5 percent (P2.3's re-sweep 5.226x vs 4.965x; the P2.3 review's independent
+ * one 5.447x vs 5.180x). The policy still ships the closed form on purpose: it
+ * is the band's top rather than a fitted constant, the curve is shallow near
+ * the optimum, and one outlier at one shape and depth does not earn a special
+ * case. Read the closed form as a good default, not as a proven optimum at
+ * every cell. metal.m's splitk_n_splits carries the full argument.
  *
  * WIRED INTO THE DECODE PATH (P2.3). enc_attn's fp16 branch dispatches this
  * pair through metal.m's enc_attn_splitk once seq reaches SG_TG * 4 == 1024,
@@ -125,9 +134,10 @@ static inline float attn_combine_weight(float mi, float M) {
 }
 
 /* One threadgroup per (query head, split), a 2D grid dispatched as
- * (x = split, y = head); metal.m's SG_K_HEADS2D class is what carries those
+ * (x = split, y = head); the host's SG_K_HEADS2D class is what carries those
  * two group dimensions, since SG_K_ATTN's single *groups count cannot (see
- * gpu_grid there, and the SG_K_TILES2D precedent it follows).
+ * sg_gpu_grid in metal_validate.m, and the SG_K_TILES2D precedent it follows;
+ * both SG_K_ kinds are declared in metal_internal.h since task R3).
  *
  * Buffers: q f32 [n_heads, q_stride]; kc, vc f16 [seq, n_kv_heads, head_dim]
  * (the sg_kv layout); m, s f32 [n_heads, n_splits]; acc f32
@@ -626,14 +636,14 @@ kernel void k_attn_decode_splitk_partial_gqa(device const float *q [[buffer(0)]]
 
     uint repeat = n_heads / n_kv;
     /* UNREACHABLE through metal.m's entry points, which reject n_kv_heads == 0
-     * and n_heads % n_kv_heads != 0 before encoding anything (check_params).
+     * and n_heads % n_kv_heads != 0 before encoding anything (sg_check_params).
      * Guarded anyway, and as a no-op rather than a best effort: with a group
      * size that does not tile n_heads exactly, the group starting at hk*repeat
      * would run off the end of the m/s/acc buffers, and a wild write is far
      * worse than an unwritten one. NOTE WHAT "UNWRITTEN" MEANS, though: the
      * m/s/acc buffers keep whatever they held, and the combine consumes those
      * stale bytes without complaint. This is a last resort against memory
-     * corruption, NOT a diagnostic; check_params is where a bad shape is
+     * corruption, NOT a diagnostic; sg_check_params is where a bad shape is
      * supposed to be caught, and it is. */
     if (repeat == 0u || n_kv * repeat != n_heads) return;
 
@@ -1225,7 +1235,8 @@ kernel void k_attn_decode_splitk_partial_gqa_online(device const float *q [[buff
     if (n_kv == 0u || hd == 0u || hk >= n_kv || part >= n_splits) return;
 
     uint repeat = n_heads / n_kv;
-    /* UNREACHABLE through metal.m's entry points (check_params rejects
+    /* UNREACHABLE through metal.m's entry points (sg_check_params, in
+     * metal_validate.m since task R3, rejects
      * n_kv_heads == 0 and n_heads % n_kv_heads != 0 first). Guarded as a no-op
      * for the reason the four-pass kernel states: with a group size that does
      * not tile n_heads, the group at hk*repeat would run off the end of the

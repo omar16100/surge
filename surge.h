@@ -831,7 +831,7 @@ sg_err sg_gpu_run_attn_prefill(sg_gpu *g, void *q, void *k, void *v, void *out,
  * two agree; on the shapes only the oracle accepts, there is nothing to compare
  * because the dispatch is refused up front, not silently computed differently.
  * k_attn_decode_splitk_partial does carry the same `repeat == 0` fallback the
- * oracle has, so the kernel would compute the oracle's answer, but check_params
+ * oracle has, so the kernel would compute the oracle's answer, but sg_check_params
  * makes that branch unreachable through these entry points and it must not be
  * read as a promise that the shape is supported.
  *
@@ -846,10 +846,26 @@ sg_err sg_gpu_run_attn_prefill(sg_gpu *g, void *q, void *k, void *v, void *out,
  * decode path uses: n_splits = clamp(seq / SG_TG, 4, 1024). Sweeping n_splits
  * over {1..1024} at seq 8192 / 32768 / 131072 / 262144, on both the real 27B
  * decode shape (24 heads, 4 kv, head_dim 256) and the real 4B dense shape (32
- * heads, 8 kv, head_dim 128), the fastest value was EXACTLY seq / SG_TG in all
- * eight cells (32, 128, 512, 1024 respectively), i.e. the top of this band:
- * give every split exactly SG_TG keys so no lane idles. At 262144 the pair beat
- * k_attn_decode_f16 by 15.9x on the 27B shape and 21.9x on the 4B shape. Below
+ * heads, 8 kv, head_dim 128), the fastest value was seq / SG_TG in SEVEN of
+ * those eight cells (32, 128, 512, 1024 respectively), i.e. the top of this
+ * band: give every split exactly SG_TG keys so no lane idles. At 262144 the
+ * pair beat k_attn_decode_f16 by 15.9x on the 27B shape and 21.9x on the 4B
+ * shape.
+ *
+ * THE EIGHTH CELL IS A REPRODUCED COUNTEREXAMPLE, not noise: the 27B shape at
+ * seq 8192 is fastest at n_splits 16, not the closed form's 32. Task P2.3's
+ * re-sweep read 16 -> 5.226x against 32 -> 4.965x and the P2.3 review's
+ * independent one (--reps 20) read 16 -> 5.447x against 32 -> 5.180x, so the
+ * roughly 5 percent gap is real. The same review saw the 27B curve go
+ * non-monotonic at 32768 as well (16 -> 9.699x above 32 -> 9.129x, before
+ * 128 -> 10.783x won the cell). The 4B shape at 8192 does peak at the closed
+ * form. The closed form is KEPT as the default anyway, deliberately: it is the
+ * top of the occupancy band above rather than a fitted constant, the curve is
+ * shallow near the optimum, and a single 5 percent outlier at one shape and one
+ * depth (where attention is not the decode bottleneck) does not pay for a
+ * shape-specific special case that would then need its own sweep and its own
+ * gate. Do not read the closed form as a proven optimum everywhere: re-measure
+ * before extending the policy. Below
  * seq 1024 the floor of that clamp is what binds instead of seq / SG_TG, so the
  * splits fall under SG_TG keys and the closed form stops being the measured
  * optimum; the decode path keeps the incumbent kernel there rather than
@@ -1867,10 +1883,13 @@ typedef struct {
      * discipline, same reason: with pacing armed, decode_tps_slope and
      * decode_tps_avg are wall-clock and so FALL, and these are what let a
      * reader separate compute from idle. */
-    double decode_rest_s;      /* total time the decode duty cycle slept,
-                                * seconds, a SUBSET of decode_wall_s (not
-                                * additional). 0 when pacing is disabled,
-                                * which is the default. */
+    double decode_rest_s;      /* total CONFIGURED rest the decode duty cycle
+                                * requested (rests x rest_ms), seconds, a
+                                * SUBSET of decode_wall_s (not additional).
+                                * A real sleep can run longer than it asked
+                                * for, so this is a floor on the time slept,
+                                * not a measurement of it. 0 when pacing is
+                                * disabled, which is the default. */
     double decode_compute_tps; /* n_gen / (decode_wall_s - decode_rest_s),
                                 * the fair full-clock decode rate with the
                                 * pacing idle excluded. < 0 if the
@@ -1884,6 +1903,21 @@ typedef struct {
                                 * number of per-token pacing points, which
                                 * catches a rest emitted from the wrong place
                                 * in the loop. */
+    double decode_step_ms;     /* sum of the valid (finite, positive) per-step
+                                * times fed to the decode pacer, ms, i.e. the
+                                * figure its work budget accumulates. Written
+                                * at full precision (%.17g) because a test
+                                * compares it with an integer ms budget.
+                                * Neither decode_wall_s nor decode_wall_s -
+                                * decode_rest_s is that figure: the wall also
+                                * covers the argmax and the progress print,
+                                * and a real sleep can overrun its configured
+                                * rest_ms. With clamp_div 1, a rest while this
+                                * is below the budget cannot have been earned
+                                * (tests/test_cli_bench.sh p30); at or above
+                                * the budget it is inconclusive, since the
+                                * total says nothing about how many rests the
+                                * budget allowed. */
     /* Detector output. These are populated on EVERY run, paced or not,
      * because they cost no wall time and their job is to tell a reader
      * whether the decode number next to them is trustworthy. */
@@ -1925,7 +1959,8 @@ void sg_bench_format_md_row(const sg_bench_row *row, char *buf, size_t cap);
 
 /* A flat JSON object of every field, key names matching the struct field
  * names verbatim. Numbers at "%.6g" (round-trips a double to display
- * precision, not bit-exact); ingestion_ok as a JSON bool; string fields
+ * precision, not bit-exact), except decode_step_ms at "%.17g" because a test
+ * compares it with an integer ms budget; ingestion_ok as a JSON bool; string fields
  * (model, engine, status, log_id) are JSON-escaped (quote, backslash, and
  * control bytes as \u00XX) so the output stays valid JSON even if one of
  * them ever contains a quote. snprintf-truncates into cap like the md

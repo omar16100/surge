@@ -31,18 +31,40 @@ and quoted bandwidth and TFLOPS figures from a private repo with no data file he
 4. `docs/c4model.md`: the M3/M5 status block said "In progress (branch `feat/m3-m5`)";
    it now says built and merged.
 5. GitHub description: drop "limiter-aware pacing scheduler", which restates the premise.
+6. One test fix from review: the p30 clamp-escalation discriminator in
+   `tests/test_cli_bench.sh` (see Review below).
 
 ## Verification
 
-- `make check` on a clean worktree at `1173c82` (the code under merge; this PR adds only
-  docs on top): exit 0, 19 test binaries, 87604 checks, 0 failures, matching the count
+- `make check` on a clean worktree at `1173c82` (the tail as it arrived, before this PR's
+  own commits): exit 0, 19 test binaries, 87604 checks, 0 failures, matching the count
   `docs/c4model.md` records for R2 and R3. `tools/check_metal_globals.sh` passed,
   `tests/test_cli_prefill.sh` 11 cases, `tests/test_cli_bench.sh` 18 cases. Skipped: the
   env-gated real-model gates (`SURGE_GGUF`, `SURGE_GGUF_QWEN3`, `SURGE_ST`,
   `SURGE_GGUF_TWIN`, `SURGE_BENCH_TOK_MODEL`, `SURGE_PACE_MODEL`), which need model files.
+- After the review fix below: `make check` exit 0, 87604 checks, 0 failures,
+  `tests/test_cli_bench.sh` 19 cases (one new), plus three standalone reruns of that
+  script, all 19/19. One earlier full run hit the known B6 `check2` timing flake (3 percent
+  bar) while another job held the CPU at load average 39; it passed on every rerun once
+  the load dropped. The flake is pre-existing and recorded in
+  `docs/18082026_decode_optimization_summary.md`.
 - Personal-data scan over `git log -p origin/main..HEAD`, plus gitleaks over the range and
   the tree.
 - After merge: `git fetch` and confirm origin/main contains `1173c82`.
+
+## Review (codex, 2026-09-27)
+
+- MAJOR, fixed: the p30 clamp-escalation case compared the div-1 arm's decode WALL with
+  the budget, and the wall includes the very rests under test. On a fast machine two
+  erroneous 20 ms rests pushed a 35 ms phase past a 52 ms budget, so a detector bug was
+  retried as a stale calibration and ended as a SKIP. The discriminator now subtracts the
+  arm's own `decode_rest_s`, lives in one function (`p30_esc_classify`), and a new
+  injected-value case (4a) pins it: the old rule misclassifies three of its five inputs.
+  The narrower window the previous commit documented (step time is about 0.85x the
+  non-rest wall) remains, and closing it needs the bench to emit accumulated step time.
+- Minor, fixed: README no longer states a date range for the blog's runs (no committed
+  source), says the compositor mitigation reduces risk rather than prevents it, and
+  notes the opt-in `--decode-clamp-div` escalation.
 
 ## Decisions and deviations
 

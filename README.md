@@ -63,10 +63,13 @@ prefill duty cycle was built on it. On 2026-08-15, telemetry from surge's own
 
 This does not prove that no limiter exists; the discriminating experiment has not
 been run. The prefill duty cycle was kept, off by default, and repurposed: it
-yields the GPU so the macOS compositor is not killed by its watchdog during long
-prefills. `src/sched.c` (task P3.0) adds a decode duty cycle, also off by
-default, and a clamp detector that only reports; no throughput benefit from
-pacing has been demonstrated (`docs/18082026_decode_pacing.md`).
+periodically yields the GPU to reduce the risk of the macOS compositor being
+killed by its watchdog during long prefills, as happened on 2026-08-14 (the
+mitigation is not proven sufficient). `src/sched.c` (task P3.0) adds a decode
+duty cycle, also off by default, and a clamp detector that by default only
+reports (the opt-in `--decode-clamp-div` shortens the work budget while a clamp
+is confirmed). No throughput benefit from pacing has been demonstrated
+(`docs/18082026_decode_pacing.md`).
 
 ## Build and test
 
@@ -75,8 +78,7 @@ pacing has been demonstrated (`docs/18082026_decode_pacing.md`).
 - `make debug`: the pure-C tests under ASan and UBSan, with Metal excluded.
 - `make surge`, `make surge-bench`: the decode CLI and the benchmark harness.
 
-Background reading: the write-up the premise came from, based on runs from 4 to
-6 August 2026, before the telemetry above:
+Background reading: the write-up the premise came from,
 [macOS clamps my M3 Ultra's GPU to 338 MHz before the fans even try](https://omarshabab.com/mac-studio-firmware-gpu-limiter/),
 and the benchmark harness at
 [llm-benchmark](https://github.com/omar16100/llm-benchmark).

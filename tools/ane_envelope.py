@@ -25,10 +25,12 @@ WHAT THIS HARNESS ANSWERS, and why each one decides something:
   Q3 DOES INT8 BUY THE ADVERTISED ~1.9x? The ANE's int8 path is its fastest. LLM weights are
      already quantized, so if int8 doubles the ANE's rate the additive gain roughly doubles too.
 
-  Q4 DOES IT CLAMP UNDER SUSTAINED LOAD? This machine's GPU is clamped by firmware to 338 MHz
-     after ~4.5 minutes at high power (llm-rnd Finding 67 and the M3 Ultra pitfalls note). A
-     burst measurement that ignores this would overstate every number above. If the ANE holds
-     its rate for ten minutes it is a fundamentally more dependable processor here than the GPU.
+  Q4 DOES IT CLAMP UNDER SUSTAINED LOAD? This harness was written against the premise that
+     this machine's GPU is clamped by firmware to 338 MHz after ~4.5 minutes at high power
+     (llm-rnd Finding 67). surge's own 256K telemetry did not support that premise on
+     2026-08-15 (docs/15082026_prefill_duty_cycle_plan.md), so treat it as unverified. A burst
+     measurement is still worth checking against a sustained one, and if the ANE holds its rate
+     for ten minutes that is useful to know either way.
 
 DESIGN NOTE, THE ONE THAT MAKES THE NUMBERS MEAN ANYTHING. A single CoreML predict carries
 13 to 15 ms of round-trip overhead from Python, which at these shapes swamps the op. So the
@@ -279,6 +281,12 @@ def full_machine(n, k, layers, reps, warmup, ane_instances, python_bin, gpu_seco
 
     Retention is reported per processor against its own solo rate, so starvation of one by the
     other is visible rather than hidden inside an aggregate.
+
+    KNOWN FLAW (review, 2026-09-27): the GPU loop starts before the ANE workers compile their
+    models, runs for a fixed 45 s, and its median is summed with independently timed ANE rates.
+    Nothing guarantees the two timed intervals overlap, so a GPU median taken mostly while the
+    ANE was idle would still read as ~1.0x retention. Results from this arm are provisional
+    until both sides are timed over one synchronized window after compilation.
     """
     import subprocess
     log(f"full machine: {ane_instances} ANE instances + GPU, n={n}")
@@ -310,11 +318,13 @@ def full_machine(n, k, layers, reps, warmup, ane_instances, python_bin, gpu_seco
 
 
 def sustained(n, k, layers, minutes, python_bin=None):
-    """Q4: does the ANE hold its rate, or clamp like this machine's GPU does?
+    """Q4: does the ANE hold its rate under sustained load?
 
     Reports the rate in successive one-minute windows. A flat series means the ANE is not
-    subject to the firmware limiter that clamps this GPU to 338 MHz after ~4.5 minutes, which
-    would make it the more dependable of the two processors here despite being the slower one.
+    subject to the firmware GPU limiter this harness was written against (a clamp to 338 MHz
+    after ~4.5 minutes; surge's own 256K telemetry did not support that premise, see
+    docs/15082026_prefill_duty_cycle_plan.md), which would make it the more dependable of the
+    two processors here despite being the slower one.
     """
     prog = build_stack(n, k, layers)
     model = convert(prog)

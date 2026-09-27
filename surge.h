@@ -2180,10 +2180,14 @@ uint64_t sg_mem_tracker_peak(const sg_mem_tracker *t);
  * on this M3 Ultra 2026-08-28 (tools/ane_gemm_probe.py, tools/ane_envelope.py;
  * local runs, raw results not committed):
  * the ANE does ~8.2 TFLOPS fp16 per die over ~126 GB/s, two dies, against the
- * GPU's ~23.6 TFLOPS and ~573 GB/s. It is slower on every axis. What makes it
- * worth having is that it does not take those cycles from the GPU: both dies
+ * GPU's ~23.6 TFLOPS and ~573 GB/s. It is slower on every axis. What could make
+ * it worth having is that it may not take those cycles from the GPU: both dies
  * plus the GPU at a bandwidth-bound shape measured 31.7 TFLOPS against the
  * GPU's own 15.8, the ANE keeping 0.963x and the GPU 1.002x of solo rate.
+ * PROVISIONAL: that run did not time the GPU and the ANE over a common window
+ * (the GPU loop started before the ANE workers compiled), so the aggregate,
+ * the retention figures and any additive speedup need a synchronized
+ * re-measurement.
  *
  * SO THIS IS A PREFILL PATH. Decode at depth is memory-bandwidth-bound and the
  * ANE has about a quarter of the bandwidth, so decode belongs on the GPU. See
@@ -2201,8 +2205,9 @@ typedef struct sg_ane sg_ane;
 
 /* Whether CoreML accepts an ANE-targeted configuration at all. This is the
  * weak check; it cannot tell you a given program will actually be scheduled on
- * the ANE, because that decision is per-shape. sg_ane_on_ane() is the real
- * answer and a caller that cares about where its work runs must use it. */
+ * the ANE, because that decision is per-shape. sg_ane_on_ane() is the better
+ * answer: the placement CoreML reported when the program was generated, which
+ * is a build-time record rather than a check on the running machine. */
 int sg_ane_available(void);
 
 /* Opens the directory tools/ane_build_model.py wrote: program.mlmodelc plus

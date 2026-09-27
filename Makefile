@@ -199,9 +199,10 @@ gate-b: surge
 # A SECOND HOST LAYER, PARALLEL TO THE METAL ONE, not a replacement. Measured
 # on this M3 Ultra 2026-08-28: the ANE does ~8.2 TFLOPS fp16 per die over
 # ~126 GB/s against the GPU's ~23.6 TFLOPS and ~573 GB/s, so it is slower on
-# every axis. It earns its place by running CONCURRENTLY at ~0 interference
-# (both dies plus the GPU measured 31.7 TFLOPS against the GPU's own 15.8).
-# So this is an additive prefill path. See src/ane.m's header.
+# every axis. Its case rests on running CONCURRENTLY with little interference
+# (both dies plus the GPU measured 31.7 TFLOPS against the GPU's own 15.8;
+# provisional, since that run did not time both over a common window). So
+# this is intended as an additive prefill path. See src/ane.m's header.
 #
 # src/ane.m is ONE translation unit and stays that way until it passes the
 # ~2000-line guideline, at which point it splits the way src/metal.m did.

@@ -59,6 +59,7 @@ int main(void) {
 
 #else
 
+#include <errno.h>
 #include <math.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -116,6 +117,10 @@ int main(void) {
         return 1;
     }
     if (access(prog, F_OK) != 0) {
+        if (errno != ENOENT) {
+            fprintf(stderr, "FAIL test_ane: cannot check %s: %s\n", prog, strerror(errno));
+            return 1;
+        }
         fprintf(stderr, "SKIP test_ane: no fixture at %s.\n"
                         "  Build one with: make ane-fixture\n", dir);
         return 0;

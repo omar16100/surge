@@ -72,8 +72,12 @@ optionally Accelerate for the CPU reference path. No third-party libraries.
   ~23.6 TFLOPS and ~573 GB/s: SLOWER ON EVERY AXIS. What earns it a place is that it does not
   take those cycles from the GPU. Both ANE dies plus the GPU, run together at a bandwidth-bound
   shape, measured 31.7 TFLOPS aggregate against the GPU's own 15.8, with the ANE keeping 0.963x
-  and the GPU 1.002x of their solo rates. So the ANE is an ADDITIVE PREFILL path worth up to
-  ~2x on compute-bound GEMM, and is NEVER a decode path: decode at depth is
+  and the GPU 1.002x of their solo rates. PROVISIONAL: in that run `tools/ane_envelope.py`'s
+  `full_machine` started the GPU's 45 s loop before the ANE workers compiled and summed
+  independently timed rates, so the overlap window was not controlled; re-measure over a
+  common window before relying on the aggregate, the retention figures or the speedup
+  built on them. So the ANE is intended as an ADDITIVE PREFILL path, worth up to ~2x on
+  compute-bound GEMM IF those figures hold, and is NEVER a decode path: decode at depth is
   memory-bandwidth-bound and the ANE has about a quarter of the bandwidth, so moving decode
   there would be roughly four times slower. Nothing in this layer is wired into
   `sg_gpu_forward` or `sg_gpu_prefill` yet; `sg_ane_matmul` is the primitive plus its gate.

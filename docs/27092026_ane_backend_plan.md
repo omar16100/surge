@@ -55,12 +55,21 @@ Applied:
   sum; an fp16 tree reduction is not ruled out); the `src/ane.m` row no longer claims no
   per-dispatch allocation (the feature provider is allocated per call).
 - `ane-fixture` recipe quotes `ANE_PY` and `ANE_FIXTURE`.
+- Round 2: `test_ane` SKIPs only when the fixture is absent (`ENOENT`); any other `access`
+  failure is a FAIL with its reason. `surge.h` no longer calls `sg_ane_on_ane()` "the real
+  answer". The concurrency figures are marked provisional everywhere they appear (below).
+  `ane_envelope.py`'s limiter docstring now points at the 2026-08-15 retraction.
 
 Left open, recorded here:
 - `sg_ane_on_ane()` reports the placement the generator saw, from its manifest. It is a
-  build-time record, not a check on the running machine, so a fixture must be built on
-  the machine that runs it (a copied fixture on a machine without an ANE would fail the
-  test's placement assertion).
+  build-time record, not a check on the running machine, and the test's placement
+  assertion checks that record: a fixture copied from another machine reports that
+  machine's placement. Build the fixture on the machine that runs the test.
+- The concurrency figures (31.7 TFLOPS aggregate, 0.963x and 1.002x retention) are
+  PROVISIONAL. `tools/ane_envelope.py`'s `full_machine` starts the GPU's 45 s loop before
+  the ANE workers compile and sums independently timed rates, so the overlap window was not
+  controlled. The docs now say so; the harness needs one synchronized window after
+  compilation and a re-run, which pins the GPU and the ANE and was not done in this sweep.
 - `machine_census.py` output can carry local paths and simulator UUIDs (above).
 
 ## Verification
@@ -71,7 +80,8 @@ Left open, recorded here:
   relative error 1.101e-2 (bar 2e-2), 8 reruns byte-identical. `test_cli_prefill` 11
   cases, `test_cli_bench` 19 cases.
 - `test_ane` against a missing fixture: SKIP, exit 0. Against an empty
-  `program.mlmodelc`: FAIL with the loader's message, exit 1.
+  `program.mlmodelc`: FAIL with the loader's message, exit 1. Against an unreadable
+  directory: FAIL "Permission denied", exit 1.
 - `make debug`: exit 0, 83615 checks, 0 failures, no sanitizer diagnostics; `test_ane` is the
   `-DSURGE_NO_ANE` stub there.
 - The Python tools were byte-compiled only; the measurement harnesses were not rerun (they

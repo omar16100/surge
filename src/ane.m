@@ -9,10 +9,14 @@
  *   GPU fp16 GEMM        ~23.6 TFLOPS, ~573 GB/s at the n=1 shape
  *
  * So the ANE is the SLOWER processor on every axis and can never replace the
- * Metal path. The one thing it does that matters: it runs CONCURRENTLY with
- * the GPU at close to zero interference. Both dies plus the GPU at a
+ * Metal path. The one thing that could matter: it may run CONCURRENTLY with
+ * the GPU at little interference. Both dies plus the GPU at a
  * bandwidth-bound shape measured 31.7 TFLOPS against the GPU's own 15.8,
  * with the ANE keeping 0.963x and the GPU 1.002x of their solo rates.
+ * PROVISIONAL: that run did not time the two over a common window (the GPU
+ * loop started before the ANE workers compiled), so the aggregate, the
+ * retention figures and any speedup derived from them (the "additive" case
+ * below) need a synchronized re-measurement.
  *
  * THIS BACKEND IS THEREFORE AN ADDITIVE PREFILL PATH, NOT A DECODE PATH.
  * Decode at long context is memory-bandwidth-bound (llm-rnd Findings 16, 22,

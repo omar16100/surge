@@ -50,12 +50,14 @@ A SECOND COMPUTE PATH, ADDITIVE TO METAL, NOT A REPLACEMENT. New files: `src/ane
 the Makefile gains `ANE_M`, `ane-fixture` and an `ANE_TESTS` rule, and `make debug` now also
 defines `-DSURGE_NO_ANE` so CoreML stays out of the ASan run the way Metal does.
 
-**WHY, MEASURED BEFORE ANY CODE WAS WRITTEN.** The ANE is the slower processor on every axis:
+**WHY, MEASURED BEFORE ANY CODE WAS WRITTEN** (local harness runs; raw results not committed).
+The ANE is the slower processor on every axis:
 ~8.2 TFLOPS fp16 per die over ~126 GB/s of weight bandwidth, two dies, against the GPU's
 ~23.6 TFLOPS and ~573 GB/s. It earns its place because it does NOT take those cycles from the
 GPU. Both dies plus the GPU at a bandwidth-bound shape measured **31.71 TFLOPS / 495.5 GB/s
 against the GPU's own 15.81, a 2.005x aggregate**, with the ANE retaining 0.963x and the GPU
-1.002x of solo rate. So this is a PREFILL path. Decode at depth is memory-bandwidth-bound and
+1.002x of solo rate (PROVISIONAL: `full_machine` did not time the GPU and the ANE over a common
+window, so the retention figures need a synchronized re-measurement). So this is a PREFILL path. Decode at depth is memory-bandwidth-bound and
 the ANE has 0.22x of the bandwidth, so decode stays on Metal, permanently.
 
 **GATE (`./tests/test_ane.bin`, 14 checks, 0 failures, `on_ane=1` confirmed by `MLComputePlan`):**
@@ -80,7 +82,8 @@ therefore CHANNEL-MAJOR and a caller crossing the boundary transposes.
 **NOT WIRED IN.** Nothing calls `sg_ane_matmul` from `sg_gpu_forward` or `sg_gpu_prefill`. That
 is the next task: split prefill GEMM between Metal and the ANE at a measured ratio, gate on
 `gen_ids` being unchanged, and measure the end-to-end gain against the 2.005x microbenchmark
-ceiling. The microbenchmark is a GEMM stack, not a transformer layer stack, so the ceiling is an
+figure. That figure is PROVISIONAL (unsynchronized timing windows, above), and the
+microbenchmark is a GEMM stack, not a transformer layer stack, so even once re-measured it is an
 upper bound and should be treated as one.
 
 **KNOWN DEPENDENCY, recorded rather than glossed:** `tools/ane_build_model.py` needs

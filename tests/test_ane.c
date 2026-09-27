@@ -14,8 +14,9 @@
  * tools/ane_accum_probe.py tested that on this machine and it is FALSE: swept
  * over k, relative error FALLS rather than rises (7.57e-4 at k=4096 to 5.41e-4
  * at k=16384, fitted exponent -0.24, where a sequential fp16 running sum
- * requires +0.5). The accumulator is wide, matching Bryngelson arXiv:2606.22283
- * which measured the same on M1 and M5.
+ * requires +0.5). So the reduction is not a sequential fp16 running sum,
+ * consistent with Bryngelson arXiv:2606.22283 on M1 and M5 (the probe cannot
+ * rule out an fp16 TREE reduction; see its header).
  *
  * WHAT ACTUALLY COSTS THE ACCURACY IS CANCELLATION over fp16-rounded operands.
  * The same probe measures 2.00e-3 with random-sign inputs against 7.57e-4 with
@@ -40,7 +41,10 @@
  * enough to expect it.
  *
  * Portability: with no fixture directory this prints a skip and exits 0, so
- * `make check` stays green on a machine that has not built one. It is also
+ * `make check` stays green on a machine that has not built one. A fixture that
+ * EXISTS but does not open is a failure, not a skip. A fixture built for the
+ * ANE also asserts sg_ane_on_ane() == 1, which reads the generator's manifest,
+ * so a fixture must be built on the machine that runs it. It is also
  * compiled to a bare skip under -DSURGE_NO_ANE, which is how `make debug`
  * keeps CoreML out of the ASan run.
  */
@@ -60,6 +64,7 @@ int main(void) {
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
 #include "surge.h"
 #include "tinytest.h"
@@ -101,12 +106,27 @@ static double h2d(const __fp16 *p, size_t i) { return (double)p[i]; }
 int main(void) {
     const char *dir = fixture_dir();
 
+    /* ABSENT is a skip; PRESENT BUT UNLOADABLE is a failure. Folding the two
+     * together would let a broken fixture or a loader regression pass as
+     * "no fixture". */
+    char prog[1024];
+    int nw = snprintf(prog, sizeof prog, "%s/program.mlmodelc", dir);
+    if (nw <= 0 || (size_t)nw >= sizeof prog) {
+        fprintf(stderr, "FAIL test_ane: fixture path too long: %s\n", dir);
+        return 1;
+    }
+    if (access(prog, F_OK) != 0) {
+        fprintf(stderr, "SKIP test_ane: no fixture at %s.\n"
+                        "  Build one with: make ane-fixture\n", dir);
+        return 0;
+    }
+
     sg_ane *a = NULL;
     sg_err e = sg_ane_open(dir, &a);
     if (e.msg) {
-        fprintf(stderr, "SKIP test_ane: no fixture at %s (%s).\n"
-                        "  Build one with: make ane-fixture\n", dir, e.msg);
-        return 0;
+        fprintf(stderr, "FAIL test_ane: a fixture exists at %s but does not open: %s\n",
+                dir, e.msg);
+        return 1;
     }
 
     uint32_t n = 0, k = 0, m = 0;
@@ -124,6 +144,12 @@ int main(void) {
      * fixture is inconsistent with the program and every later comparison would
      * be meaningless. Checked before anything is computed from it. */
     tt_assert(wlen == (size_t)m * k * 2, "weights.f16 is m*k halves");
+    if (wlen != (size_t)m * k * 2) {
+        /* Fatal, not just counted: the reference loop below reads m*k halves. */
+        free(wbuf);
+        sg_ane_close(a);
+        return tt_report();
+    }
     const __fp16 *w = (const __fp16 *)wbuf;
 
     size_t in_elems = (size_t)k * n, out_elems = (size_t)m * n;
@@ -158,12 +184,19 @@ int main(void) {
         }
     }
 
+    /* Non-finite outputs are counted separately: `NaN > max_err` is false, so
+     * an all-NaN result would otherwise sail through the error bar (and, being
+     * repeatable, through the determinism check too). */
     double max_err = 0.0, max_want = 0.0;
+    size_t nonfinite = 0;
     for (size_t i = 0; i < out_elems; i++) {
-        double d = fabs((double)got[i] - want[i]);
+        double g = (double)got[i];
+        if (!isfinite(g)) { nonfinite++; continue; }
+        double d = fabs(g - want[i]);
         if (d > max_err) max_err = d;
         if (fabs(want[i]) > max_want) max_want = fabs(want[i]);
     }
+    tt_assert(nonfinite == 0, "every ANE output is finite (%zu are not)", nonfinite);
     double rel = (max_want > 0.0) ? max_err / max_want : max_err;
     printf("test_ane: worst relative error %.3e (bar 2e-2), max|want| %.4f\n", rel, max_want);
     tt_assert(max_want > 0.0, "reference output is not identically zero");

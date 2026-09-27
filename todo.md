@@ -8,8 +8,12 @@
       `.gitignore` (regenerate with `make ane-fixture`).
 - [x] Parameterized personal paths: `ANE_PY`, `GGUF`, `PY` default under `$(HOME)`;
       `SURGE_GPU_PY` for the tools' GPU arm; `surge.h` comment paths use `~/`.
-- [x] `make check` 87605/0 (test_ane SKIPs with no fixture); `test_ane` with a local fixture
-      14/0, `on_ane=1`; `make debug` 83615/0.
+- [x] Review fixes: `sg_ane_open` no longer returns an error string that points into the
+      freed handle; `sg_ane_matmul` checks array strides and refuses padded layouts;
+      `test_ane` FAILs on a fixture that exists but does not open, asserts finite outputs,
+      and stops on a weights-size mismatch.
+- [x] `make check` 87605/0 with no fixture (test_ane SKIP) and 87620/0 with a local fixture
+      (test_ane 15/0, `on_ane=1`); `make debug` 83615/0.
 - [ ] Not wired in. Next: split prefill GEMM between Metal and the ANE, gate on `gen_ids`.
 - Plan: `docs/27092026_ane_backend_plan.md`.
 
@@ -58,7 +62,7 @@ the ANE has 0.22x of the bandwidth, so decode stays on Metal, permanently.
 
 | result | value | why it matters |
 |---|---|---|
-| accuracy vs f64 reference | **1.101e-2** (bar 2e-2) | CORRECTED 2026-08-29: this row said the ANE accumulates in fp16. `tools/ane_accum_probe.py` falsified that (error FALLS with k, exponent -0.24, where a narrow running sum needs +0.5). The accumulator is WIDE; the 1.1e-2 is a CANCELLATION artifact of this fixture, and a well-conditioned workload holds about 1e-3 |
+| accuracy vs f64 reference | **1.101e-2** (bar 2e-2) | CORRECTED 2026-08-29: this row said the ANE accumulates in fp16. `tools/ane_accum_probe.py` falsified that (error FALLS with k, exponent -0.24, where a narrow running sum needs +0.5). The reduction is not a sequential fp16 running sum (an fp16 tree reduction is not ruled out); the 1.1e-2 is a CANCELLATION artifact of this fixture, and a well-conditioned workload holds about 1e-3 |
 | determinism | **8 reruns byte-identical** | this is what leaves a byte-exact greedy gate POSSIBLE on this path |
 | per-dispatch floor | **0.815 ms from C** | against 13 to 15 ms through Python, a ~17x reduction; this is the number that decides whether the path can carry per-layer or only whole-stack work |
 

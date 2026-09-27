@@ -230,8 +230,8 @@ ANE_FIXTURE_K ?= 1024
 ANE_FIXTURE_M ?= 1024
 .PHONY: ane-fixture
 ane-fixture:
-	$(ANE_PY) tools/ane_build_model.py --n $(ANE_FIXTURE_N) --k $(ANE_FIXTURE_K) \
-	  --m $(ANE_FIXTURE_M) --out-dir $(ANE_FIXTURE)
+	"$(ANE_PY)" tools/ane_build_model.py --n $(ANE_FIXTURE_N) --k $(ANE_FIXTURE_K) \
+	  --m $(ANE_FIXTURE_M) --out-dir "$(ANE_FIXTURE)"
 
 # tests/test_ane.bin needs CoreML, so it gets its own static pattern rule like
 # METAL_TESTS. Under -DSURGE_NO_ANE (which `debug` sets) it collapses to a bare

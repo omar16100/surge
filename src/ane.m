@@ -24,9 +24,11 @@
  * processor by size: at 512x512x512 it puts this same conv on the CPU, and at
  * 1024x1024x1024 and above it puts it on the Neural Engine. A program built
  * for too small a shape is silently a CPU program. sg_ane_on_ane() reports
- * what CoreML actually decided, read once at open from the manifest the
- * generator wrote, so a caller can refuse to use a program that is not what it
- * asked for rather than quietly benchmarking the CPU.
+ * what CoreML decided WHEN THE GENERATOR RAN, read once at open from the
+ * manifest it wrote, so a caller can refuse to use a program that is not what
+ * it asked for rather than quietly benchmarking the CPU. It is a build-time
+ * record, not a check on the current machine: a manifest copied from another
+ * machine, or left stale, reports that machine's placement.
  *
  * ACTIVATIONS ARE CHANNEL-MAJOR, (1, K, 1, N), element (c, s) at c*n + s.
  * That is the layout Apple's own ml-ane-transformers uses and it is not a
@@ -90,7 +92,9 @@ struct sg_ane {
 /* Formats into the handle's own buffer, so the returned pointer stays valid
  * until the next failing call on the same handle. Mirrors sg_gpu_errf's
  * contract minus the shared static, since an ANE handle already exists to own
- * the storage. */
+ * the storage. sg_ane_open is the exception: its failure paths free the
+ * handle, so it passes NULL and gets the static fallback, which outlives the
+ * handle (and, like sg_gpu_errf's, is overwritten by the next such failure). */
 static sg_err ane_errf(sg_ane *a, const char *fmt, ...) {
     static char fallback[256];
     char *buf = a ? a->err : fallback;
@@ -100,6 +104,15 @@ static sg_err ane_errf(sg_ane *a, const char *fmt, ...) {
     vsnprintf(buf, cap, fmt, ap);
     va_end(ap);
     return (sg_err){buf};
+}
+
+/* 1 when `strides` (elements, outermost first) describe the dense layout of a
+ * (1, C, 1, n) array, which is the only layout the memcpys in sg_ane_matmul
+ * are correct for: element (c, s) at c*n + s. The size-1 axes' strides are
+ * not constrained, since no index ever moves along them. */
+static int ane_dense_1c1n(NSArray<NSNumber *> *strides, uint32_t n) {
+    if (strides.count != 4) return 0;
+    return [strides[3] longLongValue] == 1 && [strides[1] longLongValue] == (long long)n;
 }
 
 /* Reads `"on_ane": true|false|null` out of the generator's manifest.
@@ -160,7 +173,7 @@ sg_err sg_ane_open(const char *dir, sg_ane **out) {
         char prog[1024];
         int nw = snprintf(prog, sizeof prog, "%s/program.mlmodelc", dir);
         if (nw <= 0 || (size_t)nw >= sizeof prog) {
-            sg_err e = ane_errf(a, "ane: path too long: %s", dir);
+            sg_err e = ane_errf(NULL, "ane: path too long: %s", dir);
             free(a);
             return e;
         }
@@ -173,7 +186,7 @@ sg_err sg_ane_open(const char *dir, sg_ane **out) {
         a->model = [[MLModel modelWithContentsOfURL:url configuration:a->cfg
                                               error:&err] retain];
         if (!a->model) {
-            sg_err e = ane_errf(a, "ane: cannot load %s: %s", prog,
+            sg_err e = ane_errf(NULL, "ane: cannot load %s: %s", prog,
                                 err ? [[err localizedDescription] UTF8String] : "unknown");
             sg_ane_close(a);
             return e;
@@ -181,7 +194,7 @@ sg_err sg_ane_open(const char *dir, sg_ane **out) {
 
         MLModelDescription *d = a->model.modelDescription;
         if (d.inputDescriptionsByName.count != 1 || d.outputDescriptionsByName.count != 1) {
-            sg_err e = ane_errf(a, "ane: expected 1 input and 1 output, got %lu and %lu",
+            sg_err e = ane_errf(NULL, "ane: expected 1 input and 1 output, got %lu and %lu",
                                 (unsigned long)d.inputDescriptionsByName.count,
                                 (unsigned long)d.outputDescriptionsByName.count);
             sg_ane_close(a);
@@ -196,7 +209,7 @@ sg_err sg_ane_open(const char *dir, sg_ane **out) {
         MLFeatureDescription *ind = d.inputDescriptionsByName[a->input_name];
         NSArray<NSNumber *> *shape = ind.multiArrayConstraint.shape;
         if (shape.count != 4) {
-            sg_err e = ane_errf(a, "ane: input rank %lu, expected 4 (1, K, 1, N)",
+            sg_err e = ane_errf(NULL, "ane: input rank %lu, expected 4 (1, K, 1, N)",
                                 (unsigned long)shape.count);
             sg_ane_close(a);
             return e;
@@ -208,7 +221,7 @@ sg_err sg_ane_open(const char *dir, sg_ane **out) {
         NSArray<NSNumber *> *oshape = outd.multiArrayConstraint.shape;
         a->m = (oshape.count == 4) ? (uint32_t)[oshape[1] unsignedIntValue] : 0;
         if (!a->k || !a->n || !a->m) {
-            sg_err e = ane_errf(a, "ane: degenerate shape n=%u k=%u m=%u", a->n, a->k, a->m);
+            sg_err e = ane_errf(NULL, "ane: degenerate shape n=%u k=%u m=%u", a->n, a->k, a->m);
             sg_ane_close(a);
             return e;
         }
@@ -222,7 +235,7 @@ sg_err sg_ane_open(const char *dir, sg_ane **out) {
                  dataType:MLMultiArrayDataTypeFloat16
                     error:&aerr];
         if (!a->in_arr) {
-            sg_err e = ane_errf(a, "ane: cannot allocate input array: %s",
+            sg_err e = ane_errf(NULL, "ane: cannot allocate input array: %s",
                                 aerr ? [[aerr localizedDescription] UTF8String] : "unknown");
             sg_ane_close(a);
             return e;
@@ -266,16 +279,22 @@ sg_err sg_ane_matmul(sg_ane *a, const void *in, void *out) {
          * lifetime this layer would then have to guarantee across an async
          * prediction; reusing one array and filling it is both simpler and
          * keeps the allocation off the per-call path. */
+        /* The memcpy below assumes the dense (1, K, 1, N) layout. CoreML may
+         * hand back padded storage, so the strides are CHECKED, and a layout
+         * this layer does not handle is an error rather than silent garbage. */
         size_t in_bytes = (size_t)a->k * a->n * 2;
-        __block int copied = 0;
+        __block int copied = 0, dense = 0;
         [a->in_arr getMutableBytesWithHandler:^(void *ptr, NSInteger len,
                                                 NSArray<NSNumber *> *strides) {
-            (void)strides;
-            if ((size_t)len >= in_bytes) {
+            dense = ane_dense_1c1n(strides, a->n);
+            if (dense && (size_t)len >= in_bytes) {
                 memcpy(ptr, in, in_bytes);
                 copied = 1;
             }
         }];
+        if (!dense)
+            return ane_errf(a, "ane: input array is not dense (1, K, 1, N); padded "
+                               "layouts are not supported");
         if (!copied)
             return ane_errf(a, "ane: input array smaller than %zu bytes", in_bytes);
 
@@ -300,6 +319,9 @@ sg_err sg_ane_matmul(sg_ane *a, const void *in, void *out) {
         if (o.dataType != MLMultiArrayDataTypeFloat16)
             return ane_errf(a, "ane: output dtype %ld, expected float16", (long)o.dataType);
 
+        if (!ane_dense_1c1n(o.strides, a->n))
+            return ane_errf(a, "ane: output array is not dense (1, M, 1, N); padded "
+                               "layouts are not supported");
         size_t out_bytes = (size_t)a->m * a->n * 2;
         __block int ok = 0;
         [o getBytesWithHandler:^(const void *ptr, NSInteger len) {

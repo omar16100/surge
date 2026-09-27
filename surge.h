@@ -2177,7 +2177,8 @@ uint64_t sg_mem_tracker_peak(const sg_mem_tracker *t);
 /* --- ANE (Apple Neural Engine) backend, src/ane.m -------------------------
  *
  * A SECOND COMPUTE PATH THAT RUNS ALONGSIDE METAL, NOT INSTEAD OF IT. Measured
- * on this M3 Ultra 2026-08-28 (tools/ane_gemm_probe.py, tools/ane_envelope.py):
+ * on this M3 Ultra 2026-08-28 (tools/ane_gemm_probe.py, tools/ane_envelope.py;
+ * local runs, raw results not committed):
  * the ANE does ~8.2 TFLOPS fp16 per die over ~126 GB/s, two dies, against the
  * GPU's ~23.6 TFLOPS and ~573 GB/s. It is slower on every axis. What makes it
  * worth having is that it does not take those cycles from the GPU: both dies

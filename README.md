@@ -86,3 +86,27 @@ and the benchmark harness at
 [llm-benchmark](https://github.com/omar16100/llm-benchmark).
 
 License: MIT.
+
+## Native temperature and fan telemetry
+
+```sh
+make surge-monitor
+./surge-monitor
+./surge-monitor --samples 0 --interval-ms 2000 --retry-components gpu
+./surge-monitor --gpu-temp
+make monitor-check
+make monitor-debug
+```
+
+The monitor reads AppleSMC without sudo or a model.
+It reports temperatures, fan RPM, sensor coverage, and sample times.
+An unavailable temperature is `null`.
+The scalar GPU command returns exit code 3 if sensor coverage is incomplete.
+The `--retry-components` option selects the components that control retries.
+Each attempt reads all sensors and reports their actual coverage.
+The Python adapter selects GPU retries and rejects incomplete temperature coverage.
+The monitor does not change fan control.
+
+The hardware test used an M3 Ultra.
+Other chip families require tests.
+See [the telemetry specification](docs/06102026_native_telemetry.md).

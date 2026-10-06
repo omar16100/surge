@@ -1,0 +1,30 @@
+{
+  "platform": "Apple M3 Ultra",
+  "native_checks": 79,
+  "python_tests": 8,
+  "asan_ubsan": "passed",
+  "live": {
+    "samples": 10,
+    "attempts": [
+      1
+    ],
+    "cpu_status": [
+      "partial"
+    ],
+    "gpu_status": [
+      "ok"
+    ],
+    "gpu_coverage": [
+      [
+        64,
+        64
+      ]
+    ],
+    "sample_ms_median": 69.0905,
+    "discovery_errors": [
+      0
+    ]
+  },
+  "live_trace_sha256": "833a21aa45db2467ff3a37a35f604962dc8a9ddf8a2645ab5bc3f834a51a48ea",
+  "other_chip_families_tested": false
+}

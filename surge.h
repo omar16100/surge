@@ -2174,4 +2174,42 @@ void sg_mem_tracker_reset(sg_mem_tracker *t);
 void sg_mem_tracker_sample(sg_mem_tracker *t, uint64_t current_alloc, uint64_t phys_footprint);
 uint64_t sg_mem_tracker_peak(const sg_mem_tracker *t);
 
+/* Read-only native SMC telemetry (src/telemetry.m). No model, Metal work,
+ * subprocess, or root privilege required. Link IOKit and CoreFoundation.
+ * Handles are single-threaded; each sample reads fresh values, not a cache.
+ * Missing temperatures are NAN, never zero. valid < sensors means partial
+ * coverage; a temperature gate should require complete discovery and coverage. */
+#define SG_THERMAL_MAX_FANS 16
+typedef struct sg_thermal sg_thermal;
+typedef struct {
+    double avg_c, min_c, max_c;
+    uint32_t sensors, valid, invalid, read_errors;
+} sg_temperature;
+typedef struct {
+    char key[5];
+    double rpm; /* NAN when unreadable; a stopped fan's zero RPM is valid. */
+} sg_thermal_fan;
+typedef struct {
+    double wall_time, sample_ms;
+    sg_temperature cpu, gpu;
+    sg_thermal_fan fans[SG_THERMAL_MAX_FANS];
+    uint32_t fan_count, attempts, discovery_errors;
+} sg_thermal_sample;
+sg_err sg_thermal_open(sg_thermal **out);
+void sg_thermal_close(sg_thermal *t);
+/* retries is 1..10; missing/partial readings retry after 50 ms. A successful
+ * call can still contain unavailable sensors; inspect the coverage fields. */
+sg_err sg_thermal_read(sg_thermal *t, unsigned retries, sg_thermal_sample *out);
+enum {
+    SG_THERMAL_CPU = 1,
+    SG_THERMAL_GPU = 2,
+    SG_THERMAL_ALL = SG_THERMAL_CPU | SG_THERMAL_GPU
+};
+/* Select the components that control retries. Each attempt reads all sensors.
+ * Partial coverage stays visible for each component. The mask must be nonzero. */
+sg_err sg_thermal_read_components(sg_thermal *t, unsigned retries,
+                                  unsigned components, sg_thermal_sample *out);
+bool sg_temperature_complete(const sg_temperature *t);
+const char *sg_temperature_status(const sg_temperature *t);
+
 #endif

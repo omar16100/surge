@@ -700,3 +700,15 @@ byte-identical run-to-run. Correctness is byte-exact greedy TOKENS, not byte-exa
 (reduction-order and fp16-KV differences are absorbed by argmax). No em dashes in any
 file. Full milestone plan: `docs/superpowers/plans/2026-08-09-surge-m3-m5.md`; original
 design: `docs/superpowers/specs/2026-08-08-surge-design.md`.
+
+## Native thermal telemetry extension, 6 October 2026
+
+The `surge-monitor` process reads AppleSMC through IOKit and CoreFoundation.
+The `src/telemetry.m` module owns discovery, sensor reads, validity checks, and retries.
+The `src/telemetry_internal.h` interface permits a test transport.
+The public API resides in `surge.h`.
+The `src/telemetry_json.c` module converts one sample to JSONL.
+The `src/cli_monitor.c` module controls the sample interval and scalar GPU output.
+The Python adapter in `tools/thermal.py` supplies strict temperature values to external callers.
+Model inference does not call the telemetry API implicitly.
+Only the monitor and its dedicated tests link the native telemetry modules.

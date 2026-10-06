@@ -29,11 +29,29 @@ ifeq (,$(findstring SURGE_NO_METAL,$(CFLAGS)))
 	@$(MAKE) --no-print-directory surge-bench
 	@bash tests/test_cli_bench.sh ./surge ./surge-bench
 endif
-LIB_SRC = $(filter-out src/metal.m $(wildcard src/cli_*.c),$(wildcard src/*.c))
+LIB_SRC = $(filter-out src/metal.m src/telemetry_json.c $(wildcard src/cli_*.c),$(wildcard src/*.c))
 tests/%.bin: tests/%.c $(LIB_SRC)
 	$(CC) $(CFLAGS) -o $@ $< $(LIB_SRC) $(LDLIBS)
 surge-info: src/cli_info.c $(LIB_SRC)
 	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
+# Read-only native temperature/fan telemetry. No Metal or model dependencies.
+THERMAL_SRC = src/telemetry.m src/telemetry_json.c
+THERMAL_DEPS = $(THERMAL_SRC) src/telemetry_internal.h src/telemetry_json.h surge.h
+THERMAL_FRAMEWORKS = -framework IOKit -framework CoreFoundation
+surge-monitor: src/cli_monitor.c $(THERMAL_DEPS)
+	$(CC) $(CFLAGS) -o $@ src/cli_monitor.c $(THERMAL_SRC) $(THERMAL_FRAMEWORKS) $(LDLIBS)
+tests/test_telemetry.bin: tests/test_telemetry.c $(THERMAL_DEPS)
+	$(CC) $(CFLAGS) -o $@ $< $(THERMAL_SRC) $(THERMAL_FRAMEWORKS) $(LDLIBS)
+tests/telemetry_fixture.bin: tests/telemetry_fixture.c $(THERMAL_DEPS)
+	$(CC) $(CFLAGS) -o $@ $< $(THERMAL_SRC) $(THERMAL_FRAMEWORKS) $(LDLIBS)
+.PHONY: monitor-check monitor-debug
+monitor-check: tests/test_telemetry.bin tests/telemetry_fixture.bin surge-monitor
+	./tests/test_telemetry.bin
+	python3 -m unittest discover -s tests -p 'test_telemetry*.py'
+monitor-debug:
+	rm -f tests/test_telemetry.bin tests/telemetry_fixture.bin surge-monitor
+	$(MAKE) CFLAGS="$(CFLAGS) -fsanitize=address,undefined -fno-omit-frame-pointer -g -O0" monitor-check
+	rm -f tests/test_telemetry.bin tests/telemetry_fixture.bin surge-monitor
 surge-ref: src/cli_ref.c $(LIB_SRC)
 	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
 
@@ -208,6 +226,8 @@ debug:
 	@rm -f $(TESTS:.c=.bin)
 	@rm -rf $(TESTS:.c=.bin.dSYM)
 clean:
-	rm -f $(TESTS:.c=.bin) surge-info surge-ref surge surge-bench $(BENCH_SPLITK) $(METALLIB) $(METAL_AIR)
+	rm -f tests/telemetry_fixture.bin
+	rm -rf tests/telemetry_fixture.bin.dSYM surge-monitor.dSYM
+	rm -f $(TESTS:.c=.bin) surge-info surge-ref surge surge-bench surge-monitor $(BENCH_SPLITK) $(METALLIB) $(METAL_AIR)
 	rm -rf $(TESTS:.c=.bin.dSYM) surge-info.dSYM surge-ref.dSYM surge.dSYM surge-bench.dSYM
 .PHONY: check debug clean

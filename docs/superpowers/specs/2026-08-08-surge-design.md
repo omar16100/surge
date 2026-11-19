@@ -338,5 +338,5 @@ was only 1.07x because attention is not the dominant cost there
 - Attribution: the README credits the llm-rnd experimentation campaign on this machine
   (the firmware-limiter discovery, roofline measurements, and benchmarking methodology
   that this engine's design exploits), linking the published write-up at
-  https://omarshabab.com/mac-studio-firmware-gpu-limiter/ and the public
+  https://omar.sg/mac-studio-firmware-gpu-limiter/ and the public
   github.com/omar16100/llm-benchmark harness.

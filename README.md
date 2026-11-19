@@ -81,7 +81,7 @@ is confirmed). No throughput benefit from pacing has been demonstrated
 - `make surge`, `make surge-bench`: the decode CLI and the benchmark harness.
 
 Background reading: the write-up the premise came from,
-[macOS clamps my M3 Ultra's GPU to 338 MHz before the fans even try](https://omarshabab.com/mac-studio-firmware-gpu-limiter/),
+[macOS clamps my M3 Ultra's GPU to 338 MHz before the fans even try](https://omar.sg/mac-studio-firmware-gpu-limiter/),
 and the benchmark harness at
 [llm-benchmark](https://github.com/omar16100/llm-benchmark).
 

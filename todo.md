@@ -1,5 +1,10 @@
 # Surge M0-M2 Tasks
 
+## 2026-11-19: write-up link moved to omar.sg (branch omar-sg-link-19112026)
+
+- [x] `README.md` and the design spec link the write-up at `omar.sg`. The old domain of
+      the site expired.
+
 ## 2026-09-27: merge the feat/m3-m5 tail, README honesty pass (branch chore/m3-m5-tail)
 
 - [x] Tail = `origin/main..1173c82`, 13 commits: the 11 `feat/m3-m5` gained after PR #1
